@@ -16,7 +16,6 @@ use crate::{
         },
     },
 };
-use axum::http::HeaderMap;
 use cap_std::fs::Permissions;
 use chrono::{Datelike, Timelike};
 use ddup_bak::archive::entries::Entry;
@@ -457,19 +456,16 @@ impl BackupExt for DdupBakBackup {
             }
         }
 
-        let mut headers = HeaderMap::with_capacity(2);
-        headers.insert(
-            "Content-Disposition",
-            format!(
-                "attachment; filename={}.{}",
-                self.uuid,
-                archive_format.extension()
+        Ok(ApiResponse::new_stream(reader)
+            .with_header(
+                "Content-Disposition",
+                &format!(
+                    "attachment; filename={}.{}",
+                    self.uuid,
+                    archive_format.extension()
+                ),
             )
-            .parse()?,
-        );
-        headers.insert("Content-Type", archive_format.mime_type().parse()?);
-
-        Ok(ApiResponse::new_stream(reader).with_headers(headers))
+            .with_header("Content-Type", archive_format.mime_type()))
     }
 
     async fn restore(
@@ -554,10 +550,6 @@ impl BackupExt for DdupBakBackup {
                         if let Err(err) = server.filesystem.symlink(&symlink.target, &path) {
                             tracing::debug!(path = %path.display(), "failed to create symlink from backup: {:?}", err);
                         } else {
-                            server.filesystem.set_symlink_permissions(
-                                &path,
-                                cap_std::fs::Permissions::from_std(symlink.mode.into()),
-                            )?;
                             server.filesystem.set_times(&path, symlink.mtime, None)?;
                         }
                     }

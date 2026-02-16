@@ -338,7 +338,7 @@ fn docker_tmpfs_size() -> u64 {
     100
 }
 fn docker_container_pid_limit() -> u64 {
-    512
+    5120
 }
 
 fn docker_installer_limits_timeout() -> u64 {

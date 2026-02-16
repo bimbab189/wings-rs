@@ -21,10 +21,8 @@ use crate::{
     },
     utils::PortableModeExt,
 };
-use axum::http::HeaderMap;
 use chrono::{Datelike, Timelike};
 use compact_str::ToCompactString;
-use human_bytes::human_bytes;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -45,8 +43,14 @@ static RESTIC_BACKUP_CACHE: LazyLock<ResticBackupCache> =
 #[derive(Debug, Deserialize)]
 struct ResticSnapshot {
     short_id: String,
-    tags: Vec<String>,
-    paths: Vec<String>,
+    tags: Vec<compact_str::CompactString>,
+    paths: Vec<compact_str::CompactString>,
+    summary: ResticSnapshotSummary,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResticSnapshotSummary {
+    total_bytes_processed: u64,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +73,7 @@ pub struct ResticDirectoryEntry {
 pub struct ResticBackup {
     uuid: uuid::Uuid,
     short_id: String,
+    total_bytes_processed: u64,
 
     config: Arc<crate::config::Config>,
     server_path: PathBuf,
@@ -217,6 +222,7 @@ impl BackupFindExt for ResticBackup {
             return Ok(Some(Backup::Restic(ResticBackup {
                 uuid,
                 short_id: snapshot.short_id.clone(),
+                total_bytes_processed: snapshot.summary.total_bytes_processed,
                 config: Arc::clone(config),
                 server_path: match snapshot.paths.first() {
                     Some(path) => PathBuf::from(path),
@@ -280,6 +286,7 @@ impl BackupFindExt for ResticBackup {
                         backup = Some(ResticBackup {
                             uuid,
                             short_id: snapshot.short_id.clone(),
+                            total_bytes_processed: snapshot.summary.total_bytes_processed,
                             config: Arc::clone(config),
                             server_path: match snapshot.paths.first() {
                                 Some(path) => PathBuf::from(path),
@@ -343,6 +350,7 @@ impl BackupFindExt for ResticBackup {
                         backup = Some(ResticBackup {
                             uuid,
                             short_id: snapshot.short_id.clone(),
+                            total_bytes_processed: snapshot.summary.total_bytes_processed,
                             config: Arc::clone(config),
                             server_path: match snapshot.paths.first() {
                                 Some(path) => PathBuf::from(path),
@@ -562,8 +570,11 @@ impl BackupCreateExt for ResticBackup {
                 (
                     ResticSnapshot {
                         short_id: snapshot_id.clone(),
-                        tags: vec![uuid.to_string()],
-                        paths: vec![server.filesystem.base_path.to_string_lossy().to_string()],
+                        tags: vec![uuid.to_compact_string()],
+                        paths: vec![server.filesystem.base_path.to_string_lossy().into()],
+                        summary: ResticSnapshotSummary {
+                            total_bytes_processed,
+                        },
                     },
                     Arc::new(configuration),
                 ),
@@ -711,19 +722,16 @@ impl BackupExt for ResticBackup {
             }
         }
 
-        let mut headers = HeaderMap::with_capacity(2);
-        headers.insert(
-            "Content-Disposition",
-            format!(
-                "attachment; filename={}.{}",
-                self.uuid,
-                archive_format.extension()
+        Ok(ApiResponse::new_stream(reader)
+            .with_header(
+                "Content-Disposition",
+                &format!(
+                    "attachment; filename={}.{}",
+                    self.uuid,
+                    archive_format.extension()
+                ),
             )
-            .parse()?,
-        );
-        headers.insert("Content-Type", archive_format.mime_type().parse()?);
-
-        Ok(ApiResponse::new_stream(reader).with_headers(headers))
+            .with_header("Content-Type", archive_format.mime_type()))
     }
 
     async fn restore(
@@ -733,6 +741,8 @@ impl BackupExt for ResticBackup {
         total: Arc<AtomicU64>,
         _download_url: Option<compact_str::CompactString>,
     ) -> Result<(), anyhow::Error> {
+        total.store(self.total_bytes_processed, Ordering::SeqCst);
+
         let child = Command::new("restic")
             .envs(&self.configuration.environment)
             .arg("--json")
@@ -748,6 +758,7 @@ impl BackupExt for ResticBackup {
             .arg(&server.filesystem.base_path)
             .arg("--limit-download")
             .arg((server.app_state.config.system.backups.read_limit.as_kib()).to_compact_string())
+            .arg("-vv")
             .stdout(std::process::Stdio::piped())
             .spawn()?;
 
@@ -755,31 +766,20 @@ impl BackupExt for ResticBackup {
 
         while let Ok(Some(line)) = line_reader.next_line().await {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line)
-                && json.get("message_type").and_then(|v| v.as_str()) == Some("status")
+                && json.get("message_type").and_then(|v| v.as_str()) == Some("verbose_status")
             {
-                let total_bytes = json
-                    .get("total_bytes")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let bytes_restored = json
-                    .get("bytes_restored")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let percent_done = json
-                    .get("percent_done")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                let percent_done = (percent_done * 10000.0).round() / 100.0;
+                let Some(item) = json.get("item").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let size = json.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
 
-                progress.store(bytes_restored, Ordering::SeqCst);
-                total.store(total_bytes, Ordering::SeqCst);
+                if size == 0 {
+                    continue;
+                }
 
-                server.log_daemon(compact_str::format_compact!(
-                    "(restoring): {} of {} ({}%)",
-                    human_bytes(bytes_restored as f64),
-                    human_bytes(total_bytes as f64),
-                    percent_done
-                ));
+                progress.fetch_add(size, Ordering::SeqCst);
+
+                server.log_daemon(compact_str::format_compact!("(restoring): {}", item));
             }
         }
 

@@ -10,7 +10,6 @@ use crate::{
         },
     },
 };
-use axum::http::HeaderMap;
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -310,19 +309,16 @@ impl BackupExt for BtrfsBackup {
             }
         });
 
-        let mut headers = HeaderMap::with_capacity(2);
-        headers.insert(
-            "Content-Disposition",
-            format!(
-                "attachment; filename={}.{}",
-                self.uuid,
-                archive_format.extension()
+        Ok(ApiResponse::new_stream(reader)
+            .with_header(
+                "Content-Disposition",
+                &format!(
+                    "attachment; filename={}.{}",
+                    self.uuid,
+                    archive_format.extension()
+                ),
             )
-            .parse()?,
-        );
-        headers.insert("Content-Type", archive_format.mime_type().parse()?);
-
-        Ok(ApiResponse::new_stream(reader).with_headers(headers))
+            .with_header("Content-Type", archive_format.mime_type()))
     }
 
     async fn restore(

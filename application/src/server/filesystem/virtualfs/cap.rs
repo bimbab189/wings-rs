@@ -1,5 +1,3 @@
-use tokio::io::AsyncWriteExt;
-
 use super::{
     AsyncFileRead, AsyncReadableFileStream, AsyncWritableSeekableFileStream, ByteRange,
     DirectoryListing, DirectoryStreamWalk, DirectoryWalk, FileMetadata, FileRead, FileType,
@@ -17,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicU64},
 };
+use tokio::io::AsyncWriteExt;
 
 pub struct VirtualCapFilesystem {
     pub inner: crate::server::filesystem::cap::CapFilesystem,

@@ -3,8 +3,6 @@ use std::{
     os::fd::AsFd,
 };
 
-use crate::io::abort::AbortListener;
-
 pub mod abort;
 pub mod compression;
 pub mod counting_reader;
@@ -46,7 +44,7 @@ pub fn copy_file_progress(
     reader: &mut (impl AsFd + std::io::Read + ?Sized),
     writer: &mut (impl AsFd + std::io::Write + ?Sized),
     mut progress: impl FnMut(usize) -> Result<(), std::io::Error>,
-    listener: AbortListener,
+    listener: abort::AbortListener,
 ) -> Result<u64, std::io::Error> {
     let mut total_copied = 0;
 
