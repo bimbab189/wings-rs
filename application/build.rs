@@ -125,6 +125,8 @@ fn handle_git_info() {
                 "cargo:rustc-env=CARGO_GIT_BRANCH={}",
                 head_ref.rsplit('/').next().unwrap_or("unknown")
             );
+        } else {
+            println!("cargo:rustc-env=CARGO_GIT_BRANCH=release");
         }
         println!("cargo:rerun-if-changed=../.git/index");
 
