@@ -45,7 +45,9 @@ mod get {
             log_file = crate::io::tail::async_tail(log_file, lines).await?;
         }
 
-        ApiResponse::new_stream(log_file).ok()
+        ApiResponse::new_stream(log_file)
+            .with_header("Content-Type", "text/plain")
+            .ok()
     }
 }
 

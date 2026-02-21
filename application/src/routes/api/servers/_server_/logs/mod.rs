@@ -48,7 +48,9 @@ mod get {
             let _ = logs_writer.shutdown().await;
         });
 
-        ApiResponse::new_stream(logs_reader).ok()
+        ApiResponse::new_stream(logs_reader)
+            .with_header("Content-Type", "text/plain")
+            .ok()
     }
 }
 

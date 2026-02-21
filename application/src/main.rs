@@ -135,6 +135,7 @@ async fn main() {
                         std::process::exit(exit_code);
                     }
                     Err(err) => {
+                        drop(config);
                         eprintln!(
                             "{}: {:#?}",
                             "an error occurred while running cli command".red(),
@@ -387,6 +388,7 @@ async fn main() {
                     Ok(Ok(key)) => {
                         tracing::info!(
                             algorithm = %key.algorithm().to_string(),
+                            fingerprint = %key.fingerprint(Default::default()),
                             "loaded existing sftp host key"
                         );
 
@@ -426,11 +428,21 @@ async fn main() {
                         .context("failed to write sftp host key")
                         .unwrap();
 
+                        tracing::info!(
+                            algorithm = %key.algorithm().to_string(),
+                            fingerprint = %key.fingerprint(Default::default()),
+                            "new sftp host key generated"
+                        );
+
                         key
                     }
                 };
 
                 let config = russh::server::Config {
+                    server_id: russh::SshId::Standard(format!(
+                        "SSH-2.0-Calagopus-Wings-{}",
+                        wings_rs::VERSION
+                    )),
                     auth_rejection_time: std::time::Duration::from_secs(0),
                     auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
                     maximum_packet_size: 32 * 1024,

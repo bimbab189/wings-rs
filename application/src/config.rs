@@ -995,7 +995,9 @@ impl Config {
 
         tracing::subscriber::set_global_default(
             tracing_subscriber::fmt()
-                .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())
+                .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+                    "%Y-%m-%d %H:%M:%S %z".to_string(),
+                ))
                 .with_writer(stdout_writer.and(file_appender))
                 .with_target(false)
                 .with_level(true)

@@ -193,9 +193,9 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
                             Ok(_) => {
                                 println!("openrc service file created successfully");
 
+                                #[cfg(unix)]
                                 if let Ok(meta) = tokio::fs::metadata(service_path).await {
                                     let mut perms = meta.permissions();
-                                    #[cfg(unix)]
                                     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
 
                                     if let Err(err) =
