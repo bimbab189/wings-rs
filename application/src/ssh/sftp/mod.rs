@@ -12,7 +12,7 @@ use positioned_io::{ReadAt, WriteAt};
 use russh_sftp::protocol::{
     Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -24,6 +24,9 @@ mod extended;
 pub struct FileHandle {
     path: PathBuf,
     path_components: Vec<String>,
+    writable: bool,
+    changed: bool,
+    original_content: Option<String>,
 
     file: Arc<RwLock<std::fs::File>>,
 }
@@ -51,6 +54,8 @@ impl ServerHandle {
 }
 
 const HANDLE_LIMIT: usize = 32;
+const MAX_DIFF_SIZE: usize = 1024 * 1024;
+const MAX_DIFF_LINES: usize = 5000;
 
 pub struct SftpSession {
     pub state: State,
@@ -161,6 +166,108 @@ impl SftpSession {
                 .has_permission(self.user_uuid, Permission::FileSftp)
                 .await
     }
+
+    fn build_diff_metadata(file: &Path, original_content: &str, new_content: &str) -> Value {
+        let original_lines: Vec<&str> = original_content.split('\n').collect();
+        let new_lines: Vec<&str> = new_content.split('\n').collect();
+        let context_lines = 3usize;
+
+        if original_content.len() > MAX_DIFF_SIZE
+            || new_content.len() > MAX_DIFF_SIZE
+            || original_lines.len() > MAX_DIFF_LINES
+            || new_lines.len() > MAX_DIFF_LINES
+        {
+            return json!({
+                "file": file,
+                "additions": new_lines.len().saturating_sub(original_lines.len()),
+                "deletions": original_lines.len().saturating_sub(new_lines.len()),
+                "hunks": [],
+                "large_file": true,
+            });
+        }
+
+        if original_content == new_content {
+            return json!({
+                "file": file,
+                "additions": 0,
+                "deletions": 0,
+                "hunks": [],
+                "is_new_file": original_content.trim().is_empty(),
+            });
+        }
+
+        let min_len = original_lines.len().min(new_lines.len());
+        let mut prefix = 0usize;
+        while prefix < min_len && original_lines[prefix] == new_lines[prefix] {
+            prefix += 1;
+        }
+
+        let mut suffix = 0usize;
+        while suffix < (original_lines.len() - prefix).min(new_lines.len() - prefix)
+            && original_lines[original_lines.len() - 1 - suffix]
+                == new_lines[new_lines.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+
+        let changed_old_start = prefix;
+        let changed_new_start = prefix;
+        let changed_old_end = original_lines.len() - suffix;
+        let changed_new_end = new_lines.len() - suffix;
+
+        let additions = changed_new_end.saturating_sub(changed_new_start);
+        let deletions = changed_old_end.saturating_sub(changed_old_start);
+
+        let hunk_old_start = changed_old_start.saturating_sub(context_lines);
+        let hunk_new_start = changed_new_start.saturating_sub(context_lines);
+        let hunk_old_end = (changed_old_end + context_lines).min(original_lines.len());
+        let hunk_new_end = (changed_new_end + context_lines).min(new_lines.len());
+
+        let mut changes = Vec::new();
+
+        for line in &original_lines[hunk_old_start..changed_old_start] {
+            changes.push(json!({
+                "type": "context",
+                "content": line,
+            }));
+        }
+
+        for line in &original_lines[changed_old_start..changed_old_end] {
+            changes.push(json!({
+                "type": "deletion",
+                "content": line,
+            }));
+        }
+
+        for line in &new_lines[changed_new_start..changed_new_end] {
+            changes.push(json!({
+                "type": "addition",
+                "content": line,
+            }));
+        }
+
+        for line in &original_lines[changed_old_end..hunk_old_end] {
+            changes.push(json!({
+                "type": "context",
+                "content": line,
+            }));
+        }
+
+        json!({
+            "file": file,
+            "additions": additions,
+            "deletions": deletions,
+            "hunks": [{
+                "old_start": hunk_old_start + 1,
+                "old_lines": hunk_old_end.saturating_sub(hunk_old_start),
+                "new_start": hunk_new_start + 1,
+                "new_lines": hunk_new_end.saturating_sub(hunk_new_start),
+                "context": "",
+                "changes": changes,
+            }],
+            "is_new_file": original_content.trim().is_empty(),
+        })
+    }
 }
 
 impl russh_sftp::server::Handler for SftpSession {
@@ -196,7 +303,48 @@ impl russh_sftp::server::Handler for SftpSession {
     }
 
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
-        self.handles.remove(handle.as_str());
+        let closed_handle = self.handles.remove(handle.as_str());
+
+        if let Some(ServerHandle::File(file_handle)) = closed_handle
+            && file_handle.writable
+            && file_handle.changed
+        {
+            let relative_path = self.server.filesystem.relative_path(&file_handle.path);
+            let mut metadata = json!({
+                "files": [relative_path.clone()],
+                "file": relative_path,
+            });
+
+            if let Some(original_content) = &file_handle.original_content
+                && let Ok(new_content) = self
+                    .server
+                    .filesystem
+                    .async_read_to_string(&file_handle.path, MAX_DIFF_SIZE + 1)
+                    .await
+            {
+                let diff = Self::build_diff_metadata(
+                    &self.server.filesystem.relative_path(&file_handle.path),
+                    original_content,
+                    &new_content,
+                );
+
+                if let Some(metadata_obj) = metadata.as_object_mut() {
+                    metadata_obj.insert("diff".to_string(), diff);
+                }
+            }
+
+            self.server
+                .activity
+                .log_activity(Activity {
+                    event: ActivityEvent::SftpWrite,
+                    user: Some(self.user_uuid),
+                    ip: Some(self.user_ip),
+                    metadata: Some(metadata),
+                    schedule: None,
+                    timestamp: chrono::Utc::now(),
+                })
+                .await;
+        }
 
         Ok(Status {
             id,
@@ -931,18 +1079,22 @@ impl russh_sftp::server::Handler for SftpSession {
             Err(_) => PathBuf::from(filename.strip_prefix("/").unwrap_or(&filename)),
         };
 
-        match self.server.filesystem.async_symlink_metadata(&path).await {
+        let path_exists = match self.server.filesystem.async_symlink_metadata(&path).await {
             Ok(metadata) => {
                 if !metadata.is_file() {
                     return Err(StatusCode::NoSuchFile);
                 }
+
+                true
             }
             Err(_) => {
                 if !pflags.contains(OpenFlags::CREATE) {
                     return Err(StatusCode::NoSuchFile);
                 }
+
+                false
             }
-        }
+        };
 
         if self.is_ignored(&path, false).await {
             return Err(StatusCode::NoSuchFile);
@@ -951,13 +1103,29 @@ impl russh_sftp::server::Handler for SftpSession {
         let mut activity_event = None;
         if pflags.contains(OpenFlags::TRUNCATE) || pflags.contains(OpenFlags::CREATE) {
             activity_event = Some(ActivityEvent::SftpCreate);
-        } else if pflags.contains(OpenFlags::WRITE) || pflags.contains(OpenFlags::APPEND) {
-            activity_event = Some(ActivityEvent::SftpWrite);
         } else if pflags.contains(OpenFlags::READ)
             && self.state.config.system.sftp.activity.log_file_reads
         {
             activity_event = Some(ActivityEvent::SftpRead);
         }
+
+        let writable = pflags.contains(OpenFlags::WRITE)
+            || pflags.contains(OpenFlags::APPEND)
+            || pflags.contains(OpenFlags::TRUNCATE)
+            || pflags.contains(OpenFlags::CREATE);
+        let original_content = if writable {
+            if path_exists {
+                self.server
+                    .filesystem
+                    .async_read_to_string(&path, MAX_DIFF_SIZE + 1)
+                    .await
+                    .ok()
+            } else {
+                Some(String::new())
+            }
+        } else {
+            None
+        };
 
         let file = tokio::task::spawn_blocking({
             let server = self.server.clone();
@@ -1017,6 +1185,9 @@ impl russh_sftp::server::Handler for SftpSession {
             ServerHandle::File(FileHandle {
                 path,
                 path_components,
+                writable,
+                changed: false,
+                original_content,
                 file: Arc::new(RwLock::new(file)),
             }),
         );
@@ -1103,6 +1274,8 @@ impl russh_sftp::server::Handler for SftpSession {
         .await
         .map_err(|_| StatusCode::Failure)?
         .map_err(|_| StatusCode::Failure)?;
+
+        handle.changed = true;
 
         Ok(Status {
             id,

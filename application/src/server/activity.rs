@@ -23,6 +23,8 @@ pub enum ActivityEvent {
 
     #[serde(rename = "server:sftp.login")]
     SftpLogin,
+    #[serde(rename = "server:sftp.logout")]
+    SftpLogout,
     #[serde(rename = "server:sftp.write")]
     SftpWrite,
     #[serde(rename = "server:sftp.read")]
@@ -35,6 +37,15 @@ pub enum ActivityEvent {
     SftpRename,
     #[serde(rename = "server:sftp.delete")]
     SftpDelete,
+
+    #[serde(rename = "server:ssh.login")]
+    SshLogin,
+    #[serde(rename = "server:ssh.logout")]
+    SshLogout,
+    #[serde(rename = "server:ssh.command")]
+    SshCommand,
+    #[serde(rename = "server:ssh.power")]
+    SshPower,
 
     #[serde(rename = "server:file.uploaded")]
     FileUploaded,
@@ -67,6 +78,18 @@ impl ActivityEvent {
                 | ActivityEvent::SftpCreateDirectory
                 | ActivityEvent::SftpRename
                 | ActivityEvent::SftpDelete
+                | ActivityEvent::SftpLogout
+        )
+    }
+
+    #[inline]
+    pub const fn is_ssh_event(self) -> bool {
+        matches!(
+            self,
+            ActivityEvent::SshLogin
+                | ActivityEvent::SshLogout
+                | ActivityEvent::SshCommand
+                | ActivityEvent::SshPower
         )
     }
 }

@@ -5,6 +5,7 @@ use crate::{
         activity::{Activity, ActivityEvent},
         permissions::Permission,
     },
+    ssh::registry::{SessionId, SessionType},
 };
 use russh::{
     Channel, ChannelId, MethodSet,
@@ -39,6 +40,9 @@ pub struct SshSession {
 
     pub clients: HashMap<ChannelId, Channel<Msg>>,
     pub shell_clients: HashSet<ChannelId>,
+
+    /// Tracked session IDs in the global registry, keyed by channel.
+    pub tracked_sessions: HashMap<ChannelId, SessionId>,
 }
 
 impl SshSession {
@@ -131,21 +135,19 @@ impl russh::server::Handler for SshSession {
             .user_permissions
             .set_permissions(user, permissions, &ignored_files)
             .await;
-        if self.state.config.system.sftp.activity.log_logins {
-            server
-                .activity
-                .log_activity(Activity {
-                    event: ActivityEvent::SftpLogin,
-                    user: Some(user),
-                    ip: Some(self.user_ip),
-                    metadata: Some(json!({
-                        "method": "password",
-                    })),
-                    schedule: None,
-                    timestamp: chrono::Utc::now(),
-                })
-                .await;
-        }
+        server
+            .activity
+            .log_activity(Activity {
+                event: ActivityEvent::SftpLogin,
+                user: Some(user),
+                ip: Some(self.user_ip),
+                metadata: Some(json!({
+                    "method": "password",
+                })),
+                schedule: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await;
         self.server = Some(server);
 
         Ok(Auth::Accept)
@@ -217,21 +219,19 @@ impl russh::server::Handler for SshSession {
             .user_permissions
             .set_permissions(user, permissions, &ignored_files)
             .await;
-        if self.state.config.system.sftp.activity.log_logins {
-            server
-                .activity
-                .log_activity(Activity {
-                    event: ActivityEvent::SftpLogin,
-                    user: Some(user),
-                    ip: Some(self.user_ip),
-                    metadata: Some(json!({
-                        "method": "public_key",
-                    })),
-                    schedule: None,
-                    timestamp: chrono::Utc::now(),
-                })
-                .await;
-        }
+        server
+            .activity
+            .log_activity(Activity {
+                event: ActivityEvent::SftpLogin,
+                user: Some(user),
+                ip: Some(self.user_ip),
+                metadata: Some(json!({
+                    "method": "public_key",
+                })),
+                schedule: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await;
         self.server = Some(server);
 
         Ok(Auth::Accept)
@@ -257,7 +257,33 @@ impl russh::server::Handler for SshSession {
         session.close(channel)?;
 
         self.clients.remove(&channel);
+        let was_shell = self.shell_clients.contains(&channel);
         self.shell_clients.retain(|&id| id != channel);
+
+        // Deregister from session registry and log disconnect activity.
+        if let Some(session_id) = self.tracked_sessions.remove(&channel) {
+            self.state.ssh_sessions.deregister(session_id).await;
+
+            if let Some(server) = &self.server {
+                let event = if was_shell {
+                    ActivityEvent::SshLogout
+                } else {
+                    ActivityEvent::SftpLogout
+                };
+
+                server
+                    .activity
+                    .log_activity(Activity {
+                        event,
+                        user: self.user_uuid,
+                        ip: Some(self.user_ip),
+                        metadata: None,
+                        schedule: None,
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
+            }
+        }
 
         Ok(())
     }
@@ -289,6 +315,27 @@ impl russh::server::Handler for SshSession {
         };
 
         self.shell_clients.insert(channel_id);
+
+        // Register shell session in the global registry.
+        let session_id = self
+            .state
+            .ssh_sessions
+            .register(server.uuid, user_uuid, self.user_ip, SessionType::Shell)
+            .await;
+        self.tracked_sessions.insert(channel_id, session_id);
+
+        // Log SSH login activity.
+        server
+            .activity
+            .log_activity(Activity {
+                event: ActivityEvent::SshLogin,
+                user: Some(user_uuid),
+                ip: Some(self.user_ip),
+                metadata: Some(json!({ "type": "shell" })),
+                schedule: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await;
 
         session.channel_success(channel_id)?;
         let ssh = super::shell::ShellSession {
@@ -328,6 +375,14 @@ impl russh::server::Handler for SshSession {
         };
 
         tracing::debug!("recieved command from exec: {}", command);
+
+        // Register exec session in the global registry.
+        let session_id = self
+            .state
+            .ssh_sessions
+            .register(server.uuid, user_uuid, self.user_ip, SessionType::Exec)
+            .await;
+        self.tracked_sessions.insert(channel_id, session_id);
 
         session.channel_success(channel_id)?;
         let exec = super::exec::ExecSession {
@@ -376,6 +431,15 @@ impl russh::server::Handler for SshSession {
                 Some(channel) => channel,
                 None => return Err(russh::Error::WrongChannel),
             };
+
+            // Register SFTP session in the global registry.
+            let session_id = self
+                .state
+                .ssh_sessions
+                .register(server.uuid, user_uuid, self.user_ip, SessionType::Sftp)
+                .await;
+            self.tracked_sessions.insert(channel_id, session_id);
+
             let sftp = super::sftp::SftpSession {
                 state: Arc::clone(&self.state),
                 server,

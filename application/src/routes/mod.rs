@@ -85,6 +85,7 @@ pub struct AppState {
     pub server_manager: Arc<crate::server::manager::ServerManager>,
     pub backup_manager: Arc<crate::server::backup::manager::BackupManager>,
     pub mime_cache: moka::future::Cache<MimeCacheKey, &'static str>,
+    pub ssh_sessions: crate::ssh::SshSessionRegistry,
 }
 
 #[derive(ToSchema, Serialize, Deserialize)]

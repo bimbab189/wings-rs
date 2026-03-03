@@ -4,6 +4,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 mod config;
 mod logs;
 mod overview;
+mod ssh_sessions;
 mod stats;
 mod upgrade;
 
@@ -47,5 +48,6 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/upgrade", upgrade::router(state))
         .nest("/config", config::router(state))
         .nest("/stats", stats::router(state))
+        .nest("/ssh-sessions", ssh_sessions::router(state))
         .with_state(state.clone())
 }

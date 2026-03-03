@@ -103,7 +103,7 @@ impl ShellSession {
                                     event: ActivityEvent::PowerStart,
                                     user: Some(self.user_uuid),
                                     ip: Some(self.user_ip),
-                                    metadata: None,
+                                    metadata: Some(json!({ "source": "ssh" })),
                                     schedule: None,
                                     timestamp: chrono::Utc::now(),
                                 })
@@ -155,7 +155,7 @@ impl ShellSession {
                                     event: ActivityEvent::PowerRestart,
                                     user: Some(self.user_uuid),
                                     ip: Some(self.user_ip),
-                                    metadata: None,
+                                    metadata: Some(json!({ "source": "ssh" })),
                                     schedule: None,
                                     timestamp: chrono::Utc::now(),
                                 })
@@ -208,7 +208,7 @@ impl ShellSession {
                                     event: ActivityEvent::PowerStop,
                                     user: Some(self.user_uuid),
                                     ip: Some(self.user_ip),
-                                    metadata: None,
+                                    metadata: Some(json!({ "source": "ssh" })),
                                     schedule: None,
                                     timestamp: chrono::Utc::now(),
                                 })
@@ -243,7 +243,7 @@ impl ShellSession {
                                     event: ActivityEvent::PowerKill,
                                     user: Some(self.user_uuid),
                                     ip: Some(self.user_ip),
-                                    metadata: None,
+                                    metadata: Some(json!({ "source": "ssh" })),
                                     schedule: None,
                                     timestamp: chrono::Utc::now(),
                                 })
@@ -492,11 +492,12 @@ impl ShellSession {
                                         self.server
                                             .activity
                                             .log_activity(Activity {
-                                                event: ActivityEvent::ConsoleCommand,
+                                                event: ActivityEvent::SshCommand,
                                                 user: Some(self.user_uuid),
                                                 ip: Some(self.user_ip),
                                                 metadata: Some(json!({
                                                     "command": line,
+                                                    "source": "ssh",
                                                 })),
                                                 schedule: None,
                                                 timestamp: chrono::Utc::now(),

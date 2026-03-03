@@ -7,9 +7,12 @@ use std::{
 
 mod auth;
 mod exec;
+pub mod registry;
 mod ratelimiter;
 mod sftp;
 mod shell;
+
+pub use registry::SshSessionRegistry;
 
 pub struct Server {
     ratelimiter: Arc<ratelimiter::SshRatelimiter>,
@@ -56,6 +59,7 @@ impl russh::server::Server for Server {
 
             clients: HashMap::new(),
             shell_clients: HashSet::new(),
+            tracked_sessions: HashMap::new(),
         }
     }
 }

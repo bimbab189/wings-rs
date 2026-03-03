@@ -232,11 +232,12 @@ impl ExecSession {
                             self.server
                                 .activity
                                 .log_activity(Activity {
-                                    event: ActivityEvent::ConsoleCommand,
+                                    event: ActivityEvent::SshCommand,
                                     user: Some(self.user_uuid),
                                     ip: Some(self.user_ip),
                                     metadata: Some(json!({
                                         "command": command,
+                                        "source": "ssh",
                                     })),
                                     schedule: None,
                                     timestamp: chrono::Utc::now(),

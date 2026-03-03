@@ -299,6 +299,7 @@ async fn main() {
             Arc::clone(&config),
         )),
         mime_cache: moka::future::Cache::new(20480),
+        ssh_sessions: wings_rs::ssh::SshSessionRegistry::new(),
     });
 
     state.server_manager.boot(&state, servers).await;
