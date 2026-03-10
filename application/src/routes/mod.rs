@@ -84,6 +84,7 @@ pub struct AppState {
     pub stats_manager: Arc<crate::stats::StatsManager>,
     pub server_manager: Arc<crate::server::manager::ServerManager>,
     pub backup_manager: Arc<crate::server::backup::manager::BackupManager>,
+    pub inotify_manager: Arc<crate::server::filesystem::inotify::InotifyManager>,
     pub mime_cache: moka::future::Cache<MimeCacheKey, &'static str>,
 }
 

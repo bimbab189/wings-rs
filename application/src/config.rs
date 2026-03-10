@@ -156,8 +156,9 @@ fn system_passwd_directory() -> String {
 fn system_disk_check_interval() -> u64 {
     150
 }
-fn system_disk_check_threads() -> usize {
-    2
+fn system_disk_check_use_inotify() -> bool {
+    // TODO: change to true once stability is truly verified
+    false
 }
 fn system_activity_send_interval() -> u64 {
     60
@@ -555,8 +556,8 @@ nestify::nest! {
 
             #[serde(default = "system_disk_check_interval")]
             pub disk_check_interval: u64,
-            #[serde(default = "system_disk_check_threads")]
-            pub disk_check_threads: usize,
+            #[serde(default = "system_disk_check_use_inotify")]
+            pub disk_check_use_inotify: bool,
             #[serde(default)]
             pub disk_limiter_mode: crate::server::filesystem::limiter::DiskLimiterMode,
             #[serde(default = "system_activity_send_interval")]

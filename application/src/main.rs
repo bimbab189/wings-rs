@@ -298,6 +298,11 @@ async fn main() {
         backup_manager: Arc::new(wings_rs::server::backup::manager::BackupManager::new(
             Arc::clone(&config),
         )),
+        inotify_manager: Arc::new(
+            wings_rs::server::filesystem::inotify::InotifyManager::new()
+                .context("failed to initialize inotify manager")
+                .unwrap(),
+        ),
         mime_cache: moka::future::Cache::new(20480),
     });
 

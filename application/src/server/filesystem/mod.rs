@@ -16,16 +16,17 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, RwLock, RwLockReadGuard},
+    sync::{RwLock, RwLockReadGuard},
 };
 
 pub mod archive;
 pub mod cap;
+pub mod inotify;
 pub mod limiter;
 pub mod operations;
 pub mod pull;
@@ -69,12 +70,15 @@ pub struct Filesystem {
     app_state: crate::routes::State,
 
     disk_checker_rescan: Arc<tokio::sync::Notify>,
+    pub disk_checker_state_dirty: Arc<AtomicBool>,
     disk_checker: tokio::task::JoinHandle<()>,
     config: Arc<crate::config::Config>,
 
     pub base_path: PathBuf,
     base_fs_mount_path: RwLock<PathBuf>,
     cap_filesystem: cap::CapFilesystem,
+    server_notifier: inotify::InotifyServerNotifier,
+    use_server_notifier: Arc<AtomicBool>,
 
     disk_limit: AtomicI64,
     disk_usage_cached: Arc<AtomicU64>,
@@ -98,6 +102,9 @@ impl Filesystem {
         deny_list: &[compact_str::CompactString],
     ) -> Self {
         let base_path = config.data_path(uuid);
+
+        let disk_checker_state_dirty = Arc::new(AtomicBool::new(true));
+
         let disk_usage = Arc::new(RwLock::new(usage::DiskUsage::default()));
         let disk_usage_cached = Arc::new(AtomicU64::new(0));
         let apparent_disk_usage_cached = Arc::new(AtomicU64::new(0));
@@ -108,165 +115,210 @@ impl Filesystem {
         }
 
         let cap_filesystem = cap::CapFilesystem::new_uninitialized(base_path.clone());
+        let server_notifier = inotify::InotifyServerNotifier::new(base_path.clone());
+        let use_server_notifier = Arc::new(AtomicBool::new(false));
         let disk_checker_rescan = Arc::new(tokio::sync::Notify::new());
 
         Self {
             uuid,
             app_state,
             disk_checker_rescan: Arc::clone(&disk_checker_rescan),
-            disk_checker: tokio::task::spawn({
+            disk_checker_state_dirty: Arc::clone(&disk_checker_state_dirty),
+            disk_checker: tokio::spawn({
                 let config = Arc::clone(&config);
                 let disk_usage = Arc::clone(&disk_usage);
                 let disk_usage_cached = Arc::clone(&disk_usage_cached);
                 let apparent_disk_usage_cached = Arc::clone(&apparent_disk_usage_cached);
                 let cap_filesystem = cap_filesystem.clone();
+                let server_notifier = server_notifier.clone();
+                let use_server_notifier = Arc::clone(&use_server_notifier);
 
                 async move {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
                     loop {
-                        let run_inner = async || -> Result<(), anyhow::Error> {
+                        let run_inner = async |paths_to_scan: Option<Vec<PathBuf>>| -> Result<(), anyhow::Error> {
                             tracing::debug!(
                                 path = %cap_filesystem.base_path.display(),
                                 "checking disk usage"
                             );
 
-                            let tmp_disk_usage =
-                                Arc::new(Mutex::new(Some(usage::DiskUsage::default())));
-                            let seen_inodes = Arc::new(RwLock::new(HashSet::new()));
-                            let total_entries = Arc::new(AtomicU64::new(0));
-                            let total_size = Arc::new(AtomicU64::new(0));
-                            let apparent_total_size = Arc::new(AtomicU64::new(0));
+                            if let Some(modified_paths) = paths_to_scan {
+                                let mut dirs_to_scan = Vec::new();
+                                for modified_path in &modified_paths {
+                                    let relative = match modified_path.strip_prefix(&*cap_filesystem.base_path) {
+                                        Ok(relative) => relative,
+                                        Err(_) => continue,
+                                    };
 
-                            cap_filesystem
-                                .async_walk_dir(Path::new(""))
-                                .await?
-                                .run_multithreaded(
-                                    config.system.disk_check_threads,
-                                    Arc::new({
-                                        let total_size = Arc::clone(&total_size);
-                                        let total_entries = Arc::clone(&total_entries);
-                                        let apparent_total_size = Arc::clone(&apparent_total_size);
-                                        let disk_usage = Arc::clone(&tmp_disk_usage);
-                                        let seen_inodes = Arc::clone(&seen_inodes);
-                                        let cap_filesystem = cap_filesystem.clone();
+                                    let dir = match cap_filesystem.async_symlink_metadata(relative).await {
+                                        Ok(m) if m.is_dir() => relative.to_path_buf(),
+                                        Ok(_) => match relative.parent() {
+                                            Some(p) => p.to_path_buf(),
+                                            None => continue,
+                                        },
+                                        Err(_) => {
+                                            disk_usage.write().await.remove_path(relative);
+                                            continue;
+                                        }
+                                    };
 
-                                        move |_, path: PathBuf| {
-                                            let total_size = Arc::clone(&total_size);
-                                            let total_entries = Arc::clone(&total_entries);
-                                            let apparent_total_size =
-                                                Arc::clone(&apparent_total_size);
-                                            let disk_usage = Arc::clone(&disk_usage);
-                                            let seen_inodes = Arc::clone(&seen_inodes);
-                                            let cap_filesystem = cap_filesystem.clone();
+                                    dirs_to_scan.push(dir);
+                                }
 
-                                            async move {
-                                                let metadata = match cap_filesystem
-                                                    .async_symlink_metadata(&path)
-                                                    .await
-                                                {
-                                                    Ok(metadata) => metadata,
-                                                    Err(_) => return Ok(()),
-                                                };
-                                                let size = metadata.len();
+                                let dirs_to_scan = crate::utils::deduplicate_paths(dirs_to_scan);
 
-                                                total_entries.fetch_add(1, Ordering::Relaxed);
+                                tracing::debug!(
+                                    path = %cap_filesystem.base_path.display(),
+                                    "checking disk usage for {} modified directories: {:?}",
+                                    dirs_to_scan.len(),
+                                    dirs_to_scan
+                                );
 
-                                                #[cfg(unix)]
-                                                {
-                                                    use cap_std::fs::MetadataExt;
+                                for dir in &dirs_to_scan {
+                                    let mut seen_inodes = HashSet::new();
+                                    let mut dir_total = 0;
+                                    let mut dir_apparent = 0;
 
-                                                    if !metadata.is_dir() && metadata.nlink() > 1 {
-                                                        if seen_inodes
-                                                            .read()
-                                                            .await
-                                                            .contains(&metadata.ino())
-                                                        {
-                                                            if let Some(disk_usage) =
-                                                                &mut *disk_usage.lock().await
-                                                                && let Some(parent) = path.parent()
-                                                            {
-                                                                disk_usage.update_size(
-                                                                    parent,
-                                                                    (0, size as i64).into(),
-                                                                );
-                                                            }
-                                                            apparent_total_size
-                                                                .fetch_add(size, Ordering::Relaxed);
-                                                            return Ok(());
-                                                        } else {
-                                                            seen_inodes
-                                                                .write()
-                                                                .await
-                                                                .insert(metadata.ino());
-                                                        }
-                                                    }
+                                    let mut walker = cap_filesystem.async_walk_dir(dir).await?;
+                                    while let Some(entry) = walker.next_entry().await {
+                                        let (_, path) = entry?;
+                                        let metadata = match cap_filesystem.async_symlink_metadata(&path).await {
+                                            Ok(m) => m,
+                                            Err(_) => continue,
+                                        };
+                                        let size = metadata.len();
+
+                                        #[cfg(unix)]
+                                        {
+                                            use cap_std::fs::MetadataExt;
+                                            if !metadata.is_dir() && metadata.nlink() > 1 {
+                                                if seen_inodes.contains(&metadata.ino()) {
+                                                    dir_apparent += size;
+                                                    continue;
+                                                } else {
+                                                    seen_inodes.insert(metadata.ino());
                                                 }
-
-                                                if metadata.is_dir()
-                                                    && let Some(disk_usage) =
-                                                        &mut *disk_usage.lock().await
-                                                {
-                                                    disk_usage
-                                                        .update_size(&path, (size as i64).into());
-                                                } else if let Some(parent) = path.parent()
-                                                    && let Some(disk_usage) =
-                                                        &mut *disk_usage.lock().await
-                                                {
-                                                    disk_usage
-                                                        .update_size(parent, (size as i64).into());
-                                                }
-
-                                                total_size.fetch_add(size, Ordering::Relaxed);
-                                                apparent_total_size
-                                                    .fetch_add(size, Ordering::Relaxed);
-                                                Ok(())
                                             }
                                         }
-                                    }),
-                                )
-                                .await?;
 
-                            let tmp_disk_usage = match tmp_disk_usage.lock().await.take() {
-                                Some(usage) => usage,
-                                None => {
-                                    return Err(anyhow::anyhow!(
-                                        "disk usage is already taken (???????)"
-                                    ));
+                                        dir_total += size;
+                                        dir_apparent += size;
+                                    }
+
+                                    let mut disk_usage_write = disk_usage.write().await;
+                                    disk_usage_write.remove_path(dir);
+                                    disk_usage_write.update_size(dir, (dir_total as i64, dir_apparent as i64).into());
+                                    let root = disk_usage_write.space;
+                                    drop(disk_usage_write);
+
+                                    disk_usage_cached.store(root.get_real(), Ordering::Relaxed);
+                                    apparent_disk_usage_cached.store(root.get_apparent(), Ordering::Relaxed);
                                 }
-                            };
+
+                                return Ok(());
+                            }
+
+                            let mut tmp_disk_usage = usage::DiskUsage::default();
+                            let mut seen_inodes = HashSet::new();
+                            let mut total_entries = 0;
+                            let mut total_size = 0;
+                            let mut apparent_total_size = 0;
+
+                            let mut walker = cap_filesystem.async_walk_dir(Path::new("")).await?;
+
+                            while let Some(entry) = walker.next_entry().await {
+                                let (_, path) = entry?;
+
+                                let metadata = match cap_filesystem.async_symlink_metadata(&path).await {
+                                    Ok(metadata) => metadata,
+                                    Err(_) => return Ok(()),
+                                };
+                                let size = metadata.len();
+
+                                total_entries += 1;
+
+                                #[cfg(unix)]
+                                {
+                                    use cap_std::fs::MetadataExt;
+
+                                    if !metadata.is_dir() && metadata.nlink() > 1 {
+                                        if seen_inodes.contains(&metadata.ino()) {
+                                            if let Some(parent) = path.parent() {
+                                                tmp_disk_usage
+                                                    .update_size(parent, (0, size as i64).into());
+                                            }
+                                            apparent_total_size += size;
+                                            continue;
+                                        } else {
+                                            seen_inodes.insert(metadata.ino());
+                                        }
+                                    }
+                                }
+
+                                if metadata.is_dir() {
+                                    tmp_disk_usage.update_size(&path, (size as i64).into());
+                                } else if let Some(parent) = path.parent() {
+                                    tmp_disk_usage.update_size(parent, (size as i64).into());
+                                }
+
+                                total_size += size;
+                                apparent_total_size += size;
+                            }
 
                             *disk_usage.write().await = tmp_disk_usage;
-                            disk_usage_cached
-                                .store(total_size.load(Ordering::Relaxed), Ordering::Relaxed);
-                            apparent_disk_usage_cached.store(
-                                apparent_total_size.load(Ordering::Relaxed),
-                                Ordering::Relaxed,
-                            );
+                            disk_usage_cached.store(total_size, Ordering::Relaxed);
+                            apparent_disk_usage_cached.store(apparent_total_size, Ordering::Relaxed);
 
                             tracing::debug!(
                                 path = %cap_filesystem.base_path.display(),
-                                total_entries = total_entries.load(Ordering::Relaxed),
+                                total_entries = total_entries,
                                 "{} bytes disk usage",
-                                disk_usage_cached.load(Ordering::Relaxed)
+                                total_size
                             );
 
                             Ok(())
                         };
 
-                        match run_inner().await {
-                            Ok(_) => {
-                                tracing::debug!(
-                                    path = %cap_filesystem.base_path.display(),
-                                    "disk usage check completed successfully"
-                                );
-                            }
-                            Err(err) => {
-                                tracing::error!(
-                                    path = %cap_filesystem.base_path.display(),
-                                    "disk usage check failed: {}",
-                                    err
-                                );
+                        if !disk_checker_state_dirty.swap(false, Ordering::Relaxed) {
+                            tracing::debug!(
+                                "skipping disk usage check due to server state inactivity"
+                            );
+                        } else {
+                            let paths_to_scan = if use_server_notifier.load(Ordering::Relaxed) {
+                                let paths = server_notifier.take_modified_paths().await;
+                                if paths.is_empty() {
+                                    tracing::debug!(
+                                        path = %cap_filesystem.base_path.display(),
+                                        "skipping disk usage check, no modified paths"
+                                    );
+                                    None
+                                } else {
+                                    tracing::debug!(
+                                        path = %cap_filesystem.base_path.display(),
+                                        "checking disk usage for {} modified paths",
+                                        paths.len()
+                                    );
+                                    Some(paths)
+                                }
+                            } else {
+                                None
+                            };
+
+                            match run_inner(paths_to_scan).await {
+                                Ok(_) => {
+                                    tracing::debug!(
+                                        path = %cap_filesystem.base_path.display(),
+                                        "disk usage check completed successfully"
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::error!(
+                                        path = %cap_filesystem.base_path.display(),
+                                        "disk usage check failed: {}",
+                                        err
+                                    );
+                                }
                             }
                         }
 
@@ -274,7 +326,9 @@ impl Filesystem {
                             _ = tokio::time::sleep(std::time::Duration::from_secs(
                                 config.system.disk_check_interval,
                             )) => {},
-                            _ = disk_checker_rescan.notified() => {}
+                            _ = disk_checker_rescan.notified() => {
+                                server_notifier.clear_modified_paths().await;
+                            }
                         }
                     }
                 }
@@ -284,6 +338,8 @@ impl Filesystem {
             base_path: base_path.clone(),
             base_fs_mount_path: RwLock::new(base_path),
             cap_filesystem,
+            server_notifier,
+            use_server_notifier,
 
             disk_limit: AtomicI64::new(disk_limit as i64),
             disk_usage_cached,
@@ -306,7 +362,8 @@ impl Filesystem {
     }
 
     #[inline]
-    pub fn rerun_disk_checker(&self) {
+    pub async fn rerun_disk_checker(&self) {
+        self.server_notifier.clear_modified_paths().await;
         self.disk_checker_rescan.notify_one();
     }
 
@@ -1091,6 +1148,19 @@ impl Filesystem {
             {
                 Ok(Ok(dir)) => {
                     *self.cap_filesystem.inner.write().await = Some(Arc::new(dir));
+                    if let Err(err) = self
+                        .app_state
+                        .inotify_manager
+                        .register_server_with_notifier(self.server_notifier.clone(), self.uuid)
+                        .await
+                    {
+                        tracing::error!(
+                            "error while trying to attach server inotify listener, falling back to regular scans: {}",
+                            err
+                        );
+                    } else {
+                        self.use_server_notifier.store(true, Ordering::Relaxed);
+                    }
                 }
                 Ok(Err(err)) => {
                     tracing::error!(
@@ -1128,6 +1198,19 @@ impl Filesystem {
             {
                 Ok(Ok(dir)) => {
                     *self.cap_filesystem.inner.write().await = Some(Arc::new(dir));
+                    if let Err(err) = self
+                        .app_state
+                        .inotify_manager
+                        .register_server_with_notifier(self.server_notifier.clone(), self.uuid)
+                        .await
+                    {
+                        tracing::error!(
+                            "error while trying to attach server inotify listener, falling back to regular scans: {}",
+                            err
+                        );
+                    } else {
+                        self.use_server_notifier.store(true, Ordering::Relaxed);
+                    }
                 }
                 Ok(Err(err)) => {
                     tracing::error!(
@@ -1149,6 +1232,10 @@ impl Filesystem {
 
     pub async fn destroy(&self) {
         self.disk_checker.abort();
+        self.app_state
+            .inotify_manager
+            .unregister_server(self.uuid)
+            .await;
 
         if let Err(err) = self.get_disk_limiter().destroy().await {
             tracing::error!(

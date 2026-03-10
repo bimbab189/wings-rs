@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use std::{path::PathBuf, sync::LazyLock};
 
 pub fn draw_progress_bar(width: usize, current: f64, total: f64) -> String {
     let progress_percentage = (current / total) * 100.0;
@@ -48,6 +48,28 @@ pub fn parse_content_disposition_filename(header: &str) -> Option<String> {
     }
 
     None
+}
+
+pub fn deduplicate_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+
+    paths.sort();
+    paths.dedup();
+
+    let mut unique = Vec::new();
+    for path in paths {
+        if let Some(last) = unique.last()
+            && path.starts_with(last)
+        {
+            continue;
+        }
+
+        unique.push(path);
+    }
+
+    unique
 }
 
 #[inline]
