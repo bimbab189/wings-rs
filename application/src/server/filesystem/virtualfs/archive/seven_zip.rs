@@ -8,6 +8,7 @@ use crate::{
         archive::{StreamableArchiveFormat, multi_reader::MultiReader},
         cap::FileType,
         encode_mode,
+        usage::UsedSpace,
         virtualfs::{
             AsyncFileRead, AsyncReadableFileStream, ByteRange, DirectoryListing,
             DirectoryStreamWalk, DirectoryWalk, FileMetadata, FileRead, IsIgnoredFn,
@@ -34,7 +35,7 @@ pub struct VirtualSevenZipArchive {
     pub archive: Arc<sevenz_rust2::Archive>,
     pub mime_cache: moka::sync::Cache<usize, &'static str>,
     pub reader: MultiReader,
-    pub sizes: Arc<Vec<(u64, PathBuf)>>,
+    pub sizes: Arc<Vec<(UsedSpace, PathBuf)>>,
 }
 
 impl VirtualSevenZipArchive {
@@ -43,11 +44,17 @@ impl VirtualSevenZipArchive {
         archive: Arc<sevenz_rust2::Archive>,
         reader: MultiReader,
     ) -> Self {
-        let sizes = archive
+        let mut sizes = archive
             .files
             .iter()
-            .map(|entry| (entry.size, PathBuf::from(&entry.name)))
+            .map(|entry| {
+                (
+                    UsedSpace::new(entry.size, entry.compressed_size),
+                    PathBuf::from(&entry.name),
+                )
+            })
             .collect::<Vec<_>>();
+        sizes.shrink_to_fit();
 
         Self {
             server,
@@ -87,19 +94,21 @@ impl VirtualSevenZipArchive {
         path: &Path,
         entry_index: usize,
         mime_cache: &moka::sync::Cache<usize, &'static str>,
-        sizes: &[(u64, PathBuf)],
+        sizes: &[(UsedSpace, PathBuf)],
         buffer: Option<&[u8]>,
         entry: &sevenz_rust2::ArchiveEntry,
         reader: &mut dyn Read,
     ) -> DirectoryEntry {
-        let size = if entry.is_directory() {
-            sizes
+        let (size, size_physical) = if entry.is_directory() {
+            let space: UsedSpace = sizes
                 .iter()
                 .filter(|(_, name)| name.starts_with(path))
                 .map(|(size, _)| *size)
-                .sum()
+                .sum();
+
+            (space.get_logical(), space.get_physical())
         } else {
-            entry.size()
+            (entry.size, entry.compressed_size)
         };
 
         let mime_type = if entry.is_directory() {
@@ -169,6 +178,7 @@ impl VirtualSevenZipArchive {
             mode: encode_mode(mode),
             mode_bits: compact_str::format_compact!("{:o}", mode),
             size,
+            size_physical,
             directory: entry.is_directory(),
             file: !entry.is_directory(),
             symlink: false,

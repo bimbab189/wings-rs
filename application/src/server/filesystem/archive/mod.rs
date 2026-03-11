@@ -176,7 +176,6 @@ impl StreamableArchiveFormat {
     }
 }
 
-#[inline]
 pub fn zip_entry_get_modified_time(
     entry: &zip::read::ZipFile<impl std::io::Read>,
 ) -> Option<cap_std::time::SystemTime> {
@@ -186,6 +185,14 @@ pub fn zip_entry_get_modified_time(
         {
             return Some(cap_std::time::SystemTime::from_std(
                 std::time::UNIX_EPOCH + std::time::Duration::from_secs(mod_time as u64),
+            ));
+        }
+
+        if let zip::extra_fields::ExtraField::Ntfs(ntfs) = field {
+            let mtime = sevenz_rust2::NtTime::new(ntfs.mtime());
+
+            return Some(cap_std::time::SystemTime::from_std(
+                std::time::SystemTime::from(mtime),
             ));
         }
     }
@@ -210,6 +217,30 @@ pub fn zip_entry_get_modified_time(
                     chrono_date.and_time(chrono_time).and_utc().timestamp() as u64,
                 ),
         ));
+    }
+
+    None
+}
+
+pub fn zip_entry_get_created_time(
+    entry: &zip::read::ZipFile<impl std::io::Read>,
+) -> Option<cap_std::time::SystemTime> {
+    for field in entry.extra_data_fields() {
+        if let zip::extra_fields::ExtraField::ExtendedTimestamp(ext) = field
+            && let Some(cr_time) = ext.cr_time()
+        {
+            return Some(cap_std::time::SystemTime::from_std(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(cr_time as u64),
+            ));
+        }
+
+        if let zip::extra_fields::ExtraField::Ntfs(ntfs) = field {
+            let ctime = sevenz_rust2::NtTime::new(ntfs.ctime());
+
+            return Some(cap_std::time::SystemTime::from_std(
+                std::time::SystemTime::from(ctime),
+            ));
+        }
     }
 
     None

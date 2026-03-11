@@ -314,7 +314,7 @@ impl OutgoingServerTransfer {
                     .unwrap(),
                 );
 
-            let mut total_bytes = server.filesystem.get_apparent_cached_size();
+            let mut total_bytes = server.filesystem.get_logical_cached_size();
 
             if let Ok(install_logs) = crate::server::installation::ServerInstaller::get_install_logs(&server).await {
                 total_bytes += install_logs.metadata().await.map(|m| m.len()).unwrap_or(0);

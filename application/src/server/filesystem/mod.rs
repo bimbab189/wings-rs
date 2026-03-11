@@ -3,7 +3,7 @@ use crate::{
     server::filesystem::virtualfs::{
         DirectoryStreamWalkFn, VirtualReadableFilesystem, VirtualWritableFilesystem,
     },
-    utils::PortableModeExt,
+    utils::{PortableModeExt, PortableSizeExt},
 };
 use cap_std::fs::Metadata;
 use compact_str::ToCompactString;
@@ -81,9 +81,9 @@ pub struct Filesystem {
     use_server_notifier: Arc<AtomicBool>,
 
     disk_limit: AtomicI64,
-    disk_usage_cached: Arc<AtomicU64>,
     disk_usage_delta_cached: Arc<AtomicI64>,
-    apparent_disk_usage_cached: Arc<AtomicU64>,
+    disk_usage_cached_logical: Arc<AtomicU64>,
+    disk_usage_cached_physical: Arc<AtomicU64>,
     pub disk_usage: Arc<RwLock<usage::DiskUsage>>,
     disk_ignored: Arc<RwLock<ignore::gitignore::Gitignore>>,
 
@@ -106,8 +106,8 @@ impl Filesystem {
         let disk_checker_state_dirty = Arc::new(AtomicBool::new(true));
 
         let disk_usage = Arc::new(RwLock::new(usage::DiskUsage::default()));
-        let disk_usage_cached = Arc::new(AtomicU64::new(0));
-        let apparent_disk_usage_cached = Arc::new(AtomicU64::new(0));
+        let disk_usage_cached_logical = Arc::new(AtomicU64::new(0));
+        let disk_usage_cached_physical = Arc::new(AtomicU64::new(0));
         let mut disk_ignored = ignore::gitignore::GitignoreBuilder::new("/");
 
         for entry in deny_list {
@@ -127,8 +127,8 @@ impl Filesystem {
             disk_checker: tokio::spawn({
                 let config = Arc::clone(&config);
                 let disk_usage = Arc::clone(&disk_usage);
-                let disk_usage_cached = Arc::clone(&disk_usage_cached);
-                let apparent_disk_usage_cached = Arc::clone(&apparent_disk_usage_cached);
+                let disk_usage_cached_logical = Arc::clone(&disk_usage_cached_logical);
+                let disk_usage_cached_physical = Arc::clone(&disk_usage_cached_physical);
                 let cap_filesystem = cap_filesystem.clone();
                 let server_notifier = server_notifier.clone();
                 let use_server_notifier = Arc::clone(&use_server_notifier);
@@ -214,7 +214,7 @@ impl Filesystem {
                                                 Ok(metadata) => metadata,
                                                 Err(_) => continue,
                                             };
-                                            let size = metadata.len();
+                                            let delta = usage::SpaceDelta::new(metadata.size_logical() as i64, metadata.size_physical() as i64);
 
                                             let relative = match path.strip_prefix(dir) {
                                                 Ok(relative) => relative,
@@ -229,7 +229,7 @@ impl Filesystem {
                                                     if seen_inodes.contains(&metadata.ino()) {
                                                         if let Some(parent) = relative.parent() {
                                                             tmp_disk_usage
-                                                                .update_size(parent, (0, size as i64).into());
+                                                                .update_size(parent, usage::SpaceDelta::only_logical(delta.logical));
                                                         }
                                                         continue;
                                                     } else {
@@ -239,9 +239,9 @@ impl Filesystem {
                                             }
 
                                             if metadata.is_dir() {
-                                                tmp_disk_usage.update_size(relative, (size as i64).into());
+                                                tmp_disk_usage.update_size(relative, delta);
                                             } else if let Some(parent) = relative.parent() {
-                                                tmp_disk_usage.update_size(parent, (size as i64).into());
+                                                tmp_disk_usage.update_size(parent, delta);
                                             }
                                         }
 
@@ -256,8 +256,8 @@ impl Filesystem {
                                         let root_space = disk_usage_write.space;
                                         drop(disk_usage_write);
 
-                                        disk_usage_cached.store(root_space.get_real(), Ordering::Relaxed);
-                                        apparent_disk_usage_cached.store(root_space.get_apparent(), Ordering::Relaxed);
+                                        disk_usage_cached_logical.store(root_space.get_logical(), Ordering::Relaxed);
+                                        disk_usage_cached_physical.store(root_space.get_physical(), Ordering::Relaxed);
                                     }
 
                                     return Ok(());
@@ -268,7 +268,7 @@ impl Filesystem {
                             let mut seen_inodes = HashSet::new();
                             let mut total_entries = 0;
                             let mut total_size = 0;
-                            let mut apparent_total_size = 0;
+                            let mut total_size_physical = 0;
 
                             let mut walker = cap_filesystem.async_walk_dir(Path::new("")).await?;
 
@@ -279,7 +279,7 @@ impl Filesystem {
                                     Ok(metadata) => metadata,
                                     Err(_) => return Ok(()),
                                 };
-                                let size = metadata.len();
+                                let delta = usage::SpaceDelta::new(metadata.size_logical() as i64, metadata.size_physical() as i64);
 
                                 total_entries += 1;
 
@@ -291,9 +291,9 @@ impl Filesystem {
                                         if seen_inodes.contains(&metadata.ino()) {
                                             if let Some(parent) = path.parent() {
                                                 tmp_disk_usage
-                                                    .update_size(parent, (0, size as i64).into());
+                                                    .update_size(parent, usage::SpaceDelta::only_logical(delta.logical));
                                             }
-                                            apparent_total_size += size;
+                                            total_size += metadata.size_logical();
                                             continue;
                                         } else {
                                             seen_inodes.insert(metadata.ino());
@@ -302,18 +302,18 @@ impl Filesystem {
                                 }
 
                                 if metadata.is_dir() {
-                                    tmp_disk_usage.update_size(&path, (size as i64).into());
+                                    tmp_disk_usage.update_size(&path, delta);
                                 } else if let Some(parent) = path.parent() {
-                                    tmp_disk_usage.update_size(parent, (size as i64).into());
+                                    tmp_disk_usage.update_size(parent, delta);
                                 }
 
-                                total_size += size;
-                                apparent_total_size += size;
+                                total_size += metadata.size_logical();
+                                total_size_physical += metadata.size_physical();
                             }
 
                             *disk_usage.write().await = tmp_disk_usage;
-                            disk_usage_cached.store(total_size, Ordering::Relaxed);
-                            apparent_disk_usage_cached.store(apparent_total_size, Ordering::Relaxed);
+                            disk_usage_cached_logical.store(total_size, Ordering::Relaxed);
+                            disk_usage_cached_physical.store(total_size_physical, Ordering::Relaxed);
 
                             tracing::debug!(
                                 path = %cap_filesystem.base_path.display(),
@@ -380,9 +380,9 @@ impl Filesystem {
             use_server_notifier,
 
             disk_limit: AtomicI64::new(disk_limit as i64),
-            disk_usage_cached,
             disk_usage_delta_cached: Arc::new(AtomicI64::new(0)),
-            apparent_disk_usage_cached,
+            disk_usage_cached_logical,
+            disk_usage_cached_physical,
             disk_usage,
             disk_ignored: Arc::new(RwLock::new(disk_ignored.build().unwrap())),
 
@@ -395,8 +395,13 @@ impl Filesystem {
     }
 
     #[inline]
-    pub fn get_apparent_cached_size(&self) -> u64 {
-        self.apparent_disk_usage_cached.load(Ordering::Relaxed)
+    pub fn get_logical_cached_size(&self) -> u64 {
+        self.disk_usage_cached_logical.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn get_physical_cached_size(&self) -> u64 {
+        self.disk_usage_cached_logical.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -459,7 +464,7 @@ impl Filesystem {
         self.get_disk_limiter()
             .disk_usage()
             .await
-            .unwrap_or_else(|_| self.disk_usage_cached.load(Ordering::Relaxed))
+            .unwrap_or_else(|_| self.get_physical_cached_size())
     }
 
     #[inline]
@@ -697,7 +702,7 @@ impl Filesystem {
 
         let size = if metadata.is_dir() {
             let disk_usage = self.disk_usage.read().await;
-            disk_usage.get_size(&path).map_or(0, |s| s.get_real())
+            disk_usage.get_size(&path).map_or(0, |s| s.get_logical())
         } else {
             metadata.len()
         };
@@ -926,7 +931,7 @@ impl Filesystem {
             if !ignorant && self.disk_limit() != 0 {
                 let limit = self.disk_limit() as u64;
 
-                let result = self.disk_usage_cached.fetch_update(
+                let result = self.disk_usage_cached_logical.fetch_update(
                     Ordering::SeqCst,
                     Ordering::Relaxed,
                     |current| {
@@ -947,21 +952,21 @@ impl Filesystem {
                     return false;
                 }
             } else {
-                self.disk_usage_cached
+                self.disk_usage_cached_logical
                     .fetch_add(delta_u64, Ordering::Relaxed);
             }
 
-            self.apparent_disk_usage_cached
+            self.disk_usage_cached_physical
                 .fetch_add(delta_u64, Ordering::Relaxed);
         } else {
             let abs_size = delta.unsigned_abs();
 
-            self.disk_usage_cached
+            self.disk_usage_cached_logical
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     Some(current.saturating_sub(abs_size))
                 })
                 .ok();
-            self.apparent_disk_usage_cached
+            self.disk_usage_cached_physical
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     Some(current.saturating_sub(abs_size))
                 })
@@ -1068,7 +1073,8 @@ impl Filesystem {
 
     pub async fn truncate_root(&self) -> Result<(), anyhow::Error> {
         self.disk_usage.write().await.clear();
-        self.disk_usage_cached.store(0, Ordering::Relaxed);
+        self.disk_usage_cached_logical.store(0, Ordering::Relaxed);
+        self.disk_usage_cached_physical.store(0, Ordering::Relaxed);
 
         let mut directory = self.async_read_dir(Path::new("")).await?;
         while let Some(Ok((file_type, path))) = directory.next_entry().await {
@@ -1300,18 +1306,16 @@ impl Filesystem {
         let real_metadata = symlink_destination_metadata.as_ref().unwrap_or(metadata);
         let real_path = symlink_destination.as_ref().unwrap_or(&path);
 
-        let size = if real_metadata.is_dir() {
+        let (size, size_physical) = if real_metadata.is_dir() {
             if !no_directory_size && !self.config.api.disable_directory_size {
-                self.disk_usage
-                    .read()
-                    .await
-                    .get_size(real_path)
-                    .map_or(0, |s| s.get_real())
+                let space = self.disk_usage.read().await.get_size(real_path);
+
+                space.map_or((0, 0), |s| (s.get_logical(), s.get_physical()))
             } else {
-                0
+                (0, 0)
             }
         } else {
-            real_metadata.len()
+            (real_metadata.size_logical(), real_metadata.size_physical())
         };
 
         let mime = if real_metadata.is_dir() {
@@ -1367,6 +1371,7 @@ impl Filesystem {
             mode: encode_mode(metadata.permissions().mode()),
             mode_bits: compact_str::format_compact!("{:o}", metadata.permissions().mode() & 0o777),
             size,
+            size_physical,
             directory: real_metadata.is_dir(),
             file: real_metadata.is_file(),
             symlink: metadata.is_symlink(),
@@ -1386,18 +1391,16 @@ impl Filesystem {
         let real_metadata = symlink_destination_metadata.as_ref().unwrap_or(metadata);
         let real_path = symlink_destination.as_ref().unwrap_or(&path);
 
-        let size = if real_metadata.is_dir() {
+        let (size, size_physical) = if real_metadata.is_dir() {
             if !no_directory_size && !self.config.api.disable_directory_size {
-                self.disk_usage
-                    .read()
-                    .await
-                    .get_size(real_path)
-                    .map_or(0, |s| s.get_real())
+                let space = self.disk_usage.read().await.get_size(real_path);
+
+                space.map_or((0, 0), |s| (s.get_logical(), s.get_physical()))
             } else {
-                0
+                (0, 0)
             }
         } else {
-            real_metadata.len()
+            (real_metadata.size_logical(), real_metadata.size_physical())
         };
 
         let mime_type = if real_metadata.is_dir() {
@@ -1443,6 +1446,7 @@ impl Filesystem {
             mode: encode_mode(metadata.permissions().mode()),
             mode_bits: compact_str::format_compact!("{:o}", metadata.permissions().mode() & 0o777),
             size,
+            size_physical,
             directory: real_metadata.is_dir(),
             file: real_metadata.is_file(),
             symlink: metadata.is_symlink(),

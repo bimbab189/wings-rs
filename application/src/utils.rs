@@ -140,3 +140,52 @@ impl PortableModeExt for cap_std::fs::Permissions {
         if self.readonly() { 0o444 } else { 0o666 }
     }
 }
+
+pub trait PortableSizeExt {
+    fn size_logical(&self) -> u64;
+    fn size_physical(&self) -> u64;
+}
+
+#[cfg(unix)]
+impl PortableSizeExt for std::fs::Metadata {
+    fn size_logical(&self) -> u64 {
+        self.len()
+    }
+
+    fn size_physical(&self) -> u64 {
+        std::os::unix::fs::MetadataExt::blocks(self) * 512
+    }
+}
+
+#[cfg(unix)]
+impl PortableSizeExt for cap_std::fs::Metadata {
+    fn size_logical(&self) -> u64 {
+        self.len()
+    }
+
+    fn size_physical(&self) -> u64 {
+        cap_std::fs::MetadataExt::blocks(self) * 512
+    }
+}
+
+#[cfg(windows)]
+impl PortableSizeExt for std::fs::Metadata {
+    fn size_logical(&self) -> u64 {
+        self.len()
+    }
+
+    fn size_physical(&self) -> u64 {
+        self.len()
+    }
+}
+
+#[cfg(windows)]
+impl PortableSizeExt for cap_std::fs::Metadata {
+    fn size_logical(&self) -> u64 {
+        self.len()
+    }
+
+    fn size_physical(&self) -> u64 {
+        self.len()
+    }
+}

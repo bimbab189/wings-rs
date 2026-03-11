@@ -93,24 +93,37 @@ impl VirtualDdupBakArchive {
         path: &Path,
         entry: &ddup_bak::archive::entries::Entry,
     ) -> DirectoryEntry {
-        let size = match entry {
-            ddup_bak::archive::entries::Entry::File(file) => file.size_real,
+        let (size, size_physical) = match entry {
+            ddup_bak::archive::entries::Entry::File(file) => (
+                file.size_real,
+                file.size_compressed.unwrap_or(file.size_real),
+            ),
             ddup_bak::archive::entries::Entry::Directory(dir) => {
-                fn recursive_size(entry: &ddup_bak::archive::entries::Entry) -> u64 {
+                fn recursive_size(entry: &ddup_bak::archive::entries::Entry) -> (u64, u64) {
                     match entry {
-                        ddup_bak::archive::entries::Entry::File(file) => file.size_real,
-                        ddup_bak::archive::entries::Entry::Directory(dir) => {
-                            dir.entries.iter().map(recursive_size).sum()
-                        }
+                        ddup_bak::archive::entries::Entry::File(file) => (
+                            file.size_real,
+                            file.size_compressed.unwrap_or(file.size_real),
+                        ),
+                        ddup_bak::archive::entries::Entry::Directory(dir) => dir
+                            .entries
+                            .iter()
+                            .map(recursive_size)
+                            .fold((0, 0), |acc, x| (acc.0 + x.0, acc.1 + x.1)),
                         ddup_bak::archive::entries::Entry::Symlink(link) => {
-                            link.target.len() as u64
+                            (link.target.len() as u64, link.target.len() as u64)
                         }
                     }
                 }
 
-                dir.entries.iter().map(recursive_size).sum()
+                dir.entries
+                    .iter()
+                    .map(recursive_size)
+                    .fold((0, 0), |acc, x| (acc.0 + x.0, acc.1 + x.1))
             }
-            ddup_bak::archive::entries::Entry::Symlink(link) => link.target.len() as u64,
+            ddup_bak::archive::entries::Entry::Symlink(link) => {
+                (link.target.len() as u64, link.target.len() as u64)
+            }
         };
 
         let mime = if entry.is_directory() {
@@ -143,6 +156,7 @@ impl VirtualDdupBakArchive {
             mode: encode_mode(entry.mode().bits()),
             mode_bits: compact_str::format_compact!("{:o}", entry.mode().bits() & 0o777),
             size,
+            size_physical,
             directory: entry.is_directory(),
             file: entry.is_file(),
             symlink: entry.is_symlink(),

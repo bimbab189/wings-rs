@@ -940,6 +940,7 @@ impl VirtualResticBackup {
             mode: encode_mode(entry.mode),
             mode_bits: compact_str::format_compact!("{:o}", entry.mode & 0o777),
             size,
+            size_physical: size,
             directory: matches!(entry.r#type, ResticEntryType::Dir),
             file: matches!(entry.r#type, ResticEntryType::File),
             symlink: matches!(entry.r#type, ResticEntryType::Symlink),

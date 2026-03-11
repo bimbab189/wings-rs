@@ -10,6 +10,7 @@ use crate::{
         },
         cap::FileType,
         encode_mode,
+        usage::UsedSpace,
         virtualfs::{
             AsyncFileRead, AsyncReadableFileStream, ByteRange, DirectoryListing,
             DirectoryStreamWalk, DirectoryWalk, FileMetadata, FileRead, IsIgnoredFn,
@@ -60,7 +61,7 @@ pub struct VirtualZipArchive {
     pub server: crate::server::Server,
     pub archive: zip::ZipArchive<MultiReader>,
     pub mime_cache: moka::sync::Cache<usize, &'static str>,
-    pub sizes: Arc<Vec<(u64, PathBuf)>>,
+    pub sizes: Arc<Vec<(UsedSpace, PathBuf)>>,
 }
 
 impl VirtualZipArchive {
@@ -73,10 +74,13 @@ impl VirtualZipArchive {
             .into_iter()
             .map(|name| {
                 (
-                    archive
-                        .by_name(&name)
-                        .map(|file| file.size())
-                        .unwrap_or_default(),
+                    {
+                        let entry = archive.by_name(&name);
+
+                        entry
+                            .map(|e| UsedSpace::new(e.size(), e.compressed_size()))
+                            .unwrap_or_default()
+                    },
                     PathBuf::from(name),
                 )
             })
@@ -118,18 +122,20 @@ impl VirtualZipArchive {
         path: &Path,
         entry_index: usize,
         mime_cache: &moka::sync::Cache<usize, &'static str>,
-        sizes: &[(u64, PathBuf)],
+        sizes: &[(UsedSpace, PathBuf)],
         buffer: Option<&[u8]>,
         mut entry: zip::read::ZipFile<impl Read + Seek>,
     ) -> DirectoryEntry {
-        let size = if entry.is_dir() {
-            sizes
+        let (size, size_physical) = if entry.is_dir() {
+            let space: UsedSpace = sizes
                 .iter()
                 .filter(|(_, name)| name.starts_with(path))
                 .map(|(size, _)| *size)
-                .sum()
+                .sum();
+
+            (space.get_logical(), space.get_physical())
         } else {
-            entry.size()
+            (entry.size(), entry.compressed_size())
         };
 
         let mime_type = if entry.is_dir() {
@@ -190,13 +196,16 @@ impl VirtualZipArchive {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into(),
-            created: chrono::DateTime::default(),
+            created: crate::server::filesystem::archive::zip_entry_get_created_time(&entry)
+                .map(|dt| dt.into_std().into())
+                .unwrap_or_default(),
             modified: crate::server::filesystem::archive::zip_entry_get_modified_time(&entry)
                 .map(|dt| dt.into_std().into())
                 .unwrap_or_default(),
             mode: encode_mode(mode),
             mode_bits: compact_str::format_compact!("{:o}", mode & 0o777),
             size,
+            size_physical,
             directory: entry.is_dir(),
             file: entry.is_file(),
             symlink: entry.is_symlink(),

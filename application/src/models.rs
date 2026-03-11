@@ -65,6 +65,7 @@ pub struct DirectoryEntry {
     pub mode: compact_str::CompactString,
     pub mode_bits: compact_str::CompactString,
     pub size: u64,
+    pub size_physical: u64,
     pub directory: bool,
     pub file: bool,
     pub symlink: bool,
