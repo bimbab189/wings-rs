@@ -23,7 +23,7 @@ impl InotifyManager {
 
                 move |res: Result<notify::Event, notify::Error>| {
                     if let Ok(event) = res {
-                        if event.kind.is_access() {
+                        if event.kind.is_access() || event.kind.is_other() {
                             return;
                         }
 

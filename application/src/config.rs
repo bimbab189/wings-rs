@@ -157,8 +157,7 @@ fn system_disk_check_interval() -> u64 {
     150
 }
 fn system_disk_check_use_inotify() -> bool {
-    // TODO: change to true once stability is truly verified
-    false
+    true
 }
 fn system_activity_send_interval() -> u64 {
     60

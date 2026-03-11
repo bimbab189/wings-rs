@@ -144,6 +144,14 @@ impl Filesystem {
                             );
 
                             if let Some(modified_paths) = paths_to_scan {
+                                if modified_paths.is_empty() {
+                                    tracing::debug!(
+                                        path = %cap_filesystem.base_path.display(),
+                                        "skipping disk usage check, no modified paths"
+                                    );
+                                    return Ok(());
+                                }
+
                                 let mut dirs_to_scan = Vec::new();
                                 for modified_path in &modified_paths {
                                     let relative = match modified_path.strip_prefix(&*cap_filesystem.base_path) {
@@ -287,20 +295,13 @@ impl Filesystem {
                         } else {
                             let paths_to_scan = if use_server_notifier.load(Ordering::Relaxed) {
                                 let paths = server_notifier.take_modified_paths().await;
-                                if paths.is_empty() {
-                                    tracing::debug!(
-                                        path = %cap_filesystem.base_path.display(),
-                                        "skipping disk usage check, no modified paths"
-                                    );
-                                    None
-                                } else {
-                                    tracing::debug!(
-                                        path = %cap_filesystem.base_path.display(),
-                                        "checking disk usage for {} modified paths",
-                                        paths.len()
-                                    );
-                                    Some(paths)
-                                }
+
+                                tracing::debug!(
+                                    path = %cap_filesystem.base_path.display(),
+                                    "checking disk usage for {} modified paths",
+                                    paths.len()
+                                );
+                                Some(paths)
                             } else {
                                 None
                             };
