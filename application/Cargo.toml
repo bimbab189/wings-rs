@@ -37,7 +37,7 @@ flate2 = { version = "1.1.1", default-features = false, features = ["zlib-rs"] }
 jwt = "0.16.0"
 hmac = { version = "0.12.1", features = ["std"] }
 sha2 = "0.10.9"
-ddup-bak = "0.7.0"
+ddup-bak = "0.8.0"
 infer = "0.19.0"
 rustls = { version = "0.23.27", features = ["aws-lc-rs"] }
 ignore = { version = "0.4.23", features = ["simd-accel"] }

@@ -44,7 +44,15 @@ pub async fn get_repository(
     if tokio::fs::metadata(path.join(".ddup-bak")).await.is_ok() {
         let repository = Arc::new(
             tokio::task::spawn_blocking(move || {
-                ddup_bak::repository::Repository::open(&path, None, None).unwrap()
+                ddup_bak::repository::Repository::open_or_rebuild(
+                    &path,
+                    1024 * 1024,
+                    0,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
             })
             .await
             .unwrap(),

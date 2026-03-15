@@ -1173,9 +1173,9 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
 name = "ddup-bak"
-version = "0.7.3"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e814477edbfba92f582ad10b1bfcdffb4f7fde196afeba3e8ba55c9a9115d3a8"
+checksum = "eb8fc6e4c3d6352474b2588daa881b392c32bd0210a4ec82d4bb4eb13e90c13f"
 dependencies = [
  "atomicwrites",
  "blake2",
