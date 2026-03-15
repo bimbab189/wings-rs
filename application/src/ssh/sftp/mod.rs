@@ -1043,8 +1043,13 @@ impl russh_sftp::server::Handler for SftpSession {
         let data = tokio::task::spawn_blocking({
             let file = Arc::clone(&handle.file);
 
+            let mut data_len = len;
+            if len == 32 * 1024 {
+                data_len = 32 * 1024 - 64;
+            }
+
             move || -> Result<Vec<u8>, std::io::Error> {
-                let mut data = vec![0; len.min(256 * 1024).saturating_sub(64) as usize];
+                let mut data = vec![0; data_len as usize];
                 let bytes_read = file.read().unwrap().read_at(offset, &mut data)?;
 
                 data.truncate(bytes_read);
