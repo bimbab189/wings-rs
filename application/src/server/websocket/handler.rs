@@ -300,8 +300,7 @@ pub async fn handle_ws(
 
                             if let Some(jwt) = socket_jwt.as_ref()
                                 && jwt.base.validate(&state.config.jwt).await
-                                && jwt.use_console_read_permission
-                                && !jwt.permissions.has_permission(Permission::ControlReadConsole)
+                                && !jwt.permissions.has_calagopus_permission_or(Permission::ControlReadConsole, true)
                             {
                                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
@@ -318,8 +317,7 @@ pub async fn handle_ws(
                                         if let Some(jwt) = socket_jwt.as_ref()
                                             && jwt.base.validate(&state.config.jwt).await
                                         {
-                                            if jwt.use_console_read_permission
-                                                && !jwt.permissions.has_permission(Permission::ControlReadConsole)
+                                            if !jwt.permissions.has_calagopus_permission_or(Permission::ControlReadConsole, true)
                                             {
                                                 break;
                                             }

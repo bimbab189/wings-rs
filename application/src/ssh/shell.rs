@@ -639,38 +639,45 @@ impl ShellSession {
                 .await
                 .unwrap_or_default();
 
-            let mut log_stream = self
+            if self
                 .server
-                .read_log(Some(self.state.config.system.websocket_log_count))
-                .await;
-
+                .user_permissions
+                .has_calagopus_permission_or(self.user_uuid, Permission::ControlReadConsole, true)
+                .await
             {
-                let prelude = ansi_term::Color::Yellow
-                    .bold()
-                    .paint(format!("[{} Daemon]:", self.state.config.app_name));
+                let mut log_stream = self
+                    .server
+                    .read_log(Some(self.state.config.system.websocket_log_count))
+                    .await;
 
-                writer
-                    .make_writer()
-                    .write_all(
-                        format!(
-                            "{prelude} Server marked as {}...\r\n\x1b[2K",
-                            self.server.state.get_state().to_str()
-                        )
-                        .as_bytes(),
-                    )
-                    .await
-                    .unwrap_or_default();
-            }
+                {
+                    let prelude = ansi_term::Color::Yellow
+                        .bold()
+                        .paint(format!("[{} Daemon]:", self.state.config.app_name));
 
-            if self.server.state.get_state() != crate::server::state::ServerState::Offline
-                || self.state.config.api.send_offline_server_logs
-            {
-                while let Some(Ok(line)) = log_stream.next().await {
                     writer
                         .make_writer()
-                        .write_all(line.as_bytes())
+                        .write_all(
+                            format!(
+                                "{prelude} Server marked as {}...\r\n\x1b[2K",
+                                self.server.state.get_state().to_str()
+                            )
+                            .as_bytes(),
+                        )
                         .await
                         .unwrap_or_default();
+                }
+
+                if self.server.state.get_state() != crate::server::state::ServerState::Offline
+                    || self.state.config.api.send_offline_server_logs
+                {
+                    while let Some(Ok(line)) = log_stream.next().await {
+                        writer
+                            .make_writer()
+                            .write_all(line.as_bytes())
+                            .await
+                            .unwrap_or_default();
+                    }
                 }
             }
 
@@ -777,40 +784,47 @@ impl ShellSession {
                 })
             });
 
-            futures.push({
-                let server = self.server.clone();
-                let mut writer = writer.make_writer();
+            if self
+                .server
+                .user_permissions
+                .has_calagopus_permission_or(self.user_uuid, Permission::ControlReadConsole, true)
+                .await
+            {
+                futures.push({
+                    let server = self.server.clone();
+                    let mut writer = writer.make_writer();
 
-                Box::pin(async move {
-                    loop {
-                        if let Some(mut stdout) = server.container_stdout().await {
-                            loop {
-                                match stdout.recv().await {
-                                    Ok(stdout) => {
-                                        if let Err(err) = writer
-                                            .write_all(format!("{stdout}\r\n\x1b[2K").as_bytes())
-                                            .await
-                                        {
-                                            tracing::error!(error = %err, "failed to write stdout");
+                    Box::pin(async move {
+                        loop {
+                            if let Some(mut stdout) = server.container_stdout().await {
+                                loop {
+                                    match stdout.recv().await {
+                                        Ok(stdout) => {
+                                            if let Err(err) = writer
+                                                .write_all(format!("{stdout}\r\n\x1b[2K").as_bytes())
+                                                .await
+                                            {
+                                                tracing::error!(error = %err, "failed to write stdout");
+                                            }
                                         }
-                                    }
-                                    Err(RecvError::Closed) => {
-                                        break;
-                                    }
-                                    Err(RecvError::Lagged(_)) => {
-                                        tracing::debug!(
-                                            server = %server.uuid,
-                                            "stdout lagged behind, messages dropped"
-                                        );
+                                        Err(RecvError::Closed) => {
+                                            break;
+                                        }
+                                        Err(RecvError::Lagged(_)) => {
+                                            tracing::debug!(
+                                                server = %server.uuid,
+                                                "stdout lagged behind, messages dropped"
+                                            );
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                })
-            });
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    })
+                });
+            }
 
             let stdin_task = {
                 let mut data_writer = writer.make_writer();

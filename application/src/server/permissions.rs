@@ -14,6 +14,8 @@ use tokio::sync::Mutex;
 pub enum Permission {
     #[serde(rename = "*")]
     All,
+    #[serde(rename = "meta.calagopus")]
+    MetaCalagopus,
 
     #[serde(rename = "websocket.connect")]
     WebsocketConnect,
@@ -129,6 +131,22 @@ impl UserPermissionsMap {
         }
     }
 
+    pub async fn has_calagopus_permission_or(
+        &self,
+        user_uuid: uuid::Uuid,
+        permission: Permission,
+        default: bool,
+    ) -> bool {
+        let mut map = self.map.lock().await;
+        if let Some((permissions, _, last_access)) = map.get_mut(&user_uuid) {
+            *last_access = std::time::Instant::now();
+
+            permissions.has_calagopus_permission_or(permission, default)
+        } else {
+            default
+        }
+    }
+
     pub async fn is_ignored(
         &self,
         user_uuid: uuid::Uuid,
@@ -195,6 +213,11 @@ pub struct Permissions(HashSet<Permission>);
 
 impl Permissions {
     #[inline]
+    pub fn is_calagopus(&self) -> bool {
+        self.0.contains(&Permission::MetaCalagopus)
+    }
+
+    #[inline]
     pub fn has_permission(&self, permission: Permission) -> bool {
         for p in self.0.iter().copied() {
             if permission.matches(p) {
@@ -203,6 +226,15 @@ impl Permissions {
         }
 
         false
+    }
+
+    #[inline]
+    pub fn has_calagopus_permission_or(&self, permission: Permission, default: bool) -> bool {
+        if !self.is_calagopus() {
+            return default;
+        }
+
+        self.has_permission(permission)
     }
 }
 

@@ -436,10 +436,9 @@ async fn main() {
                 };
 
                 let config = russh::server::Config {
-                    server_id: russh::SshId::Standard(format!(
-                        "SSH-2.0-Calagopus-Wings-{}",
-                        wings_rs::VERSION
-                    )),
+                    server_id: russh::SshId::Standard(
+                        format!("SSH-2.0-Calagopus-Wings-{}", wings_rs::VERSION).into(),
+                    ),
                     auth_rejection_time: std::time::Duration::from_secs(0),
                     auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
                     maximum_packet_size: 32 * 1024,

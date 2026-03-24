@@ -76,10 +76,9 @@ pub async fn handle_message(
             {
                 let socket_jwt = websocket_handler.get_jwt().await?;
 
-                if socket_jwt.use_console_read_permission
-                    && !socket_jwt
-                        .permissions
-                        .has_permission(Permission::ControlReadConsole)
+                if !socket_jwt
+                    .permissions
+                    .has_calagopus_permission_or(Permission::ControlReadConsole, true)
                 {
                     return Ok(());
                 }
