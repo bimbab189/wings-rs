@@ -1212,9 +1212,10 @@ impl Config {
                 sysinfo::ProcessRefreshKind::nothing().with_memory(),
             );
             if let Some(process) = sys.process(current_pid) {
+                let users = sysinfo::Users::new_with_refreshed_list();
+
                 if self.system.user.rootless.enabled {
                     if let Some(user) = process.user_id() {
-                        let users = sysinfo::Users::new_with_refreshed_list();
                         if let Some(user) = users.get_user_by_id(user) {
                             self.system.username = user.name().to_compact_string();
                         }
@@ -1229,12 +1230,13 @@ impl Config {
                 }
 
                 let mut found_user = false;
-                if let Some(user) = process.user_id() {
-                    self.system.user.uid = **user;
-                    found_user = true;
-                }
-                if let Some(group) = process.group_id() {
-                    self.system.user.gid = *group;
+                for user in users.list() {
+                    if user.name() == self.system.username {
+                        self.system.user.uid = **user.id();
+                        self.system.user.gid = *user.group_id();
+                        found_user = true;
+                        break;
+                    }
                 }
 
                 if found_user {
