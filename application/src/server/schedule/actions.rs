@@ -52,6 +52,8 @@ pub enum ScheduleAction {
         ignore_failure: bool,
 
         contains: ScheduleDynamicParameter,
+        #[serde(default)]
+        case_insensitive: bool,
         timeout: u64,
 
         output_into: Option<ScheduleVariable>,
@@ -261,6 +263,7 @@ impl ScheduleAction {
             }
             ScheduleAction::WaitForConsoleLine {
                 contains,
+                case_insensitive,
                 timeout,
                 output_into,
                 ..
@@ -280,9 +283,19 @@ impl ScheduleAction {
                 };
 
                 let line_finder = async {
-                    while let Ok(line) = stdout.recv().await {
-                        if line.contains(&**contains) {
-                            return Some(line.to_compact_string());
+                    if *case_insensitive {
+                        let contains = contains.to_lowercase();
+
+                        while let Ok(line) = stdout.recv().await {
+                            if line.to_lowercase().contains(&*contains) {
+                                return Some(line.to_compact_string());
+                            }
+                        }
+                    } else {
+                        while let Ok(line) = stdout.recv().await {
+                            if line.contains(&**contains) {
+                                return Some(line.to_compact_string());
+                            }
                         }
                     }
 
@@ -298,6 +311,7 @@ impl ScheduleAction {
                     {
                         execution_context.store_variable(output_into.clone(), line);
                     }
+
                     return Ok(());
                 }
 
