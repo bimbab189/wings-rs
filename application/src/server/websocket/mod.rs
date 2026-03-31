@@ -261,14 +261,29 @@ impl ServerWebsocketHandler {
         }
     }
 
-    async fn has_permission(&self, permission: Permission) -> Result<bool, anyhow::Error> {
+    async fn get_server(&self) -> Result<(uuid::Uuid, crate::server::Server), anyhow::Error> {
         let jwt = self.get_jwt().await?;
 
         if let Err(err) = jwt.base.validate(&self.state.config.jwt).await {
             return Err(anyhow::anyhow!("invalid token: {err}"));
         }
 
-        Ok(jwt.permissions.has_permission(permission))
+        for server in self.state.server_manager.get_servers().await.iter() {
+            if server.uuid == jwt.server_uuid {
+                return Ok((jwt.user_uuid, server.clone()));
+            }
+        }
+
+        Err(anyhow::anyhow!("unable to find jwt server"))
+    }
+
+    async fn has_permission(&self, permission: Permission) -> Result<bool, anyhow::Error> {
+        let (user_uuid, server) = self.get_server().await?;
+
+        Ok(server
+            .user_permissions
+            .has_permission(user_uuid, permission)
+            .await)
     }
 
     async fn has_calagopus_permission_or(
@@ -276,15 +291,12 @@ impl ServerWebsocketHandler {
         permission: Permission,
         default: bool,
     ) -> Result<bool, anyhow::Error> {
-        let jwt = self.get_jwt().await?;
+        let (user_uuid, server) = self.get_server().await?;
 
-        if let Err(err) = jwt.base.validate(&self.state.config.jwt).await {
-            return Err(anyhow::anyhow!("invalid token: {err}"));
-        }
-
-        Ok(jwt
-            .permissions
-            .has_calagopus_permission_or(permission, default))
+        Ok(server
+            .user_permissions
+            .has_calagopus_permission_or(user_uuid, permission, default)
+            .await)
     }
 
     async fn close(&self, reason: &str) {
