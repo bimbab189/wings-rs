@@ -64,7 +64,8 @@ impl BasePayload {
         }
 
         if let Some(iat) = self.issued_at {
-            if iat > now || iat < client.boot_time.timestamp() {
+            // allow a 5 second clock skew
+            if iat - 5 > now || iat < client.boot_time.timestamp() {
                 return Err(JwtValidateError::InvalidIssuedAt);
             }
         } else {
