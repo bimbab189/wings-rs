@@ -90,6 +90,9 @@ notify = "8.2.0"
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 tikv-jemallocator = "0.6.0"
 
+[target.'cfg(target_arch = "riscv64gc")'.dependencies]
+libz-ng-sys = "=1.1.23" # temporary pin due to riscv64 issues
+
 [build-dependencies]
 reqwest = { workspace = true, features = ["blocking"] }
 serde = { workspace = true }
