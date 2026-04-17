@@ -57,6 +57,19 @@ impl PullQueryResponse {
         config: &Arc<crate::config::Config>,
         url: &str,
     ) -> Result<Self, anyhow::Error> {
+        let url = reqwest::Url::parse(url).context("failed to parse download URL")?;
+
+        if let Some(host) = url.host_str()
+            && let Ok(ip) = std::net::IpAddr::from_str(host)
+        {
+            for cidr in config.api.remote_download_blocked_cidrs.iter() {
+                if cidr.contains(&ip) {
+                    tracing::warn!("blocking internal IP address in pull: {}", ip);
+                    return Err(anyhow::anyhow!("IP address {} is blocked", ip));
+                }
+            }
+        }
+
         let response = get_download_client(config)
             .await?
             .get(url)
