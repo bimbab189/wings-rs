@@ -577,7 +577,11 @@ impl OutgoingServerTransfer {
                 }
             });
 
-            let response = reqwest::Client::new()
+            let response = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+                .build()
+                .unwrap()
                 .post(&url)
                 .header("Authorization", &token)
                 .header("Multiplex-Stream-Count", multiplex_streams)
@@ -654,7 +658,11 @@ impl OutgoingServerTransfer {
                     );
 
                 multiplex_responses.push(
-                    reqwest::Client::new()
+                    reqwest::Client::builder()
+                        .connect_timeout(std::time::Duration::from_secs(15))
+                        .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+                        .build()
+                        .unwrap()
                         .post(&url)
                         .header("Authorization", &token)
                         .header("Multiplex-Stream", i)
