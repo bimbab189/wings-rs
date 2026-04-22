@@ -5,7 +5,6 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs::Permissions,
     path::Path,
     sync::{Arc, atomic::Ordering},
 };
@@ -914,7 +913,7 @@ impl ServerInstaller {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&tmp_dir, Permissions::from_mode(0o755)).await?;
+            tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755)).await?;
         }
 
         Ok(bollard::container::Config {

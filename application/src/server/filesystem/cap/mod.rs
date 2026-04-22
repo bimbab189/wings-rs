@@ -1,12 +1,11 @@
 use crate::{
     io::abort::{AbortGuard, AbortListener},
-    utils::PortableModeExt,
+    utils::{PortablePermissions, PortablePermissionsApplier},
 };
 use cap_std::fs::{Metadata, OpenOptions};
 use std::{
     collections::VecDeque,
     io::{Read, Write},
-    os::fd::AsFd,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -691,20 +690,29 @@ impl CapFilesystem {
     pub async fn async_set_permissions(
         &self,
         path: impl AsRef<Path>,
-        permissions: cap_std::fs::Permissions,
+        permissions: PortablePermissions,
     ) -> Result<(), anyhow::Error> {
         let path = self.relative_path(path.as_ref());
 
         if path.components().next().is_none() {
-            tokio::fs::set_permissions(
-                &*self.base_path,
-                std::fs::Permissions::from_portable_mode(permissions.mode()),
-            )
-            .await?;
+            if let Some(os) = permissions.into_os() {
+                tokio::fs::set_permissions(&*self.base_path, os).await?;
+            }
         } else {
             let inner = self.async_get_inner().await?;
 
-            tokio::task::spawn_blocking(move || inner.set_permissions(path, permissions)).await??;
+            if let Some(os) = permissions.into_os() {
+                tokio::task::spawn_blocking(move || {
+                    inner.set_permissions(path, cap_std::fs::Permissions::from_std(os))
+                })
+                .await??;
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    let file = inner.open(&path)?;
+                    file.apply_permissions(permissions)
+                })
+                .await??;
+            }
         }
 
         Ok(())
@@ -713,12 +721,24 @@ impl CapFilesystem {
     pub fn set_permissions(
         &self,
         path: impl AsRef<Path>,
-        permissions: cap_std::fs::Permissions,
+        permissions: PortablePermissions,
     ) -> Result<(), anyhow::Error> {
         let path = self.relative_path(path.as_ref());
 
-        let inner = self.get_inner()?;
-        inner.set_permissions(path, permissions)?;
+        if path.components().next().is_none() {
+            if let Some(os) = permissions.into_os() {
+                std::fs::set_permissions(&*self.base_path, os)?;
+            }
+        } else {
+            let inner = self.get_inner()?;
+
+            if let Some(os) = permissions.into_os() {
+                inner.set_permissions(path, cap_std::fs::Permissions::from_std(os))?;
+            } else {
+                let file = inner.open(&path)?;
+                file.apply_permissions(permissions)?;
+            }
+        }
 
         Ok(())
     }
@@ -726,26 +746,33 @@ impl CapFilesystem {
     pub async fn async_set_symlink_permissions(
         &self,
         path: impl AsRef<Path>,
-        permissions: cap_std::fs::Permissions,
+        permissions: PortablePermissions,
     ) -> Result<(), anyhow::Error> {
         let path = self.relative_path(path.as_ref());
 
         if path.components().next().is_none() {
-            tokio::fs::set_permissions(
-                &*self.base_path,
-                std::fs::Permissions::from_portable_mode(permissions.mode()),
-            )
-            .await?;
+            if let Some(os) = permissions.into_os() {
+                tokio::fs::set_permissions(&*self.base_path, os).await?;
+            }
         } else {
             let inner = self.async_get_inner().await?;
 
+            #[cfg(unix)]
             tokio::task::spawn_blocking(move || {
+                use std::os::fd::AsFd;
+
                 rustix::fs::chmodat(
                     inner.as_fd(),
                     path,
-                    rustix::fs::Mode::from_raw_mode(permissions.mode()),
+                    rustix::fs::Mode::from_raw_mode(permissions.mode),
                     rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
                 )
+            })
+            .await??;
+            #[cfg(not(unix))]
+            tokio::task::spawn_blocking(move || {
+                let file = inner.open(&path)?;
+                file.apply_permissions(permissions)
             })
             .await??;
         }
@@ -756,25 +783,28 @@ impl CapFilesystem {
     pub fn set_symlink_permissions(
         &self,
         path: impl AsRef<Path>,
-        permissions: cap_std::fs::Permissions,
+        permissions: PortablePermissions,
     ) -> Result<(), anyhow::Error> {
         let path = self.relative_path(path.as_ref());
 
         if path.components().next().is_none() {
-            std::fs::set_permissions(
-                &*self.base_path,
-                std::fs::Permissions::from_portable_mode(permissions.mode()),
-            )?;
+            if let Some(os) = permissions.into_os() {
+                std::fs::set_permissions(&*self.base_path, os)?;
+            }
         } else {
-            let inner = self.get_inner()?;
-
             #[cfg(unix)]
-            rustix::fs::chmodat(
-                inner.as_fd(),
-                path,
-                rustix::fs::Mode::from_raw_mode(permissions.mode()),
-                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-            )?;
+            {
+                use std::os::fd::AsFd;
+
+                let inner = self.get_inner()?;
+
+                rustix::fs::chmodat(
+                    inner.as_fd(),
+                    path,
+                    rustix::fs::Mode::from_raw_mode(permissions.mode),
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                )?;
+            }
             #[cfg(not(unix))]
             self.set_permissions(path, permissions)?;
         }
@@ -790,6 +820,8 @@ impl CapFilesystem {
     ) -> Result<(), anyhow::Error> {
         #[cfg(unix)]
         {
+            use std::os::fd::AsFd;
+
             let path = self.relative_path(path.as_ref());
             let inner = self.async_get_inner().await?;
 
@@ -820,13 +852,12 @@ impl CapFilesystem {
             let path = self.relative_path(path.as_ref());
             let inner = self.async_get_inner().await?;
 
-            let mut times = std::fs::FileTimes::new();
-            times.set_modified(modification_time);
+            let mut times = std::fs::FileTimes::new().set_modified(modification_time);
             if let Some(atime) = access_time {
-                times.set_accessed(atime);
+                times = times.set_accessed(atime);
             }
 
-            let mut file = tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 let file = inner.open(path)?.into_std();
 
                 file.set_times(times)
@@ -845,6 +876,8 @@ impl CapFilesystem {
     ) -> Result<(), anyhow::Error> {
         #[cfg(unix)]
         {
+            use std::os::fd::AsFd;
+
             let path = self.relative_path(path.as_ref());
             let inner = self.get_inner()?;
 
@@ -872,13 +905,12 @@ impl CapFilesystem {
             let path = self.relative_path(path.as_ref());
             let inner = self.get_inner()?;
 
-            let mut times = std::fs::FileTimes::new();
-            times.set_modified(modification_time);
+            let mut times = std::fs::FileTimes::new().set_modified(modification_time);
             if let Some(atime) = access_time {
-                times.set_accessed(atime);
+                times = times.set_accessed(atime);
             }
 
-            let mut file = inner.open(path)?.into_std();
+            let file = inner.open(path)?.into_std();
             file.set_times(times)?;
 
             Ok(())
@@ -894,7 +926,18 @@ impl CapFilesystem {
         let link = self.relative_path(link.as_ref());
 
         let inner = self.async_get_inner().await?;
+        #[cfg(unix)]
         tokio::task::spawn_blocking(move || inner.symlink(target, link)).await??;
+        #[cfg(windows)]
+        tokio::task::spawn_blocking(move || {
+            let metadata = inner.metadata(&target)?;
+            if metadata.is_dir() {
+                inner.symlink_dir(target, link)
+            } else {
+                inner.symlink_file(target, link)
+            }
+        })
+        .await??;
 
         Ok(())
     }
@@ -910,9 +953,7 @@ impl CapFilesystem {
         let inner = self.get_inner()?;
 
         #[cfg(unix)]
-        {
-            inner.symlink(target, link)?;
-        }
+        inner.symlink(target, link)?;
         #[cfg(windows)]
         {
             let metadata = inner.metadata(&target)?;

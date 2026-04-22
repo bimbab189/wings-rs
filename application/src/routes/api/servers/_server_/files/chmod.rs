@@ -5,9 +5,8 @@ mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
-        utils::PortableModeExt,
+        utils::PortablePermissions,
     };
-    use cap_std::fs::Permissions;
     use serde::{Deserialize, Serialize};
     use std::path::Path;
     use utoipa::ToSchema;
@@ -77,7 +76,7 @@ mod post {
             };
 
             if filesystem
-                .async_set_permissions(&source, Permissions::from_portable_mode(mode))
+                .async_set_permissions(&source, PortablePermissions::from_mode(mode))
                 .await
                 .is_ok()
             {

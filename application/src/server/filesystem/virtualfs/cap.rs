@@ -10,6 +10,7 @@ use crate::{
         archive::StreamableArchiveFormat,
         virtualfs::{AsyncReadableWritableSeekableFileStream, ReadableWritableSeekableFileStream},
     },
+    utils::PortablePermissions,
 };
 use std::{
     path::{Path, PathBuf},
@@ -46,8 +47,9 @@ impl VirtualCapFilesystem {
             return Ok(path);
         };
         let Some(path) = (is_ignored)(file_type, path) else {
-            return Err(anyhow::anyhow!(std::io::Error::from(
-                rustix::io::Errno::NOENT
+            return Err(anyhow::anyhow!(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File not found"
             )));
         };
 
@@ -611,7 +613,7 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
     fn set_permissions(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
-        permissions: cap_std::fs::Permissions,
+        permissions: PortablePermissions,
     ) -> Result<(), anyhow::Error> {
         let path = self.check_ignored(FileType::File, path.as_ref())?;
 
@@ -620,7 +622,7 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
     async fn async_set_permissions(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
-        permissions: cap_std::fs::Permissions,
+        permissions: PortablePermissions,
     ) -> Result<(), anyhow::Error> {
         let path = self.check_ignored(FileType::File, path.as_ref())?;
 

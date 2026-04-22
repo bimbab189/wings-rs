@@ -20,7 +20,7 @@ use crate::{
             },
         },
     },
-    utils::PortableModeExt,
+    utils::PortablePermissions,
 };
 use chrono::{Datelike, Timelike};
 use compact_str::ToCompactString;
@@ -983,7 +983,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         if path.as_ref() == Path::new("") || path.as_ref() == Path::new("/") {
             return Ok(FileMetadata {
                 file_type: FileType::Dir,
-                permissions: cap_std::fs::Permissions::from_portable_mode(0o755),
+                permissions: PortablePermissions::from_mode(0o755),
                 size: 0,
                 modified: None,
                 created: None,
@@ -995,11 +995,16 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             .entries
             .iter()
             .find(|e| e.path == path)
-            .ok_or_else(|| anyhow::anyhow!(std::io::Error::from(rustix::io::Errno::NOENT)))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "File not found"
+                ))
+            })?;
 
         Ok(FileMetadata {
             file_type: Self::restic_entry_to_file_type(entry),
-            permissions: cap_std::fs::Permissions::from_portable_mode(entry.mode & 0o777),
+            permissions: PortablePermissions::from_mode(entry.mode & 0o777),
             size: entry.size.unwrap_or(0),
             modified: Some(entry.mtime.into()),
             created: None,
@@ -1034,7 +1039,12 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             .entries
             .iter()
             .find(|e| e.path == path)
-            .ok_or_else(|| anyhow::anyhow!(std::io::Error::from(rustix::io::Errno::NOENT)))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "File not found"
+                ))
+            })?;
 
         Ok(self.restic_entry_to_directory_entry(path, entry, None))
     }
@@ -1049,7 +1059,12 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             .entries
             .iter()
             .find(|e| e.path == path)
-            .ok_or_else(|| anyhow::anyhow!(std::io::Error::from(rustix::io::Errno::NOENT)))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "File not found"
+                ))
+            })?;
 
         Ok(self.restic_entry_to_directory_entry(path, entry, Some(buffer)))
     }
@@ -1345,8 +1360,9 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         let entry = self.metadata(path)?;
 
         if !entry.file_type.is_file() {
-            return Err(anyhow::anyhow!(std::io::Error::from(
-                rustix::io::Errno::NOENT
+            return Err(anyhow::anyhow!(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File not found"
             )));
         }
 
@@ -1383,8 +1399,9 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         let entry = self.async_metadata(path).await?;
 
         if !entry.file_type.is_file() {
-            return Err(anyhow::anyhow!(std::io::Error::from(
-                rustix::io::Errno::NOENT
+            return Err(anyhow::anyhow!(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File not found"
             )));
         }
 
@@ -1440,8 +1457,9 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         let entry = self.async_metadata(&path).await?;
 
         if !entry.file_type.is_dir() {
-            return Err(anyhow::anyhow!(std::io::Error::from(
-                rustix::io::Errno::NOENT
+            return Err(anyhow::anyhow!(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File not found"
             )));
         }
 
@@ -1621,8 +1639,9 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         let entry = self.async_metadata(&path).await?;
 
         if !entry.file_type.is_dir() {
-            return Err(anyhow::anyhow!(std::io::Error::from(
-                rustix::io::Errno::NOENT
+            return Err(anyhow::anyhow!(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File not found"
             )));
         }
 

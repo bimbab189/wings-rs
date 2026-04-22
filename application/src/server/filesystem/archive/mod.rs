@@ -9,9 +9,8 @@ use crate::{
         counting_reader::CountingReader,
         counting_writer::CountingWriter,
     },
-    utils::PortableModeExt,
+    utils::PortablePermissions,
 };
-use cap_std::fs::Permissions;
 use serde::{Deserialize, Serialize};
 use std::{
     io::{Read, Seek, SeekFrom, Write},
@@ -448,7 +447,7 @@ impl Archive {
                     let mut writer = super::writer::FileSystemWriter::new(
                         self.server.clone(),
                         &file_name,
-                        Some(metadata.permissions()),
+                        Some(metadata.permissions().into()),
                         metadata.modified().ok(),
                     )?;
 
@@ -513,7 +512,7 @@ impl Archive {
                             tar::EntryType::Directory => {
                                 self.server.filesystem.create_dir_all(&destination_path)?;
                                 if let Ok(permissions) =
-                                    header.mode().map(Permissions::from_portable_mode)
+                                    header.mode().map(PortablePermissions::from_mode)
                                 {
                                     self.server
                                         .filesystem
@@ -532,7 +531,7 @@ impl Archive {
                                 let mut writer = super::writer::FileSystemWriter::new(
                                     self.server.clone(),
                                     &destination_path,
-                                    header.mode().map(Permissions::from_portable_mode).ok(),
+                                    header.mode().map(PortablePermissions::from_mode).ok(),
                                     header
                                         .mtime()
                                         .map(|t| {
@@ -662,7 +661,7 @@ impl Archive {
                                         server.filesystem.create_dir_all(&destination_path)?;
                                         server.filesystem.set_permissions(
                                             &destination_path,
-                                            Permissions::from_portable_mode(
+                                            PortablePermissions::from_mode(
                                                 entry.unix_mode().unwrap_or(0o755),
                                             ),
                                         )?;
@@ -674,7 +673,7 @@ impl Archive {
                                         let mut writer = super::writer::FileSystemWriter::new(
                                             server.clone(),
                                             &destination_path,
-                                            entry.unix_mode().map(Permissions::from_portable_mode),
+                                            entry.unix_mode().map(PortablePermissions::from_mode),
                                             zip_entry_get_modified_time(&entry),
                                         )?;
 
@@ -1119,7 +1118,7 @@ impl Archive {
                                 server.filesystem.create_dir_all(&destination_path)?;
                                 server.filesystem.set_permissions(
                                     &destination_path,
-                                    cap_std::fs::Permissions::from_std(dir.mode.into()),
+                                    PortablePermissions::from_mode(dir.mode.bits()),
                                 )?;
 
                                 for entry in dir.entries {
@@ -1141,7 +1140,7 @@ impl Archive {
                                 let mut writer = super::writer::FileSystemWriter::new(
                                     server.clone(),
                                     &destination_path,
-                                    Some(cap_std::fs::Permissions::from_std(file.mode.into())),
+                                    Some(PortablePermissions::from_mode(file.mode.bits())),
                                     Some(cap_std::time::SystemTime::from_std(file.mtime)),
                                 )?;
 

@@ -18,7 +18,7 @@ use crate::{
             VirtualReadableFilesystem,
         },
     },
-    utils::PortableModeExt,
+    utils::PortablePermissions,
 };
 use std::{
     io::{Read, Seek, Write},
@@ -280,7 +280,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         if path.as_ref() == Path::new("") || path.as_ref() == Path::new("/") {
             return Ok(FileMetadata {
                 file_type: FileType::Dir,
-                permissions: cap_std::fs::Permissions::from_portable_mode(0o755),
+                permissions: PortablePermissions::from_mode(0o755),
                 size: 0,
                 modified: None,
                 created: None,
@@ -295,16 +295,17 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         Ok(FileMetadata {
             file_type: Self::zip_entry_to_file_type(&entry),
             permissions: if let Some(mode) = entry.unix_mode() {
-                cap_std::fs::Permissions::from_portable_mode(mode & 0o777)
+                PortablePermissions::from_mode(mode & 0o777)
             } else if entry.is_dir() {
-                cap_std::fs::Permissions::from_portable_mode(0o755)
+                PortablePermissions::from_mode(0o755)
             } else {
-                cap_std::fs::Permissions::from_portable_mode(0o644)
+                PortablePermissions::from_mode(0o644)
             },
             size: entry.size(),
             modified: crate::server::filesystem::archive::zip_entry_get_modified_time(&entry)
                 .map(|dt| dt.into_std()),
-            created: None,
+            created: crate::server::filesystem::archive::zip_entry_get_created_time(&entry)
+                .map(|dt| dt.into_std()),
         })
     }
     async fn async_metadata(

@@ -4,7 +4,7 @@ use crate::{
         activity::{Activity, ActivityEvent},
         permissions::Permission,
     },
-    utils::PortableModeExt,
+    utils::PortablePermissions,
 };
 use cap_std::fs::{Metadata, OpenOptions};
 use positioned_io::{ReadAt, WriteAt};
@@ -79,28 +79,53 @@ impl SftpSession {
                     .unwrap_or_default()
                     .as_secs() as u32,
             ),
-            permissions: Some(metadata.permissions().mode()),
+            permissions: Some(PortablePermissions::from(metadata.permissions()).mode),
             ..Default::default()
         };
 
-        match rustix::fs::FileType::from_raw_mode(metadata.permissions().mode()) {
-            rustix::fs::FileType::RegularFile => attrs.set_regular(true),
-            rustix::fs::FileType::Directory => attrs.set_dir(true),
-            rustix::fs::FileType::Symlink => attrs.set_symlink(true),
-            rustix::fs::FileType::BlockDevice => attrs.set_block(true),
-            rustix::fs::FileType::CharacterDevice => attrs.set_character(true),
-            rustix::fs::FileType::Fifo => attrs.set_fifo(true),
-            _ => {}
-        }
-
-        if let Some(target_metadata) = target_metadata {
-            match rustix::fs::FileType::from_raw_mode(target_metadata.permissions().mode()) {
+        #[cfg(unix)]
+        {
+            match rustix::fs::FileType::from_raw_mode(
+                PortablePermissions::from(metadata.permissions()).mode,
+            ) {
                 rustix::fs::FileType::RegularFile => attrs.set_regular(true),
                 rustix::fs::FileType::Directory => attrs.set_dir(true),
+                rustix::fs::FileType::Symlink => attrs.set_symlink(true),
                 rustix::fs::FileType::BlockDevice => attrs.set_block(true),
                 rustix::fs::FileType::CharacterDevice => attrs.set_character(true),
                 rustix::fs::FileType::Fifo => attrs.set_fifo(true),
                 _ => {}
+            }
+
+            if let Some(target_metadata) = target_metadata {
+                match rustix::fs::FileType::from_raw_mode(
+                    PortablePermissions::from(target_metadata.permissions()).mode,
+                ) {
+                    rustix::fs::FileType::RegularFile => attrs.set_regular(true),
+                    rustix::fs::FileType::Directory => attrs.set_dir(true),
+                    rustix::fs::FileType::BlockDevice => attrs.set_block(true),
+                    rustix::fs::FileType::CharacterDevice => attrs.set_character(true),
+                    rustix::fs::FileType::Fifo => attrs.set_fifo(true),
+                    _ => {}
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if metadata.is_file() {
+                attrs.set_regular(true);
+            } else if metadata.is_dir() {
+                attrs.set_dir(true);
+            } else if metadata.file_type().is_symlink() {
+                attrs.set_symlink(true);
+            }
+
+            if let Some(target_metadata) = target_metadata {
+                if target_metadata.is_file() {
+                    attrs.set_regular(true);
+                } else if target_metadata.is_dir() {
+                    attrs.set_dir(true);
+                }
             }
         }
 
@@ -501,18 +526,15 @@ impl russh_sftp::server::Handler for SftpSession {
         if self.server.filesystem.chown_path(path).await.is_err() {
             return Err(StatusCode::Failure);
         }
-        if let Some(permissions) = attrs.permissions {
-            let permissions = cap_std::fs::Permissions::from_portable_mode(permissions);
-
-            if self
+        if let Some(permissions) = attrs.permissions
+            && self
                 .server
                 .filesystem
-                .async_set_permissions(&path, permissions)
+                .async_set_permissions(&path, PortablePermissions::from_mode(permissions))
                 .await
                 .is_err()
-            {
-                return Err(StatusCode::Failure);
-            }
+        {
+            return Err(StatusCode::Failure);
         }
 
         self.server
@@ -652,11 +674,9 @@ impl russh_sftp::server::Handler for SftpSession {
         }
 
         if let Some(permissions) = attrs.permissions {
-            let permissions = cap_std::fs::Permissions::from_portable_mode(permissions);
-
             self.server
                 .filesystem
-                .async_set_permissions(&path, permissions)
+                .async_set_permissions(&path, PortablePermissions::from_mode(permissions))
                 .await
                 .map_err(|_| StatusCode::Failure)?;
         }

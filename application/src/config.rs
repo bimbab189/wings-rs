@@ -132,7 +132,6 @@ fn system_tmp_directory() -> String {
         "C:\\ProgramData\\Calagopus\\tmp".to_string()
     }
 }
-#[cfg(unix)]
 fn system_username() -> compact_str::CompactString {
     "pterodactyl".into()
 }
@@ -515,35 +514,27 @@ nestify::nest! {
             #[serde(default = "system_tmp_directory")]
             pub tmp_directory: String,
 
-            #[cfg(unix)]
             #[serde(default = "system_username")]
             pub username: compact_str::CompactString,
             #[serde(default = "system_timezone")]
             pub timezone: compact_str::CompactString,
 
-            #[cfg(unix)]
             #[serde(default)]
             #[schema(inline)]
             pub user: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemUser {
-                #[cfg(unix)]
                 #[serde(default)]
                 #[schema(inline)]
                 pub rootless: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemUserRootless {
-                    #[cfg(unix)]
                     #[serde(default)]
                     pub enabled: bool,
-                    #[cfg(unix)]
                     #[serde(default)]
                     pub container_uid: u32,
-                    #[cfg(unix)]
                     #[serde(default)]
                     pub container_gid: u32,
                 },
 
-                #[cfg(unix)]
                 #[serde(default)]
                 pub uid: u32,
-                #[cfg(unix)]
                 #[serde(default)]
                 pub gid: u32,
             },
@@ -1092,6 +1083,7 @@ impl Config {
                 "you have enabled sending offline server logs, but also deleting containers on stop. This will result in no logs being sent for stopped servers."
             );
         }
+        #[cfg(unix)]
         if matches!(
             self.system.disk_limiter_mode,
             crate::server::filesystem::limiter::DiskLimiterMode::FuseQuota
@@ -1101,6 +1093,7 @@ impl Config {
                 "you have enabled FUSEquota disk limiting, but also disabled deleting containers on stop. This can cause issues if you try manually starting things. this setup is not recommended."
             );
         }
+        #[cfg(unix)]
         if matches!(
             self.system.disk_limiter_mode,
             crate::server::filesystem::limiter::DiskLimiterMode::FuseQuota

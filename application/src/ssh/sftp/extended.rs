@@ -4,7 +4,7 @@ use crate::{
         activity::{Activity, ActivityEvent},
         permissions::Permission,
     },
-    utils::PortableModeExt,
+    utils::PortablePermissions,
 };
 use russh_sftp::protocol::{Status, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -684,12 +684,13 @@ pub async fn handle_extended(
             };
 
             if let Some(permissions) = request.attrs.permissions {
-                let permissions = cap_std::fs::Permissions::from_portable_mode(permissions);
-
                 sftp_session
                     .server
                     .filesystem
-                    .async_set_symlink_permissions(&handle.path, permissions)
+                    .async_set_symlink_permissions(
+                        &handle.path,
+                        PortablePermissions::from_mode(permissions),
+                    )
                     .await
                     .map_err(|_| StatusCode::Failure)?;
             }

@@ -5,6 +5,7 @@ use crate::{
     },
     models::DirectoryEntry,
     server::filesystem::{archive::StreamableArchiveFormat, cap::FileType},
+    utils::PortablePermissions,
 };
 use axum::http::{HeaderMap, HeaderValue};
 pub use functions::{DirectoryStreamWalkFn, DirectoryWalkFn, IsIgnoredFn};
@@ -218,7 +219,7 @@ impl AsyncFileRead {
 
 pub struct FileMetadata {
     pub file_type: FileType,
-    pub permissions: cap_std::fs::Permissions,
+    pub permissions: PortablePermissions,
     pub size: u64,
     pub modified: Option<std::time::SystemTime>,
     pub created: Option<std::time::SystemTime>,
@@ -233,7 +234,7 @@ impl From<cap_std::fs::Metadata> for FileMetadata {
                 ft if ft.is_symlink() => FileType::Symlink,
                 _ => FileType::Unknown,
             },
-            permissions: metadata.permissions(),
+            permissions: PortablePermissions::from(metadata.permissions()),
             size: metadata.len(),
             modified: metadata.modified().ok().map(|t| t.into_std()),
             created: metadata.created().ok().map(|t| t.into_std()),
@@ -250,7 +251,7 @@ impl From<std::fs::Metadata> for FileMetadata {
                 ft if ft.is_symlink() => FileType::Symlink,
                 _ => FileType::Unknown,
             },
-            permissions: cap_std::fs::Permissions::from_std(metadata.permissions()),
+            permissions: PortablePermissions::from(metadata.permissions()),
             size: metadata.len(),
             modified: metadata.modified().ok(),
             created: metadata.created().ok(),
@@ -590,12 +591,12 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
     fn set_permissions(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
-        permissions: cap_std::fs::Permissions,
+        permissions: PortablePermissions,
     ) -> Result<(), anyhow::Error>;
     async fn async_set_permissions(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
-        permissions: cap_std::fs::Permissions,
+        permissions: PortablePermissions,
     ) -> Result<(), anyhow::Error>;
     fn rename(
         &self,

@@ -16,7 +16,7 @@ use crate::{
             ReadableFileStream, VirtualReadableFilesystem,
         },
     },
-    utils::PortableModeExt,
+    utils::PortablePermissions,
 };
 use chrono::{Datelike, Timelike};
 use ddup_bak::archive::entries::Entry;
@@ -389,7 +389,7 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
         if path.as_ref() == Path::new("") || path.as_ref() == Path::new("/") {
             return Ok(FileMetadata {
                 file_type: FileType::Dir,
-                permissions: cap_std::fs::Permissions::from_portable_mode(0o755),
+                permissions: PortablePermissions::from_mode(0o755),
                 size: 0,
                 modified: None,
                 created: None,
@@ -399,13 +399,16 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
         let archive = self.archive.clone();
         let path = path.as_ref().to_path_buf();
 
-        let entry = archive
-            .find_archive_entry(&path)
-            .ok_or_else(|| anyhow::anyhow!(std::io::Error::from(rustix::io::Errno::NOENT)))?;
+        let entry = archive.find_archive_entry(&path).ok_or_else(|| {
+            anyhow::anyhow!(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File not found"
+            ))
+        })?;
 
         Ok(FileMetadata {
             file_type: Self::ddup_bak_entry_to_file_type(entry),
-            permissions: cap_std::fs::Permissions::from_portable_mode(entry.mode().bits() & 0o777),
+            permissions: PortablePermissions::from_mode(entry.mode().bits() & 0o777),
             size: match &entry {
                 ddup_bak::archive::entries::Entry::File(f) => f.size_real,
                 _ => 0,
@@ -444,9 +447,12 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
         let archive = self.archive.clone();
         let path = path.as_ref().to_path_buf();
 
-        let entry = archive
-            .find_archive_entry(&path)
-            .ok_or_else(|| anyhow::anyhow!(std::io::Error::from(rustix::io::Errno::NOENT)))?;
+        let entry = archive.find_archive_entry(&path).ok_or_else(|| {
+            anyhow::anyhow!(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File not found"
+            ))
+        })?;
 
         Ok(Self::ddup_bak_entry_to_directory_entry(
             &self.archive_created,
@@ -630,9 +636,12 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
         let archive = self.archive.clone();
         let path = path.as_ref().to_path_buf();
 
-        let entry = archive
-            .find_archive_entry(&path)
-            .ok_or_else(|| anyhow::anyhow!(std::io::Error::from(rustix::io::Errno::NOENT)))?;
+        let entry = archive.find_archive_entry(&path).ok_or_else(|| {
+            anyhow::anyhow!(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File not found"
+            ))
+        })?;
 
         let size = match entry {
             ddup_bak::archive::entries::Entry::File(file) => file.size_real,
@@ -656,9 +665,12 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
         let archive = self.archive.clone();
         let path = path.as_ref().to_path_buf();
 
-        let entry = archive
-            .find_archive_entry(&path)
-            .ok_or_else(|| anyhow::anyhow!(std::io::Error::from(rustix::io::Errno::NOENT)))?;
+        let entry = archive.find_archive_entry(&path).ok_or_else(|| {
+            anyhow::anyhow!(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File not found"
+            ))
+        })?;
 
         let size = match entry {
             ddup_bak::archive::entries::Entry::File(file) => file.size_real,
@@ -743,8 +755,9 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                             let entry = match entry {
                                 ddup_bak::archive::entries::Entry::Directory(entry) => entry,
                                 _ => {
-                                    return Err(anyhow::anyhow!(std::io::Error::from(
-                                        rustix::io::Errno::NOENT
+                                    return Err(anyhow::anyhow!(std::io::Error::new(
+                                        std::io::ErrorKind::NotFound,
+                                        "File not found"
                                     )));
                                 }
                             };
@@ -802,8 +815,9 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                             let entry = match entry {
                                 ddup_bak::archive::entries::Entry::Directory(entry) => entry,
                                 _ => {
-                                    return Err(anyhow::anyhow!(std::io::Error::from(
-                                        rustix::io::Errno::NOENT
+                                    return Err(anyhow::anyhow!(std::io::Error::new(
+                                        std::io::ErrorKind::NotFound,
+                                        "File not found"
                                     )));
                                 }
                             };

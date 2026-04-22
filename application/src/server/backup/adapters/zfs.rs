@@ -435,7 +435,7 @@ impl BackupExt for ZfsBackup {
                                     server.filesystem.async_create_dir_all(&path).await?;
                                     server
                                         .filesystem
-                                        .async_set_permissions(&path, metadata.permissions())
+                                        .async_set_permissions(&path, metadata.permissions().into())
                                         .await?;
                                     if let Ok(modified_time) = metadata.modified() {
                                         server.filesystem.async_set_times(

@@ -4,7 +4,7 @@ use crate::{
     server::filesystem::virtualfs::{
         DirectoryStreamWalkFn, VirtualReadableFilesystem, VirtualWritableFilesystem,
     },
-    utils::{PortableModeExt, PortableSizeExt},
+    utils::{PortablePermissions, PortableSizeExt},
 };
 use cap_std::fs::Metadata;
 use compact_str::ToCompactString;
@@ -13,7 +13,6 @@ use std::{
     fmt::Debug,
     hint::unreachable_unchecked,
     ops::Deref,
-    os::fd::AsFd,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -39,6 +38,7 @@ pub mod writer;
 pub fn encode_mode(mode: u32) -> compact_str::CompactString {
     let mut mode_str = compact_str::CompactString::default();
 
+    #[cfg(unix)]
     mode_str.push(match rustix::fs::FileType::from_raw_mode(mode) {
         rustix::fs::FileType::RegularFile => '-',
         rustix::fs::FileType::Directory => 'd',
@@ -49,6 +49,8 @@ pub fn encode_mode(mode: u32) -> compact_str::CompactString {
         rustix::fs::FileType::Fifo => 'p',
         rustix::fs::FileType::Unknown => '?',
     });
+    #[cfg(not(unix))]
+    mode_str.push('?');
 
     for i in 0u8..9 {
         if mode & (1 << (8 - i)) != 0 {
@@ -208,6 +210,7 @@ impl Filesystem {
 
                                     for dir in &dirs_to_scan {
                                         let mut tmp_disk_usage = usage::DiskUsage::default();
+                                        #[cfg(unix)]
                                         let mut seen_inodes = HashSet::new();
 
                                         let mut walker = cap_filesystem.async_walk_dir(dir).await?;
@@ -268,6 +271,7 @@ impl Filesystem {
                             }
 
                             let mut tmp_disk_usage = usage::DiskUsage::default();
+                            #[cfg(unix)]
                             let mut seen_inodes = HashSet::new();
                             let mut total_entries = 0;
                             let mut total_size = 0;
@@ -1105,6 +1109,8 @@ impl Filesystem {
 
         #[cfg(unix)]
         {
+            use std::os::fd::AsFd;
+
             let metadata = self.async_metadata(path.as_ref()).await?;
 
             let owner_uid = rustix::fs::Uid::from_raw_unchecked(self.config.system.user.uid);
@@ -1346,8 +1352,11 @@ impl Filesystem {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into(),
-            mode: encode_mode(metadata.permissions().mode()),
-            mode_bits: compact_str::format_compact!("{:o}", metadata.permissions().mode() & 0o777),
+            mode: encode_mode(PortablePermissions::from(metadata.permissions()).mode),
+            mode_bits: compact_str::format_compact!(
+                "{:o}",
+                PortablePermissions::from(metadata.permissions()).mode & 0o777
+            ),
             size,
             size_physical,
             editable: real_metadata.is_file() && detected_mime.valid_utf8,
@@ -1423,8 +1432,11 @@ impl Filesystem {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into(),
-            mode: encode_mode(metadata.permissions().mode()),
-            mode_bits: compact_str::format_compact!("{:o}", metadata.permissions().mode() & 0o777),
+            mode: encode_mode(PortablePermissions::from(metadata.permissions()).mode),
+            mode_bits: compact_str::format_compact!(
+                "{:o}",
+                PortablePermissions::from(metadata.permissions()).mode & 0o777
+            ),
             size,
             size_physical,
             editable: real_metadata.is_file() && detected_mime.valid_utf8,
@@ -1488,7 +1500,7 @@ impl Filesystem {
                 None
             };
 
-        let mime_key = (&metadata).into();
+        let mime_key = crate::routes::MimeCacheKey::from(&metadata);
         let detected_mime =
             if let Some(detected_mime) = self.app_state.mime_cache.get(&mime_key).await {
                 detected_mime

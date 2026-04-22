@@ -1,7 +1,4 @@
-use std::{
-    io::{Read, Write},
-    os::fd::AsFd,
-};
+use std::io::{Read, Write};
 
 pub mod abort;
 pub mod compression;
@@ -41,9 +38,10 @@ pub fn copy_shared(
     Ok(())
 }
 
+#[cfg(unix)]
 pub fn copy_file_progress(
-    reader: &mut (impl AsFd + Read + ?Sized),
-    writer: &mut (impl AsFd + Write + ?Sized),
+    reader: &mut (impl std::os::fd::AsFd + Read + ?Sized),
+    writer: &mut (impl std::os::fd::AsFd + Write + ?Sized),
     mut progress: impl FnMut(usize) -> Result<(), std::io::Error>,
     listener: abort::AbortListener,
 ) -> Result<u64, std::io::Error> {
@@ -100,6 +98,35 @@ pub fn copy_file_progress(
                 _ => return Err(err.into()),
             },
         }
+    }
+
+    Ok(total_copied)
+}
+
+#[cfg(not(unix))]
+pub fn copy_file_progress(
+    reader: &mut (impl Read + ?Sized),
+    writer: &mut (impl Write + ?Sized),
+    mut progress: impl FnMut(usize) -> Result<(), std::io::Error>,
+    listener: abort::AbortListener,
+) -> Result<u64, std::io::Error> {
+    let mut total_copied = 0;
+    let mut buffer = vec![0; crate::BUFFER_SIZE];
+
+    loop {
+        if crate::unlikely(listener.is_aborted()) {
+            return Err(std::io::Error::other("Operation aborted"));
+        }
+
+        let bytes_read = reader.read(&mut buffer)?;
+        if crate::unlikely(bytes_read == 0) {
+            break;
+        }
+
+        writer.write_all(&buffer[..bytes_read])?;
+
+        total_copied += bytes_read as u64;
+        progress(bytes_read)?;
     }
 
     Ok(total_copied)

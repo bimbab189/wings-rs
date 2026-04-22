@@ -15,8 +15,8 @@ use crate::{
             },
         },
     },
+    utils::PortablePermissions,
 };
-use cap_std::fs::Permissions;
 use chrono::{Datelike, Timelike};
 use ddup_bak::archive::entries::Entry;
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
@@ -529,7 +529,7 @@ impl BackupExt for DdupBakBackup {
                         let mut writer = crate::server::filesystem::writer::FileSystemWriter::new(
                             server.clone(),
                             &path,
-                            Some(Permissions::from_std(file.mode.into())),
+                            Some(PortablePermissions::from_mode(file.mode.bits())),
                             Some(cap_std::time::SystemTime::from_std(file.mtime)),
                         )?;
                         let reader = repository.entry_reader(Entry::File(file.clone()))?;
@@ -543,7 +543,7 @@ impl BackupExt for DdupBakBackup {
                         server.filesystem.create_dir_all(&path)?;
                         server.filesystem.set_permissions(
                             &path,
-                            cap_std::fs::Permissions::from_std(directory.mode.into()),
+                            PortablePermissions::from_mode(directory.mode.bits()),
                         )?;
 
                         for entry in &directory.entries {

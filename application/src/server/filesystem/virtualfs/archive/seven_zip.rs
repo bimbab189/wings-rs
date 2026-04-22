@@ -16,7 +16,7 @@ use crate::{
             VirtualReadableFilesystem,
         },
     },
-    utils::PortableModeExt,
+    utils::PortablePermissions,
 };
 use chrono::{Datelike, Timelike};
 use std::{
@@ -233,7 +233,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         if path.as_ref() == Path::new("") || path.as_ref() == Path::new("/") {
             return Ok(FileMetadata {
                 file_type: FileType::Dir,
-                permissions: cap_std::fs::Permissions::from_portable_mode(0o755),
+                permissions: PortablePermissions::from_mode(0o755),
                 size: 0,
                 modified: None,
                 created: None,
@@ -252,9 +252,9 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         Ok(FileMetadata {
             file_type: Self::seven_zip_entry_to_file_type(entry),
             permissions: if entry.is_directory() {
-                cap_std::fs::Permissions::from_portable_mode(0o755)
+                PortablePermissions::from_mode(0o755)
             } else {
-                cap_std::fs::Permissions::from_portable_mode(0o644)
+                PortablePermissions::from_mode(0o644)
             },
             size: entry.size(),
             modified: if entry.has_last_modified_date {

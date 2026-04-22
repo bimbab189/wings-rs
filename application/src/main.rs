@@ -241,7 +241,7 @@ async fn main() {
                     bollard::API_DEFAULT_VERSION,
                 )
             } else {
-                bollard::Docker::connect_with_unix(
+                bollard::Docker::connect_with_local(
                     &config.docker.socket,
                     120,
                     bollard::API_DEFAULT_VERSION,
@@ -474,6 +474,7 @@ async fn main() {
         });
     }
 
+    #[cfg(unix)]
     tokio::spawn(async move {
         let mut signal =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).unwrap();

@@ -261,10 +261,10 @@ impl ServerConfiguration {
             .collect()
     }
 
+    #[cfg(unix)]
     fn convert_devices(&self) -> Vec<bollard::models::DeviceMapping> {
         let mut devices = Vec::new();
 
-        #[cfg(unix)]
         if self.container.kvm_passthrough_enabled {
             devices.push(bollard::models::DeviceMapping {
                 path_on_host: Some("/dev/kvm".into()),
@@ -547,6 +547,7 @@ impl ServerConfiguration {
 
                 port_bindings: Some(self.convert_allocations_docker_bindings(config)),
                 mounts: Some(self.convert_mounts(config, filesystem).await),
+                #[cfg(unix)]
                 devices: Some(self.convert_devices()),
                 network_mode: Some(network_mode),
                 dns: Some(config.docker.network.dns.clone()),
