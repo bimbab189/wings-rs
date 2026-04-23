@@ -34,7 +34,7 @@ pub struct ConfigureArgs {
         short = 'c',
         long = "config",
         help = "path to the config file",
-        default_value = "/etc/pterodactyl/config.yml"
+        default_value = crate::DEFAULT_CONFIG_PATH
     )]
     pub config: String,
 }

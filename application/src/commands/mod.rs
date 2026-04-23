@@ -35,7 +35,7 @@ impl CliCommandGroupBuilder {
                         .long("config")
                         .alias("config-file")
                         .alias("config-path")
-                        .default_value("/etc/pterodactyl/config.yml")
+                        .default_value(crate::DEFAULT_CONFIG_PATH)
                         .global(true)
                         .required(false),
                 )

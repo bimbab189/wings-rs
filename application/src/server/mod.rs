@@ -1512,6 +1512,8 @@ impl Server {
 
         crate::server::installation::ServerInstaller::delete_install_logs(self).await;
 
+        self.filesystem.close().await;
+
         tokio::spawn({
             let server = self.clone();
 

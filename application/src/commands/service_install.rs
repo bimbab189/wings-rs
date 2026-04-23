@@ -40,7 +40,7 @@ PartOf=docker.service
 [Service]
 User=root
 KillMode=process
-WorkingDirectory=/etc/pterodactyl
+WorkingDirectory={}
 LimitNOFILE=4096
 PIDFile=/var/run/wings/daemon.pid
 ExecStart={}
@@ -52,6 +52,7 @@ RestartSec=5s
 [Install]
 WantedBy=multi-user.target
 "#,
+        crate::DEFAULT_CONFIG_PATH,
         binary_path.display()
     )
 }
@@ -65,7 +66,7 @@ description="Calagopus Wings Daemon"
 command="{}"
 supervisor="supervise-daemon"
 pidfile="/var/run/wings/daemon.pid"
-directory="/etc/pterodactyl"
+directory="{}"
 rc_ulimit="-n 4096"
 
 respawn_delay=5
@@ -75,7 +76,8 @@ depend() {{
     need net docker
 }}
 "#,
-        binary_path.display()
+        binary_path.display(),
+        crate::DEFAULT_CONFIG_PATH
     )
 }
 

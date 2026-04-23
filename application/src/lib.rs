@@ -22,6 +22,11 @@ pub const GIT_COMMIT: &str = env!("CARGO_GIT_COMMIT");
 pub const GIT_BRANCH: &str = env!("CARGO_GIT_BRANCH");
 pub const TARGET: &str = env!("CARGO_TARGET");
 
+#[cfg(unix)]
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/pterodactyl/config.yml";
+#[cfg(windows)]
+pub const DEFAULT_CONFIG_PATH: &str = "C:\\ProgramData\\Calagopus-Wings\\config.yml";
+
 /// 32 KiB - used for general IO
 pub const BUFFER_SIZE: usize = 32 * 1024;
 /// 4 MiB - used for transfers

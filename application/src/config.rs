@@ -17,7 +17,14 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 use utoipa::ToSchema;
 
 fn app_name() -> String {
-    "Pterodactyl".to_string()
+    #[cfg(unix)]
+    {
+        "Pterodactyl".to_string()
+    }
+    #[cfg(windows)]
+    {
+        "Calagopus".to_string()
+    }
 }
 fn api_host() -> String {
     "0.0.0.0".to_string()
@@ -69,7 +76,7 @@ fn system_root_directory() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus".to_string()
+        "C:\\ProgramData\\Calagopus-Wings".to_string()
     }
 }
 fn system_log_directory() -> String {
@@ -79,7 +86,7 @@ fn system_log_directory() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\logs".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\logs".to_string()
     }
 }
 fn system_vmount_directory() -> String {
@@ -89,7 +96,7 @@ fn system_vmount_directory() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\vmounts".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\vmounts".to_string()
     }
 }
 fn system_data() -> String {
@@ -99,7 +106,7 @@ fn system_data() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\volumes".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\volumes".to_string()
     }
 }
 fn system_archive_directory() -> String {
@@ -109,7 +116,7 @@ fn system_archive_directory() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\archives".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\archives".to_string()
     }
 }
 fn system_backup_directory() -> String {
@@ -119,7 +126,7 @@ fn system_backup_directory() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\backups".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\backups".to_string()
     }
 }
 fn system_tmp_directory() -> String {
@@ -129,11 +136,18 @@ fn system_tmp_directory() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\tmp".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\tmp".to_string()
     }
 }
 fn system_username() -> compact_str::CompactString {
-    "pterodactyl".into()
+    #[cfg(unix)]
+    {
+        "pterodactyl".into()
+    }
+    #[cfg(windows)]
+    {
+        "calagopus-wings".into()
+    }
 }
 fn system_timezone() -> compact_str::CompactString {
     if let Ok(tz) = std::env::var("TZ") {
@@ -263,7 +277,7 @@ fn system_backup_restic_repository() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\backups\\restic".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\backups\\restic".to_string()
     }
 }
 fn system_backup_restic_password_file() -> String {
@@ -273,7 +287,7 @@ fn system_backup_restic_password_file() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\backups\\restic_password".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\backups\\restic_password".to_string()
     }
 }
 fn system_backup_restic_retry_lock_seconds() -> u64 {
@@ -312,13 +326,27 @@ fn docker_network_dns() -> Vec<String> {
     vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()]
 }
 fn docker_network_name() -> String {
-    "pterodactyl_nw".to_string()
+    #[cfg(unix)]
+    {
+        "pterodactyl_nw".to_string()
+    }
+    #[cfg(windows)]
+    {
+        "calagopus_nw".to_string()
+    }
 }
 fn docker_network_driver() -> String {
     "bridge".to_string()
 }
 fn docker_network_mode() -> String {
-    "pterodactyl_nw".to_string()
+    #[cfg(unix)]
+    {
+        "pterodactyl_nw".to_string()
+    }
+    #[cfg(windows)]
+    {
+        "calagopus_nw".to_string()
+    }
 }
 fn docker_network_enable_icc() -> bool {
     true
