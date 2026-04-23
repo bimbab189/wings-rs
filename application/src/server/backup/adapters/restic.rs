@@ -23,7 +23,7 @@ use crate::{
     utils::PortablePermissions,
 };
 use chrono::{Datelike, Timelike};
-use compact_str::ToCompactString;
+use compact_str::{CompactString, ToCompactString};
 use serde::Deserialize;
 use serde_default::DefaultFromSerde;
 use std::{
@@ -74,22 +74,130 @@ pub struct ResticDirectoryEntry {
     mtime: chrono::DateTime<chrono::Utc>,
 }
 
-impl ResticDirectoryEntry {
-    pub fn cmp_sort(
-        &self,
-        other: &Self,
-        sort: crate::models::DirectorySortingMode,
-    ) -> std::cmp::Ordering {
-        use crate::models::DirectorySortingMode::*;
+struct ResticFileMeta {
+    file_type: FileType,
+    mode: u32,
+    size: u64,
+    mtime: chrono::DateTime<chrono::Utc>,
+}
 
-        match sort {
-            NameAsc => self.path.cmp(&other.path),
-            NameDesc => other.path.cmp(&self.path),
-            SizeAsc | PhysicalSizeAsc => self.size.unwrap_or(0).cmp(&other.size.unwrap_or(0)),
-            SizeDesc | PhysicalSizeDesc => other.size.unwrap_or(0).cmp(&self.size.unwrap_or(0)),
-            ModifiedAsc | CreatedAsc => self.mtime.cmp(&other.mtime),
-            ModifiedDesc | CreatedDesc => other.mtime.cmp(&self.mtime),
+#[derive(Default)]
+pub struct ResticTreeNode {
+    size: u64,
+    mtime: chrono::DateTime<chrono::Utc>,
+    mode: u32,
+    has_explicit_entry: bool,
+    dirs: thin_vec::ThinVec<(CompactString, ResticTreeNode)>,
+    files: thin_vec::ThinVec<(CompactString, ResticFileMeta)>,
+}
+
+impl ResticTreeNode {
+    fn build(entries: Vec<ResticDirectoryEntry>) -> Self {
+        let mut root = ResticTreeNode::default();
+
+        for entry in entries {
+            root.insert(entry);
         }
+        root.aggregate_sizes();
+        root
+    }
+
+    fn insert(&mut self, entry: ResticDirectoryEntry) {
+        let components: Vec<&str> = entry
+            .path
+            .components()
+            .filter_map(|c| c.as_os_str().to_str())
+            .collect();
+
+        if components.is_empty() {
+            return;
+        }
+
+        match entry.r#type {
+            ResticEntryType::Dir => {
+                let node = self.upsert_dir_path(&components);
+                node.has_explicit_entry = true;
+                node.mtime = entry.mtime;
+                node.mode = entry.mode;
+            }
+            ResticEntryType::File | ResticEntryType::Symlink => {
+                let (leaf, parents) = match components.split_last() {
+                    Some(v) => v,
+                    None => return,
+                };
+
+                let parent = self.upsert_dir_path(parents);
+                let meta = ResticFileMeta {
+                    file_type: match entry.r#type {
+                        ResticEntryType::File => FileType::File,
+                        ResticEntryType::Symlink => FileType::Symlink,
+                        ResticEntryType::Dir => unreachable!(),
+                    },
+                    mode: entry.mode,
+                    size: entry.size.unwrap_or(0),
+                    mtime: entry.mtime,
+                };
+                let leaf_name = leaf.to_compact_string();
+                match parent.files.binary_search_by(|(n, _)| n.as_str().cmp(leaf)) {
+                    Ok(idx) => parent.files[idx].1 = meta,
+                    Err(idx) => parent.files.insert(idx, (leaf_name, meta)),
+                }
+            }
+        }
+    }
+
+    fn upsert_dir_path(&mut self, components: &[&str]) -> &mut ResticTreeNode {
+        let mut current = self;
+        for name in components {
+            let idx = match current.dirs.binary_search_by(|(n, _)| n.as_str().cmp(name)) {
+                Ok(idx) => idx,
+                Err(idx) => {
+                    current
+                        .dirs
+                        .insert(idx, (name.to_compact_string(), ResticTreeNode::default()));
+                    idx
+                }
+            };
+            current = &mut current.dirs[idx].1;
+        }
+        current
+    }
+
+    fn aggregate_sizes(&mut self) -> u64 {
+        let mut total: u64 = self.files.iter().map(|(_, m)| m.size).sum();
+        for (_, child) in self.dirs.iter_mut() {
+            total = total.saturating_add(child.aggregate_sizes());
+        }
+        self.size = total;
+        total
+    }
+
+    fn lookup_dir(&self, path: &Path) -> Option<&ResticTreeNode> {
+        if path == Path::new("") || path == Path::new("/") {
+            return Some(self);
+        }
+        let mut current = self;
+        for component in path.components() {
+            let name = component.as_os_str().to_str()?;
+            let idx = current
+                .dirs
+                .binary_search_by(|(n, _)| n.as_str().cmp(name))
+                .ok()?;
+            current = &current.dirs[idx].1;
+        }
+        Some(current)
+    }
+
+    fn lookup_file(&self, path: &Path) -> Option<&ResticFileMeta> {
+        let parent_path = path.parent()?;
+        let leaf = path.file_name()?.to_str()?;
+
+        let parent = self.lookup_dir(parent_path)?;
+        let idx = parent
+            .files
+            .binary_search_by(|(n, _)| n.as_str().cmp(leaf))
+            .ok()?;
+        Some(&parent.files[idx].1)
     }
 }
 
@@ -867,7 +975,7 @@ impl BackupExt for ResticBackup {
             .spawn()?;
 
         let mut line_reader = tokio::io::BufReader::new(child.stdout.unwrap()).lines();
-        let mut entries = Vec::new();
+        let mut entries: Vec<ResticDirectoryEntry> = Vec::new();
 
         while let Ok(Some(line)) = line_reader.next_line().await {
             if line.is_empty() {
@@ -885,12 +993,14 @@ impl BackupExt for ResticBackup {
             }
         }
 
+        let tree = ResticTreeNode::build(entries);
+
         Ok(Arc::new(VirtualResticBackup {
             server: server.clone(),
             short_id: self.short_id.clone(),
             server_path: self.server_path.clone(),
             configuration: Arc::clone(&self.configuration),
-            entries: Arc::new(entries),
+            tree: Arc::new(tree),
         }))
     }
 }
@@ -910,30 +1020,41 @@ pub struct VirtualResticBackup {
     pub short_id: String,
     pub server_path: PathBuf,
     pub configuration: Arc<ResticBackupConfiguration>,
-    pub entries: Arc<Vec<ResticDirectoryEntry>>,
+    pub tree: Arc<ResticTreeNode>,
 }
 
 impl VirtualResticBackup {
-    fn restic_entry_to_directory_entry(
-        &self,
+    fn directory_entry_from_dir_node(path: &Path, node: &ResticTreeNode) -> DirectoryEntry {
+        let detected_mime = MimeCacheValue::directory();
+        let mode = if node.mode != 0 { node.mode } else { 0o755 };
+
+        DirectoryEntry {
+            name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into(),
+            mode: encode_mode(mode),
+            mode_bits: compact_str::format_compact!("{:o}", mode & 0o777),
+            size: node.size,
+            size_physical: node.size,
+            editable: false,
+            inner_editable: false,
+            directory: true,
+            file: false,
+            symlink: false,
+            mime: detected_mime.mime,
+            modified: node.mtime,
+            created: chrono::DateTime::from_timestamp(0, 0).unwrap_or_default(),
+        }
+    }
+
+    fn directory_entry_from_file_meta(
         path: &Path,
-        entry: &ResticDirectoryEntry,
+        meta: &ResticFileMeta,
         buffer: Option<&[u8]>,
     ) -> DirectoryEntry {
-        let size = match entry.r#type {
-            ResticEntryType::File => entry.size.unwrap_or(0),
-            ResticEntryType::Dir => self
-                .entries
-                .iter()
-                .filter(|e| e.path.starts_with(&entry.path))
-                .map(|e| e.size.unwrap_or(0))
-                .sum(),
-            _ => 0,
-        };
-
-        let detected_mime = if matches!(entry.r#type, ResticEntryType::Dir) {
-            MimeCacheValue::directory()
-        } else if matches!(entry.r#type, ResticEntryType::Symlink) {
+        let detected_mime = if meta.file_type.is_symlink() {
             MimeCacheValue::symlink()
         } else {
             crate::utils::detect_mime_type(path, buffer)
@@ -945,27 +1066,18 @@ impl VirtualResticBackup {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into(),
-            mode: encode_mode(entry.mode),
-            mode_bits: compact_str::format_compact!("{:o}", entry.mode & 0o777),
-            size,
-            size_physical: size,
-            editable: matches!(entry.r#type, ResticEntryType::File) && detected_mime.valid_utf8,
-            inner_editable: matches!(entry.r#type, ResticEntryType::File)
-                && detected_mime.valid_inner_utf8,
-            directory: matches!(entry.r#type, ResticEntryType::Dir),
-            file: matches!(entry.r#type, ResticEntryType::File),
-            symlink: matches!(entry.r#type, ResticEntryType::Symlink),
+            mode: encode_mode(meta.mode),
+            mode_bits: compact_str::format_compact!("{:o}", meta.mode & 0o777),
+            size: meta.size,
+            size_physical: meta.size,
+            editable: meta.file_type.is_file() && detected_mime.valid_utf8,
+            inner_editable: meta.file_type.is_file() && detected_mime.valid_inner_utf8,
+            directory: false,
+            file: meta.file_type.is_file(),
+            symlink: meta.file_type.is_symlink(),
             mime: detected_mime.mime,
-            modified: entry.mtime,
+            modified: meta.mtime,
             created: chrono::DateTime::from_timestamp(0, 0).unwrap_or_default(),
-        }
-    }
-
-    fn restic_entry_to_file_type(entry: &ResticDirectoryEntry) -> FileType {
-        match entry.r#type {
-            ResticEntryType::Dir => FileType::Dir,
-            ResticEntryType::File => FileType::File,
-            ResticEntryType::Symlink => FileType::Symlink,
         }
     }
 }
@@ -980,7 +1092,9 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<FileMetadata, anyhow::Error> {
-        if path.as_ref() == Path::new("") || path.as_ref() == Path::new("/") {
+        let path_ref = path.as_ref();
+
+        if path_ref == Path::new("") || path_ref == Path::new("/") {
             return Ok(FileMetadata {
                 file_type: FileType::Dir,
                 permissions: PortablePermissions::from_mode(0o755),
@@ -990,25 +1104,36 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             });
         }
 
-        let path = path.as_ref();
-        let entry = self
-            .entries
-            .iter()
-            .find(|e| e.path == path)
-            .ok_or_else(|| {
-                anyhow::anyhow!(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "File not found"
-                ))
-            })?;
+        if let Some(node) = self.tree.lookup_dir(path_ref) {
+            let mode = if node.mode != 0 { node.mode } else { 0o755 };
+            let modified = if node.has_explicit_entry {
+                Some(node.mtime.into())
+            } else {
+                None
+            };
+            return Ok(FileMetadata {
+                file_type: FileType::Dir,
+                permissions: PortablePermissions::from_mode(mode & 0o777),
+                size: node.size,
+                modified,
+                created: None,
+            });
+        }
 
-        Ok(FileMetadata {
-            file_type: Self::restic_entry_to_file_type(entry),
-            permissions: PortablePermissions::from_mode(entry.mode & 0o777),
-            size: entry.size.unwrap_or(0),
-            modified: Some(entry.mtime.into()),
-            created: None,
-        })
+        if let Some(meta) = self.tree.lookup_file(path_ref) {
+            return Ok(FileMetadata {
+                file_type: meta.file_type,
+                permissions: PortablePermissions::from_mode(meta.mode & 0o777),
+                size: meta.size,
+                modified: Some(meta.mtime.into()),
+                created: None,
+            });
+        }
+
+        Err(anyhow::anyhow!(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "File not found"
+        )))
     }
     async fn async_metadata(
         &self,
@@ -1034,19 +1159,18 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<DirectoryEntry, anyhow::Error> {
-        let path = path.as_ref();
-        let entry = self
-            .entries
-            .iter()
-            .find(|e| e.path == path)
-            .ok_or_else(|| {
-                anyhow::anyhow!(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "File not found"
-                ))
-            })?;
+        let path_ref = path.as_ref();
 
-        Ok(self.restic_entry_to_directory_entry(path, entry, None))
+        if let Some(node) = self.tree.lookup_dir(path_ref) {
+            return Ok(Self::directory_entry_from_dir_node(path_ref, node));
+        }
+        if let Some(meta) = self.tree.lookup_file(path_ref) {
+            return Ok(Self::directory_entry_from_file_meta(path_ref, meta, None));
+        }
+        Err(anyhow::anyhow!(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "File not found"
+        )))
     }
 
     async fn async_directory_entry_buffer(
@@ -1054,19 +1178,22 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         path: &(dyn AsRef<Path> + Send + Sync),
         buffer: &[u8],
     ) -> Result<DirectoryEntry, anyhow::Error> {
-        let path = path.as_ref();
-        let entry = self
-            .entries
-            .iter()
-            .find(|e| e.path == path)
-            .ok_or_else(|| {
-                anyhow::anyhow!(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "File not found"
-                ))
-            })?;
+        let path_ref = path.as_ref();
 
-        Ok(self.restic_entry_to_directory_entry(path, entry, Some(buffer)))
+        if let Some(node) = self.tree.lookup_dir(path_ref) {
+            return Ok(Self::directory_entry_from_dir_node(path_ref, node));
+        }
+        if let Some(meta) = self.tree.lookup_file(path_ref) {
+            return Ok(Self::directory_entry_from_file_meta(
+                path_ref,
+                meta,
+                Some(buffer),
+            ));
+        }
+        Err(anyhow::anyhow!(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "File not found"
+        )))
     }
 
     async fn async_read_dir(
@@ -1077,54 +1204,96 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         is_ignored: IsIgnoredFn,
         sort: crate::models::DirectorySortingMode,
     ) -> Result<DirectoryListing, anyhow::Error> {
+        use crate::models::DirectorySortingMode::*;
+
         let path = path.as_ref().to_path_buf();
-        let mut directory_entries = Vec::new();
-        let mut other_entries = Vec::new();
-
-        let path_len = path.components().count();
-        for entry in self.entries.iter() {
-            let name = &entry.path;
-
-            let name_len = name.components().count();
-            if name_len < path_len
-                || !name.starts_with(&path)
-                || name == &path
-                || name_len > path_len + 1
-            {
-                continue;
+        let node = match self.tree.lookup_dir(&path) {
+            Some(n) => n,
+            None => {
+                return Ok(DirectoryListing {
+                    total_entries: 0,
+                    entries: Vec::new(),
+                });
             }
+        };
 
-            if (is_ignored)(Self::restic_entry_to_file_type(entry), name.clone()).is_none() {
-                continue;
-            }
-
-            if matches!(entry.r#type, ResticEntryType::Dir) {
-                directory_entries.push(entry);
-            } else {
-                other_entries.push(entry);
-            }
+        enum Child<'a> {
+            Dir {
+                path: PathBuf,
+                node: &'a ResticTreeNode,
+            },
+            File {
+                path: PathBuf,
+                meta: &'a ResticFileMeta,
+            },
         }
 
-        directory_entries.sort_unstable_by(|a, b| a.cmp_sort(b, sort));
-        other_entries.sort_unstable_by(|a, b| a.cmp_sort(b, sort));
+        let mut dir_children: Vec<Child<'_>> = Vec::new();
+        let mut file_children: Vec<Child<'_>> = Vec::new();
 
-        let total_entries = directory_entries.len() + other_entries.len();
-        let mut entries = Vec::new();
-
-        if let Some(per_page) = per_page {
-            let start = (page - 1) * per_page;
-
-            for entry in directory_entries
-                .iter()
-                .chain(other_entries.iter())
-                .skip(start)
-                .take(per_page)
-            {
-                entries.push(self.restic_entry_to_directory_entry(&entry.path, entry, None));
+        for (name, child_node) in node.dirs.iter() {
+            let child_path = path.join(name.as_str());
+            if (is_ignored)(FileType::Dir, child_path.clone()).is_none() {
+                continue;
             }
+            dir_children.push(Child::Dir {
+                path: child_path,
+                node: child_node,
+            });
+        }
+        for (name, meta) in node.files.iter() {
+            let child_path = path.join(name.as_str());
+            if (is_ignored)(meta.file_type, child_path.clone()).is_none() {
+                continue;
+            }
+            file_children.push(Child::File {
+                path: child_path,
+                meta,
+            });
+        }
+
+        let cmp = |a: &Child<'_>, b: &Child<'_>| -> std::cmp::Ordering {
+            let (a_path, a_size, a_mtime) = match a {
+                Child::Dir { path, node } => (path, node.size, node.mtime),
+                Child::File { path, meta } => (path, meta.size, meta.mtime),
+            };
+            let (b_path, b_size, b_mtime) = match b {
+                Child::Dir { path, node } => (path, node.size, node.mtime),
+                Child::File { path, meta } => (path, meta.size, meta.mtime),
+            };
+
+            match sort {
+                NameAsc => a_path.cmp(b_path),
+                NameDesc => b_path.cmp(a_path),
+                SizeAsc | PhysicalSizeAsc => a_size.cmp(&b_size),
+                SizeDesc | PhysicalSizeDesc => b_size.cmp(&a_size),
+                ModifiedAsc | CreatedAsc => a_mtime.cmp(&b_mtime),
+                ModifiedDesc | CreatedDesc => b_mtime.cmp(&a_mtime),
+            }
+        };
+
+        dir_children.sort_unstable_by(&cmp);
+        file_children.sort_unstable_by(&cmp);
+
+        let total_entries = dir_children.len() + file_children.len();
+        let merged = dir_children.into_iter().chain(file_children);
+
+        let target: Vec<Child<'_>> = if let Some(per_page) = per_page {
+            let start = (page - 1) * per_page;
+            merged.skip(start).take(per_page).collect()
         } else {
-            for entry in directory_entries.iter().chain(other_entries.iter()) {
-                entries.push(self.restic_entry_to_directory_entry(&entry.path, entry, None));
+            merged.collect()
+        };
+
+        let mut entries = Vec::with_capacity(target.len());
+        for child in target {
+            match child {
+                Child::Dir { path, node } => {
+                    entries.push(Self::directory_entry_from_dir_node(&path, node));
+                }
+                Child::File { path, meta } => {
+                    entries.push(Self::directory_entry_from_file_meta(&path, meta, None));
+                }
             }
         }
 
@@ -1139,39 +1308,47 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
     ) -> Result<Box<dyn DirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
-        struct ResticWalkDir {
-            entries: Arc<Vec<ResticDirectoryEntry>>,
-            index: usize,
-            path: PathBuf,
-            is_ignored: IsIgnoredFn,
+        let start = self.tree.lookup_dir(path.as_ref());
+        let mut flat: Vec<(FileType, PathBuf)> = Vec::new();
+
+        if let Some(start) = start {
+            fn walk(
+                node: &ResticTreeNode,
+                current_path: &Path,
+                is_ignored: &IsIgnoredFn,
+                out: &mut Vec<(FileType, PathBuf)>,
+            ) {
+                for (name, meta) in node.files.iter() {
+                    let child_path = current_path.join(name.as_str());
+                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path) {
+                        out.push((meta.file_type, filtered));
+                    }
+                }
+                for (name, child) in node.dirs.iter() {
+                    let child_path = current_path.join(name.as_str());
+                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()) {
+                        out.push((FileType::Dir, filtered));
+                    }
+                    walk(child, &child_path, is_ignored, out);
+                }
+            }
+
+            walk(start, path.as_ref(), &is_ignored, &mut flat);
+        }
+
+        struct TreeWalk {
+            items: std::vec::IntoIter<(FileType, PathBuf)>,
         }
 
         #[async_trait::async_trait]
-        impl DirectoryWalk for ResticWalkDir {
+        impl DirectoryWalk for TreeWalk {
             async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
-                while self.index < self.entries.len() {
-                    let entry = &self.entries[self.index];
-                    self.index += 1;
-
-                    let name = &entry.path;
-                    if !name.starts_with(&self.path) || name == &self.path {
-                        continue;
-                    }
-
-                    let file_type = VirtualResticBackup::restic_entry_to_file_type(entry);
-                    if let Some(path) = (self.is_ignored)(file_type, name.clone()) {
-                        return Some(Ok((file_type, path)));
-                    }
-                }
-                None
+                self.items.next().map(Ok)
             }
         }
 
-        Ok(Box::new(ResticWalkDir {
-            entries: self.entries.clone(),
-            index: 0,
-            path: path.as_ref().to_path_buf(),
-            is_ignored,
+        Ok(Box::new(TreeWalk {
+            items: flat.into_iter(),
         }))
     }
 
@@ -1202,50 +1379,39 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             }
         }
 
+        let root_path = path.as_ref().to_path_buf();
+        let mut top_entries: Vec<(FileType, PathBuf)> = Vec::new();
+        if let Some(node) = self.tree.lookup_dir(&root_path) {
+            for (name, _child) in node.dirs.iter() {
+                top_entries.push((FileType::Dir, root_path.join(name.as_str())));
+            }
+            for (name, meta) in node.files.iter() {
+                top_entries.push((meta.file_type, root_path.join(name.as_str())));
+            }
+        }
+
         let entry_wanted_notifier = Arc::new(tokio::sync::Notify::new());
         let (entry_channel_tx, entry_channel_rx) = tokio::sync::mpsc::channel(1);
 
         crate::spawn_handled({
             let entry_wanted_notifier = Arc::clone(&entry_wanted_notifier);
-            let entries = self.entries.clone();
             let configuration = Arc::clone(&self.configuration);
             let config = self.server.app_state.config.clone();
             let short_id = self.short_id.clone();
             let server_path = self.server_path.clone();
             let is_ignored = is_ignored.clone();
-            let root_path = path.as_ref().to_path_buf();
 
             async move {
-                let mut top_entries = Vec::new();
-
-                let path_len = root_path.components().count();
-
-                for entry in entries.iter() {
-                    let name = &entry.path;
-
-                    let name_len = name.components().count();
-                    if name_len < path_len
-                        || !name.starts_with(&root_path)
-                        || name == &root_path
-                        || name_len > path_len + 1
-                    {
-                        continue;
-                    }
-
-                    top_entries.push(entry);
-                }
-
                 let mut skip_notifier = false;
-                for entry in top_entries {
+                for (file_type, entry_path) in top_entries {
                     if !skip_notifier {
                         entry_wanted_notifier.notified().await;
                     } else {
                         skip_notifier = false;
                     }
 
-                    let file_type = VirtualResticBackup::restic_entry_to_file_type(entry);
-                    if let Some(path) = (is_ignored)(file_type, entry.path.clone()) {
-                        let full_path = server_path.join(&entry.path);
+                    if let Some(path) = (is_ignored)(file_type, entry_path.clone()) {
+                        let full_path = server_path.join(&entry_path);
 
                         if file_type.is_dir() {
                             let child = std::process::Command::new("restic")
@@ -1679,7 +1845,35 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                 .spawn()
         };
 
-        let entries = self.entries.clone();
+        enum ResolvedEntry {
+            Dir {
+                path: PathBuf,
+            },
+            File {
+                path: PathBuf,
+                mode: u32,
+                size: u64,
+                mtime: chrono::DateTime<chrono::Utc>,
+            },
+        }
+
+        let mut resolved: Vec<ResolvedEntry> = Vec::with_capacity(file_paths.len());
+        for entry_path in &file_paths {
+            if self.tree.lookup_dir(entry_path).is_some() {
+                resolved.push(ResolvedEntry::Dir {
+                    path: entry_path.clone(),
+                });
+            } else if let Some(meta) = self.tree.lookup_file(entry_path)
+                && meta.file_type.is_file()
+            {
+                resolved.push(ResolvedEntry::File {
+                    path: entry_path.clone(),
+                    mode: meta.mode,
+                    size: meta.size,
+                    mtime: meta.mtime,
+                });
+            }
+        }
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
@@ -1689,115 +1883,114 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
 
                     let mut read_buffer = vec![0; crate::BUFFER_SIZE];
 
-                    for entry_path in file_paths {
-                        let entry = match entries.iter().find(|e| e.path == entry_path) {
-                            Some(entry) => entry,
-                            None => continue,
-                        };
+                    for resolved_entry in resolved {
+                        match resolved_entry {
+                            ResolvedEntry::Dir { path: entry_path } => {
+                                let mut child = spawn_restic(true, &entry_path)?;
 
-                        if !matches!(entry.r#type, ResticEntryType::Dir | ResticEntryType::File) {
-                            continue;
-                        }
+                                let mut restic_tar =
+                                    tar::Archive::new(child.stdout.take().unwrap());
+                                let mut entries = restic_tar.entries()?;
 
-                        let mut child = spawn_restic(
-                            matches!(entry.r#type, ResticEntryType::Dir),
-                            &entry_path,
-                        )?;
+                                while let Some(Ok(mut entry)) = entries.next() {
+                                    let header = entry.header().clone();
+                                    let relative = entry_path.join(entry.path()?);
 
-                        if matches!(entry.r#type, ResticEntryType::Dir) {
-                            let mut restic_tar = tar::Archive::new(child.stdout.take().unwrap());
-                            let mut entries = restic_tar.entries()?;
+                                    let file_type = match header.entry_type() {
+                                        tar::EntryType::Directory => FileType::Dir,
+                                        tar::EntryType::Regular => FileType::File,
+                                        tar::EntryType::Symlink => FileType::Symlink,
+                                        _ => continue,
+                                    };
 
-                            while let Some(Ok(mut entry)) = entries.next() {
-                                let header = entry.header().clone();
-                                let relative = entry_path.join(entry.path()?);
+                                    let absolute_path = path.join(&relative);
+                                    if (is_ignored)(file_type, absolute_path).is_none() {
+                                        continue;
+                                    }
 
-                                let file_type = match header.entry_type() {
-                                    tar::EntryType::Directory => FileType::Dir,
-                                    tar::EntryType::Regular => FileType::File,
-                                    tar::EntryType::Symlink => FileType::Symlink,
-                                    _ => continue,
-                                };
+                                    let mut options: zip::write::FileOptions<'_, ()> =
+                                        zip::write::FileOptions::default()
+                                            .compression_level(Some(
+                                                compression_level.to_deflate_level() as i64,
+                                            ))
+                                            .unix_permissions(header.mode()?)
+                                            .large_file(header.size()? >= u32::MAX as u64);
 
-                                let absolute_path = path.join(&relative);
-                                if (is_ignored)(file_type, absolute_path).is_none() {
-                                    continue;
+                                    if let Ok(mtime) = header.mtime()
+                                        && let Some(mtime) =
+                                            chrono::DateTime::from_timestamp(mtime as i64, 0)
+                                    {
+                                        options = options.last_modified_time(
+                                            zip::DateTime::from_date_and_time(
+                                                mtime.year() as u16,
+                                                mtime.month() as u8,
+                                                mtime.day() as u8,
+                                                mtime.hour() as u8,
+                                                mtime.minute() as u8,
+                                                mtime.second() as u8,
+                                            )?,
+                                        );
+                                    }
+
+                                    match header.entry_type() {
+                                        tar::EntryType::Directory => {
+                                            zip.add_directory(relative.to_string_lossy(), options)?;
+                                        }
+                                        tar::EntryType::Regular => {
+                                            zip.start_file(relative.to_string_lossy(), options)?;
+
+                                            loop {
+                                                let n = entry.read(&mut read_buffer)?;
+                                                if n == 0 {
+                                                    break;
+                                                }
+                                                zip.write_all(&read_buffer[..n])?;
+                                                if let Some(counter) = &bytes_archived {
+                                                    counter.fetch_add(n as u64, Ordering::SeqCst);
+                                                }
+                                            }
+                                        }
+                                        _ => continue,
+                                    }
                                 }
+                            }
+                            ResolvedEntry::File {
+                                path: entry_path,
+                                mode,
+                                size,
+                                mtime,
+                            } => {
+                                let mut child = spawn_restic(false, &entry_path)?;
 
-                                let mut options: zip::write::FileOptions<'_, ()> =
+                                let options: zip::write::FileOptions<'_, ()> =
                                     zip::write::FileOptions::default()
                                         .compression_level(Some(
                                             compression_level.to_deflate_level() as i64,
                                         ))
-                                        .unix_permissions(header.mode()?)
-                                        .large_file(header.size()? >= u32::MAX as u64);
-
-                                if let Ok(mtime) = header.mtime()
-                                    && let Some(mtime) =
-                                        chrono::DateTime::from_timestamp(mtime as i64, 0)
-                                {
-                                    options = options.last_modified_time(
-                                        zip::DateTime::from_date_and_time(
+                                        .unix_permissions(mode)
+                                        .large_file(size >= u32::MAX as u64)
+                                        .last_modified_time(zip::DateTime::from_date_and_time(
                                             mtime.year() as u16,
                                             mtime.month() as u8,
                                             mtime.day() as u8,
                                             mtime.hour() as u8,
                                             mtime.minute() as u8,
                                             mtime.second() as u8,
-                                        )?,
-                                    );
-                                }
+                                        )?);
 
-                                match header.entry_type() {
-                                    tar::EntryType::Directory => {
-                                        zip.add_directory(relative.to_string_lossy(), options)?;
+                                zip.start_file(entry_path.to_string_lossy(), options)?;
+
+                                let mut restic_file = child.stdout.take().unwrap();
+
+                                loop {
+                                    let n = restic_file.read(&mut read_buffer)?;
+                                    if n == 0 {
+                                        break;
                                     }
-                                    tar::EntryType::Regular => {
-                                        zip.start_file(relative.to_string_lossy(), options)?;
-
-                                        loop {
-                                            let n = entry.read(&mut read_buffer)?;
-                                            if n == 0 {
-                                                break;
-                                            }
-                                            zip.write_all(&read_buffer[..n])?;
-                                            if let Some(counter) = &bytes_archived {
-                                                counter.fetch_add(n as u64, Ordering::SeqCst);
-                                            }
-                                        }
+                                    zip.write_all(&read_buffer[..n])?;
+                                    if let Some(counter) = &bytes_archived {
+                                        counter.fetch_add(n as u64, Ordering::SeqCst);
                                     }
-                                    _ => continue,
-                                }
-                            }
-                        } else {
-                            let options: zip::write::FileOptions<'_, ()> =
-                                zip::write::FileOptions::default()
-                                    .compression_level(Some(
-                                        compression_level.to_deflate_level() as i64
-                                    ))
-                                    .unix_permissions(entry.mode)
-                                    .large_file(entry.size.unwrap_or(0) >= u32::MAX as u64)
-                                    .last_modified_time(zip::DateTime::from_date_and_time(
-                                        entry.mtime.year() as u16,
-                                        entry.mtime.month() as u8,
-                                        entry.mtime.day() as u8,
-                                        entry.mtime.hour() as u8,
-                                        entry.mtime.minute() as u8,
-                                        entry.mtime.second() as u8,
-                                    )?);
-
-                            zip.start_file(entry_path.to_string_lossy(), options)?;
-
-                            let mut restic_file = child.stdout.take().unwrap();
-
-                            loop {
-                                let n = restic_file.read(&mut read_buffer)?;
-                                if n == 0 {
-                                    break;
-                                }
-                                zip.write_all(&read_buffer[..n])?;
-                                if let Some(counter) = &bytes_archived {
-                                    counter.fetch_add(n as u64, Ordering::SeqCst);
                                 }
                             }
                         }
@@ -1820,76 +2013,80 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                     )?;
                     let mut tar = tar::Builder::new(writer);
 
-                    for entry_path in file_paths {
-                        let entry = match entries.iter().find(|e| e.path == entry_path) {
-                            Some(entry) => entry,
-                            None => continue,
-                        };
+                    for resolved_entry in resolved {
+                        match resolved_entry {
+                            ResolvedEntry::Dir { path: entry_path } => {
+                                let mut child = spawn_restic(true, &entry_path)?;
 
-                        if !matches!(entry.r#type, ResticEntryType::Dir | ResticEntryType::File) {
-                            continue;
-                        }
+                                let mut restic_tar =
+                                    tar::Archive::new(child.stdout.take().unwrap());
+                                let mut entries = restic_tar.entries()?;
 
-                        let mut child = spawn_restic(
-                            matches!(entry.r#type, ResticEntryType::Dir),
-                            &entry_path,
-                        )?;
+                                while let Some(Ok(entry)) = entries.next() {
+                                    let mut header = entry.header().clone();
+                                    let relative = entry.path()?.to_path_buf();
 
-                        if matches!(entry.r#type, ResticEntryType::Dir) {
-                            let mut restic_tar = tar::Archive::new(child.stdout.take().unwrap());
-                            let mut entries = restic_tar.entries()?;
+                                    let file_type = match header.entry_type() {
+                                        tar::EntryType::Directory => FileType::Dir,
+                                        tar::EntryType::Regular => FileType::File,
+                                        tar::EntryType::Symlink => FileType::Symlink,
+                                        _ => continue,
+                                    };
 
-                            while let Some(Ok(entry)) = entries.next() {
-                                let mut header = entry.header().clone();
-                                let relative = entry.path()?.to_path_buf();
-
-                                let file_type = match header.entry_type() {
-                                    tar::EntryType::Directory => FileType::Dir,
-                                    tar::EntryType::Regular => FileType::File,
-                                    tar::EntryType::Symlink => FileType::Symlink,
-                                    _ => continue,
-                                };
-
-                                let absolute_path = path.join(&relative);
-                                if (is_ignored)(file_type, absolute_path).is_none() {
-                                    continue;
-                                }
-
-                                if file_type.is_file() {
-                                    if let Some(counter) = &bytes_archived {
-                                        let counting_reader = CountingReader::new_with_bytes_read(
-                                            entry,
-                                            counter.clone(),
-                                        );
-                                        tar.append_data(&mut header, relative, counting_reader)?;
-                                    } else {
-                                        tar.append_data(&mut header, relative, entry)?;
+                                    let absolute_path = path.join(&relative);
+                                    if (is_ignored)(file_type, absolute_path).is_none() {
+                                        continue;
                                     }
-                                } else {
-                                    tar.append_data(&mut header, relative, std::io::empty())?;
+
+                                    if file_type.is_file() {
+                                        if let Some(counter) = &bytes_archived {
+                                            let counting_reader =
+                                                CountingReader::new_with_bytes_read(
+                                                    entry,
+                                                    counter.clone(),
+                                                );
+                                            tar.append_data(
+                                                &mut header,
+                                                relative,
+                                                counting_reader,
+                                            )?;
+                                        } else {
+                                            tar.append_data(&mut header, relative, entry)?;
+                                        }
+                                    } else {
+                                        tar.append_data(&mut header, relative, std::io::empty())?;
+                                    }
                                 }
                             }
-                        } else {
-                            let mut header = tar::Header::new_gnu();
-                            header.set_path(&entry_path)?;
-                            header.set_size(entry.size.unwrap_or(0));
-                            header.set_mode(entry.mode);
-                            header.set_mtime(entry.mtime.timestamp() as u64);
-                            header.set_entry_type(tar::EntryType::Regular);
-                            header.set_cksum();
+                            ResolvedEntry::File {
+                                path: entry_path,
+                                mode,
+                                size,
+                                mtime,
+                            } => {
+                                let mut child = spawn_restic(false, &entry_path)?;
 
-                            if let Some(counter) = &bytes_archived {
-                                let counting_reader = CountingReader::new_with_bytes_read(
-                                    child.stdout.take().unwrap(),
-                                    counter.clone(),
-                                );
-                                tar.append_data(&mut header, &entry_path, counting_reader)?;
-                            } else {
-                                tar.append_data(
-                                    &mut header,
-                                    &entry_path,
-                                    child.stdout.take().unwrap(),
-                                )?;
+                                let mut header = tar::Header::new_gnu();
+                                header.set_path(&entry_path)?;
+                                header.set_size(size);
+                                header.set_mode(mode);
+                                header.set_mtime(mtime.timestamp() as u64);
+                                header.set_entry_type(tar::EntryType::Regular);
+                                header.set_cksum();
+
+                                if let Some(counter) = &bytes_archived {
+                                    let counting_reader = CountingReader::new_with_bytes_read(
+                                        child.stdout.take().unwrap(),
+                                        counter.clone(),
+                                    );
+                                    tar.append_data(&mut header, &entry_path, counting_reader)?;
+                                } else {
+                                    tar.append_data(
+                                        &mut header,
+                                        &entry_path,
+                                        child.stdout.take().unwrap(),
+                                    )?;
+                                }
                             }
                         }
                     }
