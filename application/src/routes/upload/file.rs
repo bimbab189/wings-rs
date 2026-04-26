@@ -174,7 +174,7 @@ mod post {
                     .ok();
             }
 
-            filesystem.async_create_dir_all(&parent).await?;
+            filesystem.async_create_dir_all(&root).await?;
 
             let mut written_size = 0;
             let mut writer = filesystem.async_create_file(&path).await?;
