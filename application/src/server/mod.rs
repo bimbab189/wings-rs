@@ -1019,12 +1019,6 @@ impl Server {
             return Err(anyhow::anyhow!("Server is already running."));
         }
 
-        if self.filesystem.is_full().await {
-            return Err(anyhow::anyhow!(
-                "Disk space is full, cannot start the server."
-            ));
-        }
-
         tracing::info!(
             server = %self.uuid,
             "starting server"
@@ -1045,9 +1039,43 @@ impl Server {
                     |_| async {
                         server.filesystem.setup().await;
                         server.filesystem.get_disk_limiter().startup().await?;
+
                         server.destroy_container().await;
 
                         server.sync_configuration().await;
+
+                        if !server.filesystem.disk_checker_state_dirty.load(std::sync::atomic::Ordering::Relaxed) {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let last_check = server.filesystem.last_disk_check.load(std::sync::atomic::Ordering::Relaxed);
+                            if now.saturating_sub(last_check) > server.app_state.config.system.disk_check_interval {
+                                tracing::info!(
+                                    server = %server.uuid,
+                                    "disk usage check is stale (last check was {} seconds ago), doing foreground check before starting server",
+                                    now.saturating_sub(last_check)
+                                );
+
+                                server.log_daemon_with_prelude(
+                                    "Recalculating disk usage before startup, this may take a moment...",
+                                );
+                                server.filesystem.rerun_disk_checker().await;
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(
+                                        server.app_state.config.system.disk_check_interval.min(30),
+                                    ),
+                                    server.filesystem.disk_check_completed.notified(),
+                                )
+                                .await;
+                            }
+                        }
+
+                        if server.filesystem.is_full().await {
+                            return Err(anyhow::anyhow!(
+                                "Disk space is full, cannot start the server."
+                            ));
+                        }
 
                         server.log_daemon_with_prelude("Updating process configuration files...");
                         if let Err(err) = server.process_configuration

@@ -1,7 +1,7 @@
 [package]
 name = "wings-rs"
 rust-version = { workspace = true }
-version = "1.0.4"
+version = "1.0.5"
 edition = "2024"
 
 [dependencies]
@@ -48,7 +48,7 @@ human_bytes = "0.4.3"
 ansi_term = "0.12.1"
 clap = { version = "4.5.37", features = ["derive", "string"] }
 dialoguer = "0.12.0"
-sysinfo = "0.38.0"
+sysinfo = "0.39.0"
 crc32fast = "1.4.2"
 cap-std = "4.0.0"
 rustix = "1.0.7"

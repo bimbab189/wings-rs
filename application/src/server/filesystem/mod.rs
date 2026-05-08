@@ -9,7 +9,7 @@ use crate::{
 use cap_std::fs::Metadata;
 use compact_str::ToCompactString;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt::Debug,
     hint::unreachable_unchecked,
     ops::Deref,
@@ -26,6 +26,7 @@ use tokio::{
 
 pub mod archive;
 pub mod cap;
+pub mod disk_checker;
 pub mod inotify;
 pub mod limiter;
 pub mod operations;
@@ -88,6 +89,8 @@ pub struct Filesystem {
     disk_usage_cached_logical: Arc<AtomicU64>,
     disk_usage_cached_physical: Arc<AtomicU64>,
     pub disk_usage: Arc<RwLock<usage::DiskUsage>>,
+    pub last_disk_check: Arc<AtomicU64>,
+    pub disk_check_completed: Arc<tokio::sync::Notify>,
     disk_ignored: Arc<RwLock<ignore::gitignore::Gitignore>>,
 
     pub archive_fs_cache: moka::future::Cache<PathBuf, Arc<dyn VirtualReadableFilesystem>>,
@@ -121,281 +124,27 @@ impl Filesystem {
         let server_notifier = inotify::InotifyServerNotifier::new(base_path.clone());
         let use_server_notifier = Arc::new(AtomicBool::new(false));
         let disk_checker_rescan = Arc::new(tokio::sync::Notify::new());
+        let disk_check_completed = Arc::new(tokio::sync::Notify::new());
+        let last_disk_check = Arc::new(AtomicU64::new(0));
 
         Self {
             uuid,
             app_state,
             disk_checker_rescan: Arc::clone(&disk_checker_rescan),
             disk_checker_state_dirty: Arc::clone(&disk_checker_state_dirty),
-            disk_checker: tokio::spawn({
-                let config = Arc::clone(&config);
-                let disk_usage = Arc::clone(&disk_usage);
-                let disk_usage_cached_logical = Arc::clone(&disk_usage_cached_logical);
-                let disk_usage_cached_physical = Arc::clone(&disk_usage_cached_physical);
-                let cap_filesystem = cap_filesystem.clone();
-                let server_notifier = server_notifier.clone();
-                let use_server_notifier = Arc::clone(&use_server_notifier);
-
-                async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-                    let mut full_disk_check_counter = 0;
-
-                    loop {
-                        let permit = config
-                            .disk_check_concurrency_semaphore
-                            .acquire()
-                            .await
-                            .unwrap();
-
-                        let run_inner = async |paths_to_scan: Option<Vec<PathBuf>>| -> Result<(), anyhow::Error> {
-                            tracing::debug!(
-                                path = %cap_filesystem.base_path.display(),
-                                "checking disk usage"
-                            );
-
-                            'selective_scan: {
-                                if let Some(modified_paths) = paths_to_scan {
-                                    if modified_paths.is_empty() {
-                                        tracing::debug!(
-                                            path = %cap_filesystem.base_path.display(),
-                                            "skipping disk usage check, no modified paths"
-                                        );
-                                        return Ok(());
-                                    }
-
-                                    let mut dirs_to_scan = Vec::new();
-                                    for modified_path in &modified_paths {
-                                        let relative = match modified_path.strip_prefix(&*cap_filesystem.base_path) {
-                                            Ok(relative) => relative,
-                                            Err(_) => continue,
-                                        };
-
-                                        let dir = match cap_filesystem.async_symlink_metadata(relative).await {
-                                            Ok(metadata) if metadata.is_dir() => relative.to_path_buf(),
-                                            Ok(_) => match relative.parent() {
-                                                Some(relative) => relative.to_path_buf(),
-                                                None => continue,
-                                            },
-                                            Err(_) => {
-                                                let mut parent = relative;
-                                                loop {
-                                                    parent = match parent.parent() {
-                                                        Some(p) => p,
-                                                        None => break,
-                                                    };
-
-                                                    match cap_filesystem.async_symlink_metadata(parent).await {
-                                                        Ok(metadata) if metadata.is_dir() => {
-                                                            dirs_to_scan.push(parent.to_path_buf());
-                                                            break;
-                                                        }
-                                                        _ => continue,
-                                                    }
-                                                }
-
-                                                parent.to_path_buf()
-                                            }
-                                        };
-
-                                        dirs_to_scan.push(dir);
-                                    }
-
-                                    let dirs_to_scan = crate::utils::deduplicate_paths(dirs_to_scan);
-
-                                    if dirs_to_scan.first().is_some_and(|p| p == Path::new("")) {
-                                        break 'selective_scan;
-                                    }
-
-                                    tracing::debug!(
-                                        path = %cap_filesystem.base_path.display(),
-                                        "checking disk usage for {} modified directories: {:?}",
-                                        dirs_to_scan.len(),
-                                        dirs_to_scan
-                                    );
-
-                                    for dir in &dirs_to_scan {
-                                        let mut tmp_disk_usage = usage::DiskUsage::default();
-                                        #[cfg(unix)]
-                                        let mut seen_inodes = HashSet::new();
-
-                                        let mut walker = cap_filesystem.async_walk_dir(dir).await?;
-                                        while let Some(entry) = walker.next_entry().await {
-                                            let (_, path) = entry?;
-                                            let metadata = match cap_filesystem.async_symlink_metadata(&path).await {
-                                                Ok(metadata) => metadata,
-                                                Err(_) => continue,
-                                            };
-                                            let delta = usage::SpaceDelta::new(metadata.size_logical() as i64, metadata.size_physical() as i64);
-
-                                            let relative = match path.strip_prefix(dir) {
-                                                Ok(relative) => relative,
-                                                Err(_) => continue,
-                                            };
-
-                                            #[cfg(unix)]
-                                            {
-                                                use cap_std::fs::MetadataExt;
-
-                                                if !metadata.is_dir() && metadata.nlink() > 1 {
-                                                    if seen_inodes.contains(&metadata.ino()) {
-                                                        if let Some(parent) = relative.parent() {
-                                                            tmp_disk_usage
-                                                                .update_size(parent, usage::SpaceDelta::only_logical(delta.logical));
-                                                        }
-                                                        continue;
-                                                    } else {
-                                                        seen_inodes.insert(metadata.ino());
-                                                    }
-                                                }
-                                            }
-
-                                            if metadata.is_dir() {
-                                                tmp_disk_usage.update_size(relative, delta);
-                                            } else if let Some(parent) = relative.parent() {
-                                                tmp_disk_usage.update_size(parent, delta);
-                                            }
-                                        }
-
-                                        let mut disk_usage_write = disk_usage.write().await;
-                                        disk_usage_write.remove_path(dir);
-                                        disk_usage_write.add_directory(
-                                            &dir.components()
-                                                .map(|c| c.as_os_str().to_string_lossy().to_string())
-                                                .collect::<Vec<_>>(),
-                                            tmp_disk_usage
-                                        );
-                                        let root_space = disk_usage_write.space;
-                                        drop(disk_usage_write);
-
-                                        disk_usage_cached_logical.store(root_space.get_logical(), Ordering::Relaxed);
-                                        disk_usage_cached_physical.store(root_space.get_physical(), Ordering::Relaxed);
-                                    }
-
-                                    return Ok(());
-                                }
-                            }
-
-                            let mut tmp_disk_usage = usage::DiskUsage::default();
-                            #[cfg(unix)]
-                            let mut seen_inodes = HashSet::new();
-                            let mut total_entries = 0;
-                            let mut total_size = 0;
-                            let mut total_size_physical = 0;
-
-                            let mut walker = cap_filesystem.async_walk_dir(Path::new("")).await?;
-
-                            while let Some(entry) = walker.next_entry().await {
-                                let (_, path) = entry?;
-
-                                let metadata = match cap_filesystem.async_symlink_metadata(&path).await {
-                                    Ok(metadata) => metadata,
-                                    Err(_) => return Ok(()),
-                                };
-                                let delta = usage::SpaceDelta::new(metadata.size_logical() as i64, metadata.size_physical() as i64);
-
-                                total_entries += 1;
-
-                                #[cfg(unix)]
-                                {
-                                    use cap_std::fs::MetadataExt;
-
-                                    if !metadata.is_dir() && metadata.nlink() > 1 {
-                                        if seen_inodes.contains(&metadata.ino()) {
-                                            if let Some(parent) = path.parent() {
-                                                tmp_disk_usage
-                                                    .update_size(parent, usage::SpaceDelta::only_logical(delta.logical));
-                                            }
-                                            total_size += metadata.size_logical();
-                                            continue;
-                                        } else {
-                                            seen_inodes.insert(metadata.ino());
-                                        }
-                                    }
-                                }
-
-                                if metadata.is_dir() {
-                                    tmp_disk_usage.update_size(&path, delta);
-                                } else if let Some(parent) = path.parent() {
-                                    tmp_disk_usage.update_size(parent, delta);
-                                }
-
-                                total_size += metadata.size_logical();
-                                total_size_physical += metadata.size_physical();
-                            }
-
-                            *disk_usage.write().await = tmp_disk_usage;
-                            disk_usage_cached_logical.store(total_size, Ordering::Relaxed);
-                            disk_usage_cached_physical.store(total_size_physical, Ordering::Relaxed);
-
-                            tracing::debug!(
-                                path = %cap_filesystem.base_path.display(),
-                                total_entries = total_entries,
-                                "{} bytes disk usage",
-                                total_size
-                            );
-
-                            Ok(())
-                        };
-
-                        if !disk_checker_state_dirty.swap(false, Ordering::Relaxed) {
-                            tracing::debug!(
-                                path = %cap_filesystem.base_path.display(),
-                                "skipping disk usage check due to server state inactivity"
-                            );
-                        } else {
-                            let paths_to_scan = if full_disk_check_counter
-                                % config.system.full_disk_check_every
-                                == 0
-                            {
-                                None
-                            } else if use_server_notifier.load(Ordering::Relaxed)
-                                && server_notifier.is_trusted()
-                            {
-                                let paths = server_notifier.take_modified_paths().await;
-
-                                tracing::debug!(
-                                    path = %cap_filesystem.base_path.display(),
-                                    "checking disk usage for {} modified paths",
-                                    paths.len()
-                                );
-                                Some(paths)
-                            } else {
-                                None
-                            };
-
-                            full_disk_check_counter += 1;
-
-                            match run_inner(paths_to_scan).await {
-                                Ok(_) => {
-                                    tracing::debug!(
-                                        path = %cap_filesystem.base_path.display(),
-                                        "disk usage check completed successfully"
-                                    );
-                                }
-                                Err(err) => {
-                                    tracing::error!(
-                                        path = %cap_filesystem.base_path.display(),
-                                        "disk usage check failed: {}",
-                                        err
-                                    );
-                                }
-                            }
-                        }
-
-                        drop(permit);
-
-                        tokio::select! {
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(
-                                config.system.disk_check_interval,
-                            )) => {},
-                            _ = disk_checker_rescan.notified() => {
-                                server_notifier.clear_modified_paths().await;
-                            }
-                        }
-                    }
-                }
-            }),
+            disk_checker: tokio::spawn(disk_checker::run(disk_checker::DiskCheckerContext {
+                config: Arc::clone(&config),
+                disk_usage: Arc::clone(&disk_usage),
+                disk_usage_cached_logical: Arc::clone(&disk_usage_cached_logical),
+                disk_usage_cached_physical: Arc::clone(&disk_usage_cached_physical),
+                disk_checker_state_dirty: Arc::clone(&disk_checker_state_dirty),
+                disk_checker_rescan: Arc::clone(&disk_checker_rescan),
+                disk_check_completed: Arc::clone(&disk_check_completed),
+                cap_filesystem: cap_filesystem.clone(),
+                server_notifier: server_notifier.clone(),
+                use_server_notifier: Arc::clone(&use_server_notifier),
+                last_disk_check: Arc::clone(&last_disk_check),
+            })),
             config: Arc::clone(&config),
 
             base_path: base_path.clone(),
@@ -409,6 +158,8 @@ impl Filesystem {
             disk_usage_cached_logical,
             disk_usage_cached_physical,
             disk_usage,
+            last_disk_check,
+            disk_check_completed,
             disk_ignored: Arc::new(RwLock::new(disk_ignored.build().unwrap())),
 
             archive_fs_cache: moka::future::CacheBuilder::new(8)
@@ -854,25 +605,27 @@ impl Filesystem {
 
         let metadata = self.async_symlink_metadata(&path).await?;
 
-        let size = if metadata.is_dir() {
-            let disk_usage = self.disk_usage.read().await;
-            disk_usage.get_size(&path).map_or(0, |s| s.get_logical())
-        } else {
-            metadata.len()
-        };
-
         if metadata.is_dir() {
             self.async_remove_dir_all(&path).await?;
-        } else {
-            self.async_remove_file(&path).await?;
-        }
 
-        if metadata.is_dir() {
             let mut disk_usage = self.disk_usage.write().await;
-            disk_usage.remove_path(&path);
-        } else if let Some(parent) = path.parent() {
-            self.async_allocate_in_path(parent, -(size as i64), false)
-                .await;
+            if let Some(removed) = disk_usage.remove_path(&path) {
+                drop(disk_usage);
+                self.try_update_atomics(
+                    usage::SpaceDelta::new(
+                        -(removed.space.get_logical() as i64),
+                        -(removed.space.get_physical() as i64),
+                    ),
+                    false,
+                );
+            }
+        } else {
+            let size = metadata.len() as i64;
+            self.async_remove_file(&path).await?;
+
+            if let Some(parent) = path.parent() {
+                self.async_allocate_in_path(parent, -size, false).await;
+            }
         }
 
         Ok(())
@@ -1080,13 +833,15 @@ impl Filesystem {
         Ok(())
     }
 
-    fn try_update_atomics(&self, delta: i64, ignorant: bool) -> bool {
-        if crate::unlikely(delta == 0) {
+    fn try_update_atomics(&self, delta: impl Into<usage::SpaceDelta>, ignorant: bool) -> bool {
+        let delta: usage::SpaceDelta = delta.into();
+
+        if crate::unlikely(delta.logical == 0 && delta.physical == 0) {
             return true;
         }
 
-        if delta > 0 {
-            let delta_u64 = delta as u64;
+        if delta.logical > 0 {
+            let delta_u64 = delta.logical as u64;
 
             if !ignorant && self.disk_limit() != 0 {
                 let limit = self.disk_limit() as u64;
@@ -1115,26 +870,29 @@ impl Filesystem {
                 self.disk_usage_cached_logical
                     .fetch_add(delta_u64, Ordering::Relaxed);
             }
-
-            self.disk_usage_cached_physical
-                .fetch_add(delta_u64, Ordering::Relaxed);
-        } else {
-            let abs_size = delta.unsigned_abs();
-
+        } else if delta.logical < 0 {
+            let abs = delta.logical.unsigned_abs();
             self.disk_usage_cached_logical
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    Some(current.saturating_sub(abs_size))
+                    Some(current.saturating_sub(abs))
                 })
                 .ok();
+        }
+
+        if delta.physical > 0 {
+            self.disk_usage_cached_physical
+                .fetch_add(delta.physical as u64, Ordering::Relaxed);
+        } else if delta.physical < 0 {
+            let abs = delta.physical.unsigned_abs();
             self.disk_usage_cached_physical
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    Some(current.saturating_sub(abs_size))
+                    Some(current.saturating_sub(abs))
                 })
                 .ok();
         }
 
         self.disk_usage_delta_cached
-            .fetch_add(delta, Ordering::Relaxed);
+            .fetch_add(delta.logical, Ordering::Relaxed);
 
         true
     }
