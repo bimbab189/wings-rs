@@ -64,7 +64,7 @@ description="Calagopus Wings Daemon"
 
 command="{}"
 supervisor="supervise-daemon"
-pidfile="/var/run/wings/daemon.pid"
+pidfile="/run/calagopus-wings.pid"
 directory="/etc/pterodactyl"
 rc_ulimit="-n 4096"
 
