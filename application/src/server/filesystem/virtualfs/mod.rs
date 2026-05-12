@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::{
     io::{
         compression::CompressionLevel,
@@ -87,7 +89,7 @@ impl ByteRange {
         matches!((&self.0, &self.1), (Bound::Unbounded, Bound::Unbounded))
     }
 
-    pub fn to_header_value(&self, total: u64) -> HeaderValue {
+    pub fn get_header_value(&self, total: u64) -> HeaderValue {
         let range_header_value = match (&self.0, &self.1) {
             (Bound::Included(s), Bound::Included(e)) => format!("bytes {}-{}/{}", s, e, total),
             (Bound::Included(s), Bound::Excluded(e)) => format!("bytes {}-{}/{}", s, e - 1, total),
@@ -210,7 +212,7 @@ impl AsyncFileRead {
             );
             headers.insert(
                 axum::http::header::CONTENT_RANGE,
-                reader_range.to_header_value(self.total_size),
+                reader_range.get_header_value(self.total_size),
             );
         }
 

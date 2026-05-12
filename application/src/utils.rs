@@ -171,10 +171,6 @@ impl PortablePermissions {
         Self { mode }
     }
 
-    pub fn is_readonly(&self) -> bool {
-        self.mode & 0o200 == 0
-    }
-
     pub fn into_std_permissions(self) -> Option<std::fs::Permissions> {
         #[cfg(unix)]
         {

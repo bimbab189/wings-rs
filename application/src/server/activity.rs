@@ -52,8 +52,6 @@ pub enum ActivityEvent {
     FileDelete,
     #[serde(rename = "server:file.rename")]
     FileRename,
-    #[serde(rename = "server:file.pull")]
-    FilePull,
 }
 
 impl ActivityEvent {

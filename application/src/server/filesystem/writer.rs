@@ -205,6 +205,7 @@ impl AsyncFileSystemWriter {
     }
 
     /// Skip Disk Limit Checks
+    #[allow(dead_code)]
     pub fn ignorant(mut self) -> Self {
         self.ignorant = true;
         self

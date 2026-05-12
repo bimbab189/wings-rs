@@ -49,11 +49,6 @@ impl<R: Read> AbortReader<R> {
     pub fn new(inner: R, listener: AbortListener) -> Self {
         Self { inner, listener }
     }
-
-    #[inline]
-    pub fn into_inner(self) -> R {
-        self.inner
-    }
 }
 
 impl<R: Read + Clone> Clone for AbortReader<R> {

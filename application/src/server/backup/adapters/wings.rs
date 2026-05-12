@@ -310,7 +310,7 @@ impl BackupExt for WingsBackup {
             headers.insert(axum::http::header::CONTENT_LENGTH, reader.len().into());
             headers.insert(
                 axum::http::header::CONTENT_RANGE,
-                range.to_header_value(metadata.len()),
+                range.get_header_value(metadata.len()),
             );
 
             ApiResponse::new_stream(reader)

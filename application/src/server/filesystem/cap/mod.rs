@@ -5,7 +5,6 @@ use crate::{
 use cap_std::fs::{Metadata, OpenOptions};
 use std::{
     collections::VecDeque,
-    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -148,33 +147,6 @@ impl CapFilesystem {
 
         let inner = self.async_get_inner().await?;
         tokio::task::spawn_blocking(move || inner.create_dir(path)).await??;
-
-        Ok(())
-    }
-
-    pub fn create_dir(&self, path: impl AsRef<Path>) -> Result<(), anyhow::Error> {
-        let path = self.relative_path(path.as_ref());
-
-        let inner = self.get_inner()?;
-        inner.create_dir(path)?;
-
-        Ok(())
-    }
-
-    pub async fn async_remove_dir(&self, path: impl AsRef<Path>) -> Result<(), anyhow::Error> {
-        let path = self.relative_path(path.as_ref());
-
-        let inner = self.async_get_inner().await?;
-        tokio::task::spawn_blocking(move || inner.remove_dir(path)).await??;
-
-        Ok(())
-    }
-
-    pub fn remove_dir(&self, path: impl AsRef<Path>) -> Result<(), anyhow::Error> {
-        let path = self.relative_path(path.as_ref());
-
-        let inner = self.get_inner()?;
-        inner.remove_dir(path)?;
 
         Ok(())
     }
@@ -323,18 +295,6 @@ impl CapFilesystem {
         Ok(canonicalized)
     }
 
-    pub fn canonicalize(&self, path: impl AsRef<Path>) -> Result<PathBuf, anyhow::Error> {
-        let path = self.relative_path(path.as_ref());
-        if path.components().next().is_none() {
-            return Ok(path);
-        }
-
-        let inner = self.get_inner()?;
-        let canonicalized = inner.canonicalize(path)?;
-
-        Ok(canonicalized)
-    }
-
     pub async fn async_read_link(&self, path: impl AsRef<Path>) -> Result<PathBuf, anyhow::Error> {
         let path = self.relative_path(path.as_ref());
 
@@ -351,19 +311,6 @@ impl CapFilesystem {
         let link = inner.read_link(path)?;
 
         Ok(link)
-    }
-
-    pub async fn async_read_link_contents(
-        &self,
-        path: impl AsRef<Path>,
-    ) -> Result<PathBuf, anyhow::Error> {
-        let path = self.relative_path(path.as_ref());
-
-        let inner = self.async_get_inner().await?;
-        let link_contents =
-            tokio::task::spawn_blocking(move || inner.read_link_contents(path)).await??;
-
-        Ok(link_contents)
     }
 
     pub fn read_link_contents(&self, path: impl AsRef<Path>) -> Result<PathBuf, anyhow::Error> {
@@ -385,16 +332,6 @@ impl CapFilesystem {
         Ok(String::from_utf8(content)?)
     }
 
-    pub fn read_to_string(
-        &self,
-        path: impl AsRef<Path>,
-        limit: usize,
-    ) -> Result<String, anyhow::Error> {
-        let content = self.read_to_vec(path, limit)?;
-
-        Ok(String::from_utf8(content)?)
-    }
-
     pub async fn async_read_to_vec(
         &self,
         path: impl AsRef<Path>,
@@ -408,35 +345,6 @@ impl CapFilesystem {
         let mut buf = vec![0; crate::BUFFER_SIZE];
         loop {
             let bytes_read = file.read(&mut buf).await?;
-
-            if crate::unlikely(bytes_read == 0) {
-                break;
-            }
-
-            content.extend_from_slice(&buf[..bytes_read]);
-
-            if crate::unlikely(content.len() >= limit) {
-                content.truncate(limit);
-                break;
-            }
-        }
-
-        Ok(content)
-    }
-
-    pub fn read_to_vec(
-        &self,
-        path: impl AsRef<Path>,
-        limit: usize,
-    ) -> Result<Vec<u8>, anyhow::Error> {
-        let path = self.relative_path(path.as_ref());
-
-        let mut file = self.open(path)?;
-        let mut content = Vec::new();
-
-        let mut buf = vec![0; crate::BUFFER_SIZE];
-        loop {
-            let bytes_read = file.read(&mut buf)?;
 
             if crate::unlikely(bytes_read == 0) {
                 break;
@@ -514,20 +422,6 @@ impl CapFilesystem {
         Ok(())
     }
 
-    pub fn write(
-        &self,
-        path: impl AsRef<Path>,
-        data: impl AsRef<[u8]>,
-    ) -> Result<(), anyhow::Error> {
-        let path = self.relative_path(path.as_ref());
-
-        let mut file = self.create(path)?;
-        file.write_all(data.as_ref())?;
-        file.sync_all()?;
-
-        Ok(())
-    }
-
     pub async fn async_create(
         &self,
         path: impl AsRef<Path>,
@@ -562,22 +456,6 @@ impl CapFilesystem {
         let to_inner = to_dir.async_get_inner().await?;
         let bytes_copied =
             tokio::task::spawn_blocking(move || inner.copy(from, &to_inner, to)).await??;
-
-        Ok(bytes_copied)
-    }
-
-    pub fn copy(
-        &self,
-        from: impl AsRef<Path>,
-        to_dir: &CapFilesystem,
-        to: impl AsRef<Path>,
-    ) -> Result<u64, anyhow::Error> {
-        let from = self.relative_path(from.as_ref());
-        let to = self.relative_path(to.as_ref());
-
-        let inner = self.get_inner()?;
-        let to_inner = to_dir.get_inner()?;
-        let bytes_copied = inner.copy(from, &to_inner, to)?;
 
         Ok(bytes_copied)
     }
@@ -780,38 +658,6 @@ impl CapFilesystem {
         Ok(())
     }
 
-    pub fn set_symlink_permissions(
-        &self,
-        path: impl AsRef<Path>,
-        permissions: PortablePermissions,
-    ) -> Result<(), anyhow::Error> {
-        let path = self.relative_path(path.as_ref());
-
-        if path.components().next().is_none() {
-            if let Some(permissions) = permissions.into_std_permissions() {
-                std::fs::set_permissions(&*self.base_path, permissions)?;
-            }
-        } else {
-            #[cfg(unix)]
-            {
-                use std::os::fd::AsFd;
-
-                let inner = self.get_inner()?;
-
-                rustix::fs::chmodat(
-                    inner.as_fd(),
-                    path,
-                    rustix::fs::Mode::from_raw_mode(permissions.mode),
-                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-                )?;
-            }
-            #[cfg(not(unix))]
-            self.set_permissions(path, permissions)?;
-        }
-
-        Ok(())
-    }
-
     pub async fn async_set_times(
         &self,
         path: impl AsRef<Path>,
@@ -1007,17 +853,6 @@ impl CapFilesystem {
 
         let mut names = Vec::new();
         while let Some(Ok((_, entry))) = read_dir.next_entry().await {
-            names.push(entry);
-        }
-
-        Ok(names)
-    }
-
-    pub fn read_dir_all(&self, path: impl AsRef<Path>) -> Result<Vec<String>, anyhow::Error> {
-        let mut read_dir = self.read_dir(path)?;
-
-        let mut names = Vec::new();
-        while let Some(Ok((_, entry))) = read_dir.next_entry() {
             names.push(entry);
         }
 

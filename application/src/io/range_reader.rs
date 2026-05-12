@@ -60,10 +60,6 @@ impl<R: Read + Seek> RangeReader<R> {
             None => self.len - self.start,
         }
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 impl<R: Read + Seek> Read for RangeReader<R> {
@@ -141,10 +137,6 @@ impl<R: AsyncRead + AsyncSeek + Unpin> AsyncRangeReader<R> {
             Some(end) => end - self.start + 1,
             None => self.len - self.start,
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 

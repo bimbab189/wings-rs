@@ -6,6 +6,7 @@ use std::{
     sync::{Arc, atomic::AtomicU64},
 };
 use tokio::sync::{RwLock, RwLockReadGuard};
+use utoipa::ToSchema;
 
 fn serialize_arc<S>(value: &Arc<AtomicU64>, serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -14,70 +15,94 @@ where
     serializer.serialize_u64(value.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, ToSchema, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum FilesystemOperation {
     Compress {
+        #[schema(value_type = String)]
         path: PathBuf,
+        #[schema(value_type = Vec<String>)]
         files: Vec<PathBuf>,
+        #[schema(value_type = String)]
         destination_path: PathBuf,
 
         start_time: chrono::DateTime<chrono::Utc>,
         #[serde(serialize_with = "serialize_arc")]
+        #[schema(value_type = u64)]
         progress: Arc<AtomicU64>,
         #[serde(serialize_with = "serialize_arc")]
+        #[schema(value_type = u64)]
         total: Arc<AtomicU64>,
     },
     Decompress {
+        #[schema(value_type = String)]
         path: PathBuf,
+        #[schema(value_type = String)]
         destination_path: PathBuf,
 
         start_time: chrono::DateTime<chrono::Utc>,
         #[serde(serialize_with = "serialize_arc")]
+        #[schema(value_type = u64)]
         progress: Arc<AtomicU64>,
         #[serde(serialize_with = "serialize_arc")]
+        #[schema(value_type = u64)]
         total: Arc<AtomicU64>,
     },
     Pull {
+        #[schema(value_type = String)]
         destination_path: PathBuf,
 
         start_time: chrono::DateTime<chrono::Utc>,
         #[serde(serialize_with = "serialize_arc")]
+        #[schema(value_type = u64)]
         progress: Arc<AtomicU64>,
         #[serde(serialize_with = "serialize_arc")]
+        #[schema(value_type = u64)]
         total: Arc<AtomicU64>,
     },
     Copy {
+        #[schema(value_type = String)]
         path: PathBuf,
+        #[schema(value_type = String)]
         destination_path: PathBuf,
 
         start_time: chrono::DateTime<chrono::Utc>,
         #[serde(serialize_with = "serialize_arc")]
+        #[schema(value_type = u64)]
         progress: Arc<AtomicU64>,
         #[serde(serialize_with = "serialize_arc")]
+        #[schema(value_type = u64)]
         total: Arc<AtomicU64>,
     },
     CopyMany {
+        #[schema(value_type = String)]
         path: PathBuf,
         files: Vec<crate::models::CopyFile>,
 
         start_time: chrono::DateTime<chrono::Utc>,
         #[serde(serialize_with = "serialize_arc")]
+        #[schema(value_type = u64)]
         progress: Arc<AtomicU64>,
         #[serde(serialize_with = "serialize_arc")]
+        #[schema(value_type = u64)]
         total: Arc<AtomicU64>,
     },
     CopyRemote {
         server: uuid::Uuid,
+        #[schema(value_type = String)]
         path: PathBuf,
+        #[schema(value_type = Vec<String>)]
         files: Vec<PathBuf>,
         destination_server: uuid::Uuid,
+        #[schema(value_type = String)]
         destination_path: PathBuf,
 
         start_time: chrono::DateTime<chrono::Utc>,
         #[serde(serialize_with = "serialize_arc")]
+        #[schema(value_type = u64)]
         progress: Arc<AtomicU64>,
         #[serde(serialize_with = "serialize_arc")]
+        #[schema(value_type = u64)]
         total: Arc<AtomicU64>,
     },
 }
@@ -85,7 +110,6 @@ pub enum FilesystemOperation {
 pub struct Operation {
     pub filesystem_operation: FilesystemOperation,
     abort_sender: tokio::sync::oneshot::Sender<()>,
-    finish_notifier: Arc<tokio::sync::Notify>,
 }
 
 pub struct OperationManager {
@@ -121,13 +145,11 @@ impl OperationManager {
     ) {
         let operation_uuid = uuid::Uuid::new_v4();
         let (abort_sender, abort_receiver) = tokio::sync::oneshot::channel();
-        let finish_notifier = Arc::new(tokio::sync::Notify::new());
 
         let handle = tokio::spawn({
             let operation = operation.clone();
             let operations = self.operations.clone();
             let sender = self.sender.clone();
-            let finish_notifier = Arc::clone(&finish_notifier);
 
             async move {
                 let progress_task = async {
@@ -196,8 +218,6 @@ impl OperationManager {
                         .ok();
                 }
 
-                finish_notifier.notify_waiters();
-
                 result
             }
         });
@@ -207,7 +227,6 @@ impl OperationManager {
             Operation {
                 filesystem_operation: operation,
                 abort_sender,
-                finish_notifier,
             },
         );
 
@@ -221,17 +240,5 @@ impl OperationManager {
         }
 
         false
-    }
-
-    pub async fn wait_for_operation_completion(&self, operation_uuid: uuid::Uuid) -> Option<()> {
-        let finish_notifier = {
-            let operations = self.operations.read().await;
-            let operation = operations.get(&operation_uuid)?;
-
-            Arc::clone(&operation.finish_notifier)
-        };
-
-        finish_notifier.notified().await;
-        Some(())
     }
 }

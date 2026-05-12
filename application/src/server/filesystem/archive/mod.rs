@@ -2,10 +2,7 @@ use crate::{
     io::{
         ReadSeek,
         abort::{AbortGuard, AbortListener, AbortReader, AbortWriter},
-        compression::{
-            CompressionType,
-            reader::{AsyncCompressionReader, CompressionReaderMt},
-        },
+        compression::{CompressionType, reader::CompressionReaderMt},
         counting_reader::CountingReader,
         counting_writer::CountingWriter,
     },
@@ -311,7 +308,6 @@ pub struct Archive {
     pub archive: ArchiveType,
 
     pub server: crate::server::Server,
-    pub header: [u8; 64],
 
     pub file: File,
     pub path: PathBuf,
@@ -338,7 +334,6 @@ impl Archive {
             compression: compression_format,
             archive: archive_format,
             server,
-            header,
             file,
             path,
         })
@@ -381,94 +376,6 @@ impl Archive {
                 get_archive_format(),
             ),
         }
-    }
-
-    pub async fn estimated_size(&mut self) -> Option<u64> {
-        match self.compression {
-            CompressionType::None => Some(self.file.metadata().await.ok()?.len()),
-            CompressionType::Gz => {
-                let file_size = self.file.metadata().await.ok()?.len();
-
-                if file_size < 4 {
-                    return None;
-                }
-
-                if self.file.seek(SeekFrom::End(-4)).await.is_err() {
-                    return None;
-                }
-
-                let mut buffer = [0; 4];
-                if self.file.read_exact(&mut buffer).await.is_err() {
-                    return None;
-                }
-
-                Some(u32::from_le_bytes(buffer) as u64)
-            }
-            CompressionType::Xz => None,
-            CompressionType::Lzip => None,
-            CompressionType::Bz2 => None,
-            CompressionType::Lz4 => {
-                if self.header[0..4] != [0x04, 0x22, 0x4D, 0x18] {
-                    return None;
-                }
-
-                let flags = self.header[4];
-                let has_content_size = (flags & 0x08) != 0;
-
-                if !has_content_size || self.header.len() < 13 {
-                    return None;
-                }
-
-                Some(u64::from_le_bytes(self.header[5..13].try_into().ok()?))
-            }
-            CompressionType::Zstd => {
-                if self.header[0..4] != [0x28, 0xB5, 0x2F, 0xFD] {
-                    return None;
-                }
-
-                let frame_header_descriptor = self.header[4];
-
-                let fcs_flag = frame_header_descriptor & 0x03;
-                let single_segment = (frame_header_descriptor & 0x20) != 0;
-
-                if fcs_flag == 0 && !single_segment {
-                    return None;
-                }
-
-                let size_bytes = match fcs_flag {
-                    0 if single_segment => 1,
-                    1 => 2,
-                    2 => 4,
-                    3 => 8,
-                    _ => return None,
-                };
-
-                let size_buffer = &self.header[5..13];
-
-                match size_bytes {
-                    1 => Some(size_buffer[0] as u64),
-                    2 => Some(u16::from_le_bytes([size_buffer[0], size_buffer[1]]) as u64),
-                    4 => Some(u32::from_le_bytes([
-                        size_buffer[0],
-                        size_buffer[1],
-                        size_buffer[2],
-                        size_buffer[3],
-                    ]) as u64),
-                    8 => Some(u64::from_le_bytes(size_buffer.try_into().ok()?)),
-                    _ => None,
-                }
-            }
-        }
-    }
-
-    pub async fn reader(mut self) -> Result<AsyncCompressionReader, anyhow::Error> {
-        self.file.seek(SeekFrom::Start(0)).await?;
-
-        Ok(AsyncCompressionReader::new_mt(
-            self.file.into_std().await,
-            self.compression,
-            self.server.app_state.config.api.file_decompression_threads,
-        ))
     }
 
     pub async fn extract(

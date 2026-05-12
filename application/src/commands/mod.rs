@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use clap::{Arg, ArgMatches, Args, Command};
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 

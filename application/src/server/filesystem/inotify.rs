@@ -1,7 +1,7 @@
 use notify::Watcher;
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -64,34 +64,6 @@ impl InotifyManager {
             watcher: Arc::new(std::sync::Mutex::new(watcher)),
             server_notifiers,
         })
-    }
-
-    pub async fn register_server(
-        &self,
-        base_path: &Path,
-        uuid: uuid::Uuid,
-    ) -> Result<InotifyServerNotifier, anyhow::Error> {
-        let base_path = tokio::task::spawn_blocking({
-            let base_path = base_path.to_path_buf();
-            let watcher = Arc::clone(&self.watcher);
-
-            move || {
-                watcher
-                    .lock()
-                    .unwrap()
-                    .watch(&base_path, notify::RecursiveMode::Recursive)?;
-                Ok::<_, anyhow::Error>(base_path)
-            }
-        })
-        .await??;
-
-        let notifier = InotifyServerNotifier::new(base_path);
-        self.server_notifiers
-            .lock()
-            .await
-            .insert(uuid, notifier.clone());
-
-        Ok(notifier)
     }
 
     pub async fn register_server_with_notifier(

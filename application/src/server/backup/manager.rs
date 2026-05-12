@@ -37,26 +37,6 @@ impl BackupManager {
             || server.configuration.read().await.backups.contains(&uuid)
     }
 
-    pub async fn adapter_contains(&self, state: &crate::routes::State, uuid: uuid::Uuid) -> bool {
-        if let Some(adapter) = self.cached_backup_adapters.get(&uuid).await {
-            match adapter.exists(state, uuid).await {
-                Ok(exists) => exists,
-                Err(err) => {
-                    tracing::error!(adapter = ?adapter, "failed to check if backup {} exists: {:#?}", uuid, err);
-                    false
-                }
-            }
-        } else {
-            match BackupAdapter::exists_any(state, uuid).await {
-                Ok(exists) => exists,
-                Err(err) => {
-                    tracing::error!("failed to check if backup {} exists: {:#?}", uuid, err);
-                    false
-                }
-            }
-        }
-    }
-
     pub async fn create(
         &self,
         adapter: BackupAdapter,

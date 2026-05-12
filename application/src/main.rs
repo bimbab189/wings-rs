@@ -1,3 +1,4 @@
+use crate::{response::ApiResponse, routes::GetState, server::executor::ServerExecutor};
 use anyhow::Context;
 use axum::{
     body::Body,
@@ -8,10 +9,108 @@ use axum::{
 };
 use colored::Colorize;
 use russh::server::Server;
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Instant};
+use std::{fmt::Debug, net::SocketAddr, path::Path, sync::Arc, time::Instant};
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa_axum::router::OpenApiRouter;
-use wings_rs::{response::ApiResponse, routes::GetState, server::executor::ServerExecutor};
+
+mod bins;
+mod commands;
+mod config;
+mod deserialize;
+mod io;
+mod models;
+mod payload;
+mod remote;
+mod response;
+mod routes;
+mod server;
+mod ssh;
+mod stats;
+mod utils;
+
+use payload::Payload;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const GIT_COMMIT: &str = env!("CARGO_GIT_COMMIT");
+const GIT_BRANCH: &str = env!("CARGO_GIT_BRANCH");
+const TARGET: &str = env!("CARGO_TARGET");
+
+#[cfg(unix)]
+const DEFAULT_CONFIG_PATH: &str = "/etc/pterodactyl/config.yml";
+#[cfg(windows)]
+const DEFAULT_CONFIG_PATH: &str = "C:\\ProgramData\\Calagopus-Wings\\config.yml";
+
+/// 32 KiB - used for general IO
+const BUFFER_SIZE: usize = 32 * 1024;
+/// 4 MiB - used for transfers
+const TRANSFER_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+fn full_version() -> String {
+    if GIT_BRANCH == "unknown" {
+        VERSION.to_string()
+    } else {
+        format!("{VERSION}:{GIT_COMMIT}@{GIT_BRANCH}")
+    }
+}
+
+fn spawn_blocking_handled<
+    F: FnOnce() -> Result<(), E> + Send + 'static,
+    E: Debug + Send + 'static,
+>(
+    f: F,
+) {
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(f).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                tracing::error!("spawned blocking task failed: {:?}", err);
+            }
+            Err(err) => {
+                tracing::error!("spawned blocking task panicked: {:?}", err);
+            }
+        }
+    });
+}
+
+fn spawn_handled<
+    F: std::future::Future<Output = Result<(), E>> + Send + 'static,
+    E: Debug + Send + 'static,
+>(
+    f: F,
+) {
+    tokio::spawn(async move {
+        match f.await {
+            Ok(_) => {}
+            Err(err) => {
+                tracing::error!("spawned async task failed: {:?}", err);
+            }
+        }
+    });
+}
+
+#[inline(always)]
+#[cold]
+fn cold_path() {}
+
+#[inline(always)]
+fn likely(b: bool) -> bool {
+    if b {
+        true
+    } else {
+        cold_path();
+        false
+    }
+}
+
+#[inline(always)]
+fn unlikely(b: bool) -> bool {
+    if b {
+        cold_path();
+        true
+    } else {
+        false
+    }
+}
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[global_allocator]
@@ -25,16 +124,15 @@ async fn handle_request(req: Request<Body>, next: Next) -> Result<Response<Body>
         req.method().to_string().to_lowercase(),
     );
 
-    Ok(wings_rs::response::ACCEPT_HEADER
-        .scope(
-            wings_rs::response::accept_from_headers(req.headers()),
-            async { next.run(req).await },
-        )
+    Ok(crate::response::ACCEPT_HEADER
+        .scope(crate::response::accept_from_headers(req.headers()), async {
+            next.run(req).await
+        })
         .await)
 }
 
 async fn handle_cors(
-    state: wings_rs::routes::GetState,
+    state: crate::routes::GetState,
     req: Request,
     next: Next,
 ) -> Result<Response<Body>, StatusCode> {
@@ -100,12 +198,12 @@ async fn handle_cors(
 
 #[tokio::main]
 async fn main() {
-    let cli = wings_rs::commands::CliCommandGroupBuilder::new(
+    let cli = crate::commands::CliCommandGroupBuilder::new(
         "wings-rs",
         "The wings server implementing server management for the panel.",
     );
 
-    let mut cli = wings_rs::commands::commands(cli);
+    let mut cli = crate::commands::commands(cli);
     let mut matches = cli.get_matches();
 
     let config_path = matches.get_one::<String>("config").unwrap().clone();
@@ -114,7 +212,7 @@ async fn main() {
         .get_one::<bool>("ignore_certificate_errors")
         .copied()
         .unwrap_or(false);
-    let config = wings_rs::config::Config::open(
+    let config = crate::config::Config::open(
         &config_path,
         debug,
         matches.subcommand().is_some(),
@@ -151,8 +249,8 @@ async fn main() {
             tracing::info!("   \\_/\\_/ |_|_| |_|\\__, |___/__ ___ ");
             tracing::info!("                    __/ | | '__/ __|");
             tracing::info!("                   |___/  | |  \\__ \\");
-            tracing::info!("{: >25} |_|  |___/", wings_rs::VERSION);
-            tracing::info!("github.com/calagopus/wings#{}\n", wings_rs::GIT_COMMIT);
+            tracing::info!("{: >25} |_|  |___/", crate::VERSION);
+            tracing::info!("github.com/calagopus/wings#{}\n", crate::GIT_COMMIT);
         }
     }
 
@@ -165,7 +263,7 @@ async fn main() {
     };
     tracing::info!("config loaded from {}", config_path);
 
-    wings_rs::spawn_handled(async move {
+    crate::spawn_handled(async move {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
@@ -250,7 +348,7 @@ async fn main() {
             .context("failed to connect to docker")
             .unwrap(),
         );
-    let executor = Arc::new(wings_rs::server::executor::docker::DockerExecutor::new(
+    let executor = Arc::new(crate::server::executor::docker::DockerExecutor::new(
         docker,
         config.clone(),
     ));
@@ -281,22 +379,22 @@ async fn main() {
         .context("failed to fetch servers from remote")
         .unwrap();
 
-    let state = Arc::new(wings_rs::routes::AppState {
+    let state = Arc::new(crate::routes::AppState {
         start_time: Instant::now(),
         container_type: match std::env::var("OCI_CONTAINER").as_deref() {
-            Ok("official") => wings_rs::routes::AppContainerType::Official,
-            Ok(_) => wings_rs::routes::AppContainerType::Unknown,
-            Err(_) => wings_rs::routes::AppContainerType::None,
+            Ok("official") => crate::routes::AppContainerType::Official,
+            Ok(_) => crate::routes::AppContainerType::Unknown,
+            Err(_) => crate::routes::AppContainerType::None,
         },
-        version: wings_rs::full_version(),
+        version: crate::full_version(),
 
         config: Arc::clone(&config),
         executor,
-        stats_manager: Arc::new(wings_rs::stats::StatsManager::default()),
-        server_manager: Arc::new(wings_rs::server::manager::ServerManager::new(&servers)),
-        backup_manager: Arc::new(wings_rs::server::backup::manager::BackupManager::default()),
+        stats_manager: Arc::new(crate::stats::StatsManager::default()),
+        server_manager: Arc::new(crate::server::manager::ServerManager::new(&servers)),
+        backup_manager: Arc::new(crate::server::backup::manager::BackupManager::default()),
         inotify_manager: Arc::new(
-            wings_rs::server::filesystem::inotify::InotifyManager::new()
+            crate::server::filesystem::inotify::InotifyManager::new()
                 .context("failed to initialize inotify manager")
                 .unwrap(),
         ),
@@ -306,7 +404,7 @@ async fn main() {
     state.server_manager.boot(&state, servers).await;
 
     let app = OpenApiRouter::new()
-        .merge(wings_rs::routes::router(&state))
+        .merge(crate::routes::router(&state))
         .fallback(|state: GetState, req: Request| async move {
             if let Some(redirect) = state.config.api.redirects.get(req.uri().path()) {
                 return ApiResponse::new(Body::empty())
@@ -375,7 +473,7 @@ async fn main() {
             let state = Arc::clone(&state);
 
             async move {
-                let mut server = wings_rs::ssh::Server::new(Arc::clone(&state));
+                let mut server = crate::ssh::Server::new(Arc::clone(&state));
 
                 let key_file = Path::new(&state.config.system.data_directory)
                     .join(".sftp")
@@ -461,7 +559,7 @@ async fn main() {
                 tracing::info!(
                     "ssh server listening on {} (app@{}, {}ms)",
                     address.to_string(),
-                    wings_rs::VERSION,
+                    crate::VERSION,
                     state.start_time.elapsed().as_millis()
                 );
 

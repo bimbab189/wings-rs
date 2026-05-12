@@ -964,9 +964,10 @@ impl DockerOverhead {
     }
 }
 
+#[allow(dead_code)]
 pub struct ConfigGuard(
-    pub tracing_appender::non_blocking::WorkerGuard,
-    pub tracing_appender::non_blocking::WorkerGuard,
+    tracing_appender::non_blocking::WorkerGuard,
+    tracing_appender::non_blocking::WorkerGuard,
 );
 
 pub struct Config {

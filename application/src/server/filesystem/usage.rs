@@ -9,11 +9,6 @@ pub struct UsedSpace {
 
 impl UsedSpace {
     #[inline]
-    pub fn new(logical: u64, physical: u64) -> Self {
-        Self { logical, physical }
-    }
-
-    #[inline]
     pub fn get_logical(&self) -> u64 {
         self.logical
     }
@@ -89,26 +84,10 @@ impl SpaceDelta {
     }
 
     #[inline]
-    pub fn zero() -> Self {
-        Self {
-            logical: 0,
-            physical: 0,
-        }
-    }
-
-    #[inline]
     pub fn only_logical(logical: i64) -> Self {
         Self {
             logical,
             physical: 0,
-        }
-    }
-
-    #[inline]
-    pub fn only_physical(physical: i64) -> Self {
-        Self {
-            logical: 0,
-            physical,
         }
     }
 }

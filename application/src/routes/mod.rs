@@ -147,11 +147,6 @@ impl<'a> ApiError<'a> {
     pub fn new(error: &'a str) -> Self {
         Self { error }
     }
-
-    #[inline]
-    pub fn to_json(&self) -> serde_json::Value {
-        serde_json::to_value(self).unwrap()
-    }
 }
 
 pub type State = Arc<AppState>;

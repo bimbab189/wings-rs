@@ -198,26 +198,6 @@ impl Schedule {
         }
     }
 
-    pub async fn trigger_with_context(
-        &self,
-        skip_condition: bool,
-        execution_context: ScheduleExecutionContext,
-    ) -> Option<ScheduleExecutionContext> {
-        let old_context = self
-            .next_execution_context
-            .lock()
-            .await
-            .replace(execution_context);
-
-        if skip_condition {
-            self.executor_skip_notifier.notify_one();
-        } else {
-            self.executor_notifier.notify_one();
-        }
-
-        old_context
-    }
-
     pub async fn update(&self, raw_schedule: &super::configuration::Schedule) {
         *self.condition.write().await = raw_schedule.condition.clone();
         *self.raw_actions.write().await = Arc::new(raw_schedule.actions.clone());

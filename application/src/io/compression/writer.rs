@@ -1,11 +1,6 @@
 use super::{CompressionLevel, CompressionType};
 use gzp::ZWriter;
-use std::{
-    io::Write,
-    pin::Pin,
-    task::{Context, Poll},
-};
-use tokio::io::AsyncWrite;
+use std::io::Write;
 
 pub enum CompressionWriter<'a, W: Write + Send + 'static> {
     None(W),
@@ -152,97 +147,5 @@ impl<'a, W: Write + Send + 'static> Write for CompressionWriter<'a, W> {
             CompressionWriter::Lz4(writer) => writer.flush(),
             CompressionWriter::Zstd(_, _, writer) => writer.flush(),
         }
-    }
-}
-
-pub struct AsyncCompressionWriter {
-    inner_error_receiver: tokio::sync::oneshot::Receiver<std::io::Error>,
-    inner_writer: tokio::io::WriteHalf<tokio::io::SimplexStream>,
-}
-
-impl AsyncCompressionWriter {
-    pub fn new(
-        writer: impl Write + Send + 'static,
-        compression_type: CompressionType,
-        compression_level: CompressionLevel,
-        threads: usize,
-    ) -> Self {
-        let (inner_reader, inner_writer) = tokio::io::simplex(crate::BUFFER_SIZE * 4);
-        let (inner_error_sender, inner_error_receiver) = tokio::sync::oneshot::channel();
-
-        tokio::task::spawn_blocking(move || {
-            let mut reader = tokio_util::io::SyncIoBridge::new(inner_reader);
-            let mut stream = match CompressionWriter::new(
-                writer,
-                compression_type,
-                compression_level,
-                threads,
-            ) {
-                Ok(stream) => stream,
-                Err(err) => {
-                    let _ = inner_error_sender.send(err);
-                    return;
-                }
-            };
-
-            match crate::io::copy(&mut reader, &mut stream) {
-                Ok(_) => {}
-                Err(err) => {
-                    let _ = inner_error_sender.send(err);
-                    return;
-                }
-            }
-
-            match stream.finish() {
-                Ok(_) => {}
-                Err(err) => {
-                    let _ = inner_error_sender.send(err);
-                }
-            }
-        });
-
-        Self {
-            inner_error_receiver,
-            inner_writer,
-        }
-    }
-}
-
-impl AsyncWrite for AsyncCompressionWriter {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        if !self.inner_error_receiver.is_terminated()
-            && let Poll::Ready(result) = Pin::new(&mut self.inner_error_receiver).poll(cx)
-            && let Ok(err) = result
-        {
-            return Poll::Ready(Err(err));
-        }
-
-        Pin::new(&mut self.inner_writer).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        if !self.inner_error_receiver.is_terminated()
-            && let Poll::Ready(result) = Pin::new(&mut self.inner_error_receiver).poll(cx)
-            && let Ok(err) = result
-        {
-            return Poll::Ready(Err(err));
-        }
-
-        Pin::new(&mut self.inner_writer).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        if !self.inner_error_receiver.is_terminated()
-            && let Poll::Ready(result) = Pin::new(&mut self.inner_error_receiver).poll(cx)
-            && let Ok(err) = result
-        {
-            return Poll::Ready(Err(err));
-        }
-
-        Pin::new(&mut self.inner_writer).poll_shutdown(cx)
     }
 }
