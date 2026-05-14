@@ -403,6 +403,10 @@ impl russh_sftp::server::Handler for SftpSession {
                 return Err(StatusCode::NoSuchFile);
             }
 
+            if let Err(err) = self.server.diff.forget_file(&path.to_string_lossy()).await {
+                tracing::error!("failed to forget file from diff storage: {:?}", err);
+            }
+
             self.server
                 .activity
                 .log_activity(Activity {
@@ -631,11 +635,21 @@ impl russh_sftp::server::Handler for SftpSession {
         if self
             .server
             .filesystem
-            .rename_path(old_path, new_path)
+            .rename_path(&old_path, &new_path)
             .await
             .is_err()
         {
             return Err(StatusCode::NoSuchFile);
+        }
+
+        let new_path = self.server.filesystem.relative_path(&new_path);
+        if let Err(err) = self
+            .server
+            .diff
+            .rename_file(&old_path.to_string_lossy(), &new_path.to_string_lossy())
+            .await
+        {
+            tracing::error!("failed to rename file in diff storage: {:?}", err);
         }
 
         self.server.activity.log_activity(activity).await;

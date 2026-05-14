@@ -339,6 +339,10 @@ impl BackupManager {
                     )
                     .into(),
                 );
+                if let Err(err) = server.diff.clear().await {
+                    tracing::warn!(server = %server.uuid, "failed to clear file history: {:?}", err);
+                }
+
                 server
                     .app_state
                     .config

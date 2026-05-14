@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, RwLock};
 pub mod activity;
 pub mod backup;
 pub mod configuration;
+pub mod diff;
 pub mod executor;
 pub mod filesystem;
 pub mod installation;
@@ -44,6 +45,7 @@ pub struct InnerServer {
     process_handle: RwLock<Option<Arc<dyn executor::ProcessHandle>>>,
     process_startup_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
     pub schedules: Arc<schedule::manager::ScheduleManager>,
+    pub diff: diff::manager::DiffManager,
     pub activity: activity::ActivityManager,
 
     pub state: state::ServerStateLock,
@@ -108,6 +110,7 @@ impl Server {
         );
 
         let activity = activity::ActivityManager::new(configuration.uuid, &app_state.config);
+        let diff = diff::manager::DiffManager::new(configuration.uuid, &app_state.config);
         let schedules = Arc::new(schedule::manager::ScheduleManager::new(Arc::clone(
             &app_state.config,
         )));
@@ -128,6 +131,7 @@ impl Server {
             process_handle: RwLock::new(None),
             process_startup_task: RwLock::new(None),
             schedules: Arc::clone(&schedules),
+            diff,
             activity,
 
             state: state::ServerStateLock::new(websocket_tx, schedules),
@@ -1243,12 +1247,16 @@ impl Server {
 
         crate::server::installation::ServerInstaller::delete_install_logs(self).await;
 
+        self.diff.close().await;
         self.filesystem.close().await;
 
         tokio::spawn({
             let server = self.clone();
 
-            async move { server.filesystem.destroy().await }
+            async move {
+                server.diff.destroy().await;
+                server.filesystem.destroy().await;
+            }
         });
     }
 

@@ -2,13 +2,12 @@ use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod post {
-    use std::path::Path;
-
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
     };
     use serde::{Deserialize, Serialize};
+    use std::path::Path;
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Deserialize)]
@@ -64,6 +63,18 @@ mod post {
             }
 
             if if filesystem.is_primary_server_fs() {
+                if metadata.file_type.is_file() {
+                    let path = server
+                        .filesystem
+                        .async_canonicalize(&source)
+                        .await
+                        .unwrap_or_else(|_| server.filesystem.relative_path(&source));
+
+                    if let Err(err) = server.diff.forget_file(&path.to_string_lossy()).await {
+                        tracing::error!("failed to forget file from diff storage: {:?}", err);
+                    }
+                }
+
                 server.filesystem.truncate_path(&source).await.is_ok()
             } else if metadata.file_type.is_dir() {
                 filesystem.async_remove_dir_all(&source).await.is_ok()

@@ -16,6 +16,7 @@ mod list_directory;
 mod operations;
 mod pull;
 mod rename;
+mod revisions;
 mod search;
 mod write;
 
@@ -38,5 +39,6 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/compress", compress::router(state))
         .nest("/decompress", decompress::router(state))
         .nest("/operations", operations::router(state))
+        .nest("/revisions", revisions::router(state))
         .with_state(state.clone())
 }

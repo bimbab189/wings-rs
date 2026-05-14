@@ -78,7 +78,14 @@ mod put {
             }
 
             if filesystem.is_primary_server_fs() {
-                if let Err(err) = server.filesystem.rename_path(from, to).await {
+                let from_path = server
+                    .filesystem
+                    .async_canonicalize(&from)
+                    .await
+                    .unwrap_or_else(|_| server.filesystem.relative_path(&from));
+                let to_path = server.filesystem.relative_path(&to);
+
+                if let Err(err) = server.filesystem.rename_path(&from, &to).await {
                     tracing::debug!(
                         server = %server.uuid,
                         "failed to rename file: {:#?}",
@@ -86,6 +93,14 @@ mod put {
                     );
                 } else {
                     renamed_count += 1;
+                }
+
+                if let Err(err) = server
+                    .diff
+                    .rename_file(&from_path.to_string_lossy(), &to_path.to_string_lossy())
+                    .await
+                {
+                    tracing::error!("failed to rename file in diff storage: {:?}", err);
                 }
             } else if filesystem.async_rename(&from, &to).await.is_ok() {
                 renamed_count += 1;

@@ -244,6 +244,34 @@ fn system_crash_detection_timeout() -> u64 {
     60
 }
 
+fn system_file_history_enabled() -> bool {
+    true
+}
+fn system_file_history_zstd_level() -> i32 {
+    19
+}
+fn system_file_history_anchor_interval() -> u64 {
+    4
+}
+fn system_file_history_keep_chains() -> u64 {
+    2
+}
+fn system_file_history_file_size_cap() -> u64 {
+    1024 * 1024
+}
+fn system_file_history_per_file_size_cap() -> u64 {
+    16 * 1024 * 1024
+}
+fn system_file_history_per_file_disk_budget() -> u64 {
+    5 * 1024 * 1024
+}
+fn system_file_history_per_server_disk_budget() -> u64 {
+    200 * 1024 * 1024
+}
+fn system_file_history_maintenance_interval() -> u64 {
+    3600
+}
+
 fn system_backup_mounting_enabled() -> bool {
     true
 }
@@ -678,6 +706,34 @@ nestify::nest! {
                 pub detect_clean_exit_as_crash: bool,
                 #[serde(default = "system_crash_detection_timeout")]
                 pub timeout: u64,
+            },
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub file_history: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemFileHistory {
+                #[serde(default = "system_file_history_enabled")]
+                pub enabled: bool,
+
+                #[serde(default = "system_file_history_zstd_level")]
+                pub zstd_level: i32,
+                #[serde(default = "system_file_history_anchor_interval")]
+                pub anchor_interval: u64,
+
+                #[serde(default = "system_file_history_keep_chains")]
+                pub keep_chains: u64,
+
+                #[serde(default = "system_file_history_file_size_cap")]
+                pub file_size_cap: u64,
+
+                #[serde(default = "system_file_history_per_file_size_cap")]
+                pub per_file_size_cap: u64,
+                #[serde(default = "system_file_history_per_file_disk_budget")]
+                pub per_file_disk_budget: u64,
+                #[serde(default = "system_file_history_per_server_disk_budget")]
+                pub per_server_disk_budget: u64,
+
+                #[serde(default = "system_file_history_maintenance_interval")]
+                pub maintenance_interval: u64,
             },
 
             #[serde(default)]
