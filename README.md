@@ -18,6 +18,8 @@ For installation instructions, please refer to the [Docs](https://calagopus.com/
 
 ## Added Config Options
 
+[Read full Config Reference](https://calagopus.com/docs/wings/configuration)
+
 ```yml
 api:
   # custom redirects for the api server, e.g. / -> https://yourpanel.com
@@ -105,6 +107,16 @@ system:
       log_logins: false
       # whether to log file read actions in server activity
       log_file_reads: false
+
+  file_history:
+    enabled: true
+    zstd_level: 19
+    anchor_interval: 4
+    keep_chains: 2
+    file_size_cap: 1048576
+    per_file_disk_budget: 5242880
+    per_server_disk_budget: 209715200
+    maintenance_interval: 3600
 
   backups:
     # what compression level to use? best_speed, good_speed, good_compression, best_compression (higher compression = more CPU usage, better compression)

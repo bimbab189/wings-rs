@@ -31,21 +31,21 @@ tokio-util = { workspace = true }
 uuid = { workspace = true }
 rand = { workspace = true }
 tar = "0.4.44"
-zip = { version = "8.0.0", default-features = false, features = ["bzip2", "deflate", "time", "zstd", "lzma", "xz"] }
+zip = { version = "8.0.0", default-features = false, features = ["bzip2", "deflate", "zstd", "lzma", "xz"] }
 sevenz-rust2 = { version = "0.21.0", features = ["deflate", "compress", "brotli", "zstd", "bzip2", "ppmd", "lz4"] }
-flate2 = { version = "1.1.1", default-features = false, features = ["zlib-rs"] }
+flate2 = { version = "1.1.1", default-features = false, features = ["zlib-ng"] }
 sha2 = "0.11.0"
 ddup-bak = "0.8.0"
 infer = "0.19.0"
 rustls = { version = "0.23.27", features = ["aws-lc-rs"] }
-ignore = { version = "0.4.23", features = ["simd-accel"] }
+ignore = "0.4.23"
 sha1 = "0.11.0"
 futures = "0.3.31"
 russh = "0.60.0"
 russh-sftp = "2.1.1"
 md5 = "0.8.0"
 human_bytes = "0.4.3"
-ansi_term = "0.12.1"
+nu-ansi-term = "0.50.3"
 clap = { version = "4.5.37", features = ["derive", "string"] }
 dialoguer = "0.12.0"
 sysinfo = "0.39.0"

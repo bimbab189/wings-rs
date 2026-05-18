@@ -203,7 +203,7 @@ impl OutgoingServerTransfer {
     }
 
     fn log(server: &super::Server, message: &str) {
-        let prelude = ansi_term::Color::Yellow.bold().paint(format!(
+        let prelude = nu_ansi_term::Color::Yellow.bold().paint(format!(
             "{} [Transfer System] [Source Node]:",
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
         ));

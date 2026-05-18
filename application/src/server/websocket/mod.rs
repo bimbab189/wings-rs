@@ -361,9 +361,9 @@ impl ServerWebsocketHandler {
     async fn send_error(&self, message: impl Into<Cow<'_, str>>) {
         let message = WebsocketMessage::new(
             WebsocketEvent::ServerDaemonMessage,
-            [ansi_term::Style::new()
+            [nu_ansi_term::Style::new()
                 .bold()
-                .on(ansi_term::Color::Red)
+                .on(nu_ansi_term::Color::Red)
                 .paint(message.into())
                 .to_compact_string()]
             .into(),
@@ -411,9 +411,9 @@ impl ServerWebsocketHandler {
 
         let message = WebsocketMessage::new(
             WebsocketEvent::ServerDaemonMessage,
-            [ansi_term::Style::new()
+            [nu_ansi_term::Style::new()
                 .bold()
-                .on(ansi_term::Color::Red)
+                .on(nu_ansi_term::Color::Red)
                 .paint(message)
                 .to_compact_string()]
             .into(),

@@ -196,8 +196,7 @@ async fn handle_cors(
     Ok(response)
 }
 
-#[tokio::main]
-async fn main() {
+async fn main_rt() {
     let cli = crate::commands::CliCommandGroupBuilder::new(
         "wings-rs",
         "The wings server implementing server management for the panel.",
@@ -719,4 +718,23 @@ async fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn main() {
+    let thread_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(1024)
+        .thread_name_fn({
+            let thread_count = thread_count.clone();
+            move || {
+                let count = thread_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                format!("calagopus-wings-rt-{count}")
+            }
+        })
+        .name("calagopus-wings-rt")
+        .build()
+        .unwrap()
+        .block_on(main_rt());
 }

@@ -259,9 +259,6 @@ fn system_file_history_keep_chains() -> u64 {
 fn system_file_history_file_size_cap() -> u64 {
     1024 * 1024
 }
-fn system_file_history_per_file_size_cap() -> u64 {
-    16 * 1024 * 1024
-}
 fn system_file_history_per_file_disk_budget() -> u64 {
     5 * 1024 * 1024
 }
@@ -725,8 +722,6 @@ nestify::nest! {
                 #[serde(default = "system_file_history_file_size_cap")]
                 pub file_size_cap: u64,
 
-                #[serde(default = "system_file_history_per_file_size_cap")]
-                pub per_file_size_cap: u64,
                 #[serde(default = "system_file_history_per_file_disk_budget")]
                 pub per_file_disk_budget: u64,
                 #[serde(default = "system_file_history_per_server_disk_budget")]
@@ -1511,7 +1506,7 @@ impl Config {
     }
 
     pub fn daemon_prelude(&self) -> compact_str::CompactString {
-        ansi_term::Color::Yellow
+        nu_ansi_term::Color::Yellow
             .bold()
             .paint(format!("[{} Daemon]:", self.load().app_name))
             .to_compact_string()

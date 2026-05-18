@@ -883,7 +883,7 @@ impl Server {
                 [compact_str::format_compact!(
                     "{} {}",
                     prelude,
-                    ansi_term::Style::new().bold().paint(message)
+                    nu_ansi_term::Style::new().bold().paint(message)
                 )]
                 .into(),
             ))
@@ -892,9 +892,9 @@ impl Server {
 
     pub fn log_daemon_error(&self, message: &str) {
         self.log_daemon(
-            ansi_term::Style::new()
+            nu_ansi_term::Style::new()
                 .bold()
-                .on(ansi_term::Color::Red)
+                .on(nu_ansi_term::Color::Red)
                 .paint(message)
                 .to_compact_string(),
         );
@@ -903,9 +903,9 @@ impl Server {
     pub fn get_daemon_error(&self, message: &str) -> websocket::WebsocketMessage {
         websocket::WebsocketMessage::new(
             websocket::WebsocketEvent::ServerDaemonMessage,
-            [ansi_term::Style::new()
+            [nu_ansi_term::Style::new()
                 .bold()
-                .on(ansi_term::Color::Red)
+                .on(nu_ansi_term::Color::Red)
                 .paint(message)
                 .to_compact_string()]
             .into(),

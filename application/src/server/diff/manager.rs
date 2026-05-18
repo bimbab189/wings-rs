@@ -130,9 +130,6 @@ impl DiffManager {
             return Ok(());
         }
         let config = self.config.load();
-        if (after.len() as u64) > config.system.file_history.per_file_size_cap {
-            return Ok(());
-        }
 
         let anchor_interval = config.system.file_history.anchor_interval.max(1);
         let keep_chains = config.system.file_history.keep_chains.max(1);
