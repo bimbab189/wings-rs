@@ -10,7 +10,7 @@ mod get {
     use axum::http::StatusCode;
     use compact_str::ToCompactString;
     use serde::Deserialize;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Deserialize)]
@@ -56,10 +56,10 @@ mod get {
         };
 
         let mut stack = Vec::with_capacity(32);
-        stack.push((root, root_usage));
+        stack.push((PathBuf::new(), root_usage));
 
         while let Some((usage_path, usage)) = stack.pop() {
-            if usage_path.components().count() > 0 {
+            if !usage_path.as_os_str().is_empty() {
                 let self_size = usage.space.get_logical().saturating_sub(
                     usage
                         .get_entries()
@@ -74,9 +74,7 @@ mod get {
             }
 
             for (sub_path, sub_usage) in usage.get_entries() {
-                let sub_path = usage_path.join(sub_path);
-
-                stack.push((sub_path, sub_usage));
+                stack.push((usage_path.join(sub_path), sub_usage));
             }
         }
 
@@ -108,14 +106,16 @@ mod get {
         directory_entries.reserve_exact(entries.len());
 
         for (path, _) in entries {
-            let metadata = match server.filesystem.async_symlink_metadata(&path).await {
+            let abs_path = root.join(&path);
+
+            let metadata = match server.filesystem.async_symlink_metadata(&abs_path).await {
                 Ok(metadata) => metadata,
                 Err(_) => continue,
             };
 
             let mut entry = server
                 .filesystem
-                .to_api_entry_buffer(path.clone(), &metadata, false, None, None, None)
+                .to_api_entry_buffer(abs_path, &metadata, false, None, None, None)
                 .await;
             entry.name = path.to_string_lossy().to_compact_string();
 
