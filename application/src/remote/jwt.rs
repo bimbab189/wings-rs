@@ -1,5 +1,5 @@
 use compact_str::ToCompactString;
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{collections::HashMap, sync::Arc};
@@ -103,7 +103,6 @@ type CountingMap = HashMap<
 
 pub struct JwtClient {
     pub decoding_key: DecodingKey,
-    pub encoding_key: EncodingKey,
     pub validation: Validation,
     pub boot_time: chrono::DateTime<chrono::Utc>,
     pub max_jwt_uses: usize,
@@ -148,7 +147,6 @@ impl JwtClient {
 
         Self {
             decoding_key: DecodingKey::from_secret(config.token.as_bytes()),
-            encoding_key: EncodingKey::from_secret(config.token.as_bytes()),
             validation,
             boot_time: chrono::Utc::now(),
             max_jwt_uses: config.api.max_jwt_uses,
@@ -165,11 +163,6 @@ impl JwtClient {
     ) -> Result<T, jsonwebtoken::errors::Error> {
         let data = jsonwebtoken::decode::<T>(token, &self.decoding_key, &self.validation)?;
         Ok(data.claims)
-    }
-
-    #[inline]
-    pub fn create<T: Serialize>(&self, payload: &T) -> Result<String, jsonwebtoken::errors::Error> {
-        jsonwebtoken::encode(&Header::new(Algorithm::HS256), payload, &self.encoding_key)
     }
 
     pub fn limited_jwt_id(&self, id: &str) -> bool {

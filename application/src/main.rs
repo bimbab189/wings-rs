@@ -186,9 +186,13 @@ async fn handle_cors(
     );
     headers.insert(
         "Access-Control-Allow-Methods",
-        HeaderValue::from_static("GET, POST, PATCH, PUT, DELETE, OPTIONS"),
+        HeaderValue::from_static("GET, HEAD, POST, PATCH, PUT, DELETE, OPTIONS"),
     );
-    headers.insert("Access-Control-Allow-Headers", HeaderValue::from_static("Accept, Accept-Encoding, Authorization, Cache-Control, Content-Type, Content-Length, Origin, X-Real-IP, X-CSRF-Token"));
+    headers.insert("Access-Control-Allow-Headers", HeaderValue::from_static("Accept, Accept-Encoding, Authorization, Cache-Control, Content-Type, Content-Length, Origin, X-Real-IP, X-CSRF-Token, Upload-Offset, Upload-Length, Upload-Complete"));
+    headers.insert(
+        "Access-Control-Expose-Headers",
+        HeaderValue::from_static("Upload-Offset"),
+    );
 
     if state.config.load().allow_cors_private_network {
         headers.insert(

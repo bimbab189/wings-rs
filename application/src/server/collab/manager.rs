@@ -130,8 +130,6 @@ impl CollabSession {
         .await;
     }
 
-    /// Stores the new conflict state and reports whether it differs from the
-    /// previous one, so callers can skip re-broadcasting an unchanged conflict.
     fn set_conflict(&self, state: Option<ConflictState>) -> bool {
         let mut conflict = self.conflict.lock().expect("collab conflict lock poisoned");
         if *conflict != state {
@@ -309,10 +307,6 @@ impl CollabManager {
                 Some(session) => {
                     let session = Arc::clone(session);
 
-                    // Only refresh an empty (grace-period) session from disk
-                    // here. A session with active participants must not have
-                    // its doc swapped without resyncing those clients — the
-                    // reconciler handles that case and broadcasts a resync.
                     if session.participants.lock().await.is_empty()
                         && !session.dirty.load(Ordering::Relaxed)
                     {
@@ -359,9 +353,6 @@ impl CollabManager {
                 }
             };
 
-            // Insert the participant while still holding the sessions lock so a
-            // concurrent teardown cannot observe an empty participant map and
-            // remove the session between lookup and join.
             session.participants.lock().await.insert(
                 handler.connection_id,
                 Participant {
@@ -406,10 +397,6 @@ impl CollabManager {
         Ok(())
     }
 
-    /// Watches the file behind a session for external (SFTP, HTTP, …) changes.
-    /// The task holds only a weak reference and exits once the session is torn
-    /// down. mtime is used as a cheap gate; the content hash against the
-    /// session's `disk_hash` is the actual source of truth.
     fn spawn_reconciler(&self, session: &Arc<CollabSession>) {
         let weak = Arc::downgrade(session);
         let config = Arc::clone(&self.config);
@@ -423,16 +410,10 @@ impl CollabManager {
                 tokio::time::sleep(RECONCILE_INTERVAL).await;
 
                 let Some(session) = weak.upgrade() else { break };
-
-                // Skip the tick while a save or reload holds the lock, so a
-                // mid-write file is never misread as an external change.
                 let Ok(_save_guard) = session.save_lock.try_lock() else {
                     continue;
                 };
 
-                // Heal the dirty flag when the doc has converged back to the
-                // on-disk state (undo to baseline, or a no-op update applied
-                // after a doc swap).
                 if session.dirty.load(Ordering::Relaxed) {
                     let converged = {
                         let doc = session.doc.lock().expect("collab doc lock poisoned");
@@ -476,8 +457,6 @@ impl CollabManager {
                         };
 
                         if matches {
-                            // Disk went back to what the session knows (e.g. the
-                            // external change was reverted) — clear any conflict.
                             if session.set_conflict(None) {
                                 session.broadcast_conflict(None).await;
                             }
@@ -497,9 +476,6 @@ impl CollabManager {
                         } else {
                             let reloaded = {
                                 let mut doc = session.doc.lock().expect("collab doc lock poisoned");
-                                // Re-check dirty under the doc lock: apply_update
-                                // flips it inside this lock, so no update can land
-                                // between the check and the swap.
                                 if !session.dirty.load(Ordering::Relaxed)
                                     && doc.disk_hash != disk_hash
                                 {
@@ -531,9 +507,6 @@ impl CollabManager {
                                 session.broadcast_conflict(Some(state)).await;
                             }
                         } else if !reported_unreadable {
-                            // Clean session over a file that vanished or became
-                            // unreadable: force clients to resubscribe once so the
-                            // failure surfaces through the normal subscribe path.
                             reported_unreadable = true;
                             session.broadcast_resync().await;
                         }
@@ -740,8 +713,6 @@ impl CollabManager {
             Err(_) => (false, 0),
         };
 
-        // Read the current disk content once, shared by the conflict check and
-        // the history capture.
         let read_cap = history_size_cap.max(size_cap);
         let old_bytes: Option<Vec<u8>> =
             if file_exists && old_content_size > 0 && old_content_size as u64 <= read_cap {
@@ -764,14 +735,10 @@ impl CollabManager {
         } else if old_content_size == 0 {
             Some(blake3::hash(b""))
         } else {
-            // None here means the file grew beyond the readable cap or could
-            // not be read — treated as an external change below.
             old_bytes.as_deref().map(blake3::hash)
         };
 
         if !current_hash.is_some_and(|hash| hash == doc_disk_hash) {
-            // A force save only applies when the client resolved the exact disk
-            // state it was shown; if disk moved again in between, re-conflict.
             let force_applies = force
                 && expected_hash.is_none_or(|expected| {
                     current_hash.is_some_and(|hash| hash.to_hex().as_str() == expected)
@@ -881,8 +848,6 @@ impl CollabManager {
         Ok(())
     }
 
-    /// Discards the session's in-memory state and reloads it from disk — the
-    /// "load theirs" conflict resolution. Applies to every participant.
     pub async fn reload(
         &self,
         server: &crate::server::Server,
