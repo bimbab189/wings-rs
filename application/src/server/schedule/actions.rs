@@ -1668,7 +1668,40 @@ impl ScheduleAction {
                     }
                 };
 
-                let thread = tokio::spawn(archive.extract(root.clone(), None, None));
+                let (destination_root, destination_filesystem) =
+                    server.filesystem.resolve_writable_fs(server, &root).await;
+
+                let bytes_processed = Arc::new(AtomicU64::new(0));
+                let bytes_total = Arc::new(AtomicU64::new(0));
+                let files_processed = Arc::new(AtomicU64::new(0));
+
+                let (_, task) = server
+                    .filesystem
+                    .operations
+                    .add_operation(
+                        crate::server::filesystem::operations::FilesystemOperation::Decompress {
+                            path: source.clone(),
+                            destination_path: root.clone(),
+                            start_time: chrono::Utc::now(),
+                            bytes_processed: bytes_processed.clone(),
+                            bytes_total: bytes_total.clone(),
+                            files_processed: files_processed.clone(),
+                        },
+                        async move {
+                            archive
+                                .extract(
+                                    destination_root,
+                                    destination_filesystem,
+                                    crate::server::filesystem::archive::create::ArchiveProgress::new(
+                                        bytes_processed,
+                                        files_processed,
+                                    ),
+                                    Some(bytes_total),
+                                )
+                                .await
+                        },
+                    )
+                    .await;
 
                 server.activity.log_activity(Activity {
                     event: ActivityEvent::FileDecompress,
@@ -1682,10 +1715,33 @@ impl ScheduleAction {
                     timestamp: chrono::Utc::now(),
                 });
 
-                if *foreground && let Ok(Err(err)) = thread.await {
-                    tracing::error!(path = %source.display(), "failed to decompress file: {:?}", err);
+                if *foreground {
+                    match task.await {
+                        Ok(Some(Ok(()))) => {}
+                        Ok(None) => {
+                            return Err("archive decompression aborted by another source".into());
+                        }
+                        Ok(Some(Err(err))) => {
+                            tracing::error!(
+                                server = %server.uuid,
+                                path = %source.display(),
+                                "failed to decompress file: {:#?}",
+                                err,
+                            );
 
-                    return Err("failed to decompress file".into());
+                            return Err(format!("failed to decompress file: {err}").into());
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                server = %server.uuid,
+                                path = %source.display(),
+                                "failed to decompress file: {:#?}",
+                                err,
+                            );
+
+                            return Err("failed to decompress file".into());
+                        }
+                    }
                 }
             }
             ScheduleAction::UpdateStartupVariable {

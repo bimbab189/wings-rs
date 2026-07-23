@@ -7,6 +7,7 @@ use crate::{
     io::compression::CompressionLevel,
     models::DirectoryEntry,
     server::filesystem::{
+        DirectoryEntryOptions,
         archive::StreamableArchiveFormat,
         virtualfs::{
             AsyncReadableWritableSeekableFileStream, DirectoryWalk,
@@ -154,7 +155,12 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         Ok(self
             .server
             .filesystem
-            .to_api_entry_cap(&self.inner, path, metadata, !self.is_primary_server_fs)
+            .to_api_entry_cap(
+                &self.inner,
+                path,
+                metadata,
+                DirectoryEntryOptions::server_fs(self.is_primary_server_fs),
+            )
             .await)
     }
 
@@ -173,7 +179,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
             .to_api_entry_buffer(
                 path,
                 &metadata,
-                !self.is_primary_server_fs,
+                DirectoryEntryOptions::server_fs(self.is_primary_server_fs),
                 Some(buffer),
                 None,
                 None,
@@ -257,7 +263,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                     entries,
                 })
             } else {
-                let no_directory_size = !this.is_primary_server_fs;
+                let options = DirectoryEntryOptions::server_fs(this.is_primary_server_fs);
 
                 let prepare_group = |names: Vec<String>| {
                     let mut out = Vec::with_capacity(names.len());
@@ -273,7 +279,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                                 .block_on(
                                     this.server
                                         .filesystem
-                                        .prepared_entry_sort_size(&prepared, no_directory_size),
+                                        .prepared_entry_sort_size(&prepared, options),
                                 )
                                 .0
                                 .into(),
@@ -281,7 +287,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                                 .block_on(
                                     this.server
                                         .filesystem
-                                        .prepared_entry_sort_size(&prepared, no_directory_size),
+                                        .prepared_entry_sort_size(&prepared, options),
                                 )
                                 .1
                                 .into(),
@@ -324,7 +330,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                         runtime.block_on(this.server.filesystem.finish_api_entry_cap(
                             &this.inner,
                             prepared,
-                            no_directory_size,
+                            options,
                         )),
                     );
                 }
@@ -832,6 +838,35 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         let path = self.check_ignored(FileType::File, path.as_ref())?;
 
         self.inner.async_set_permissions(path, permissions).await?;
+
+        Ok(())
+    }
+
+    fn set_times(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        modification_time: std::time::SystemTime,
+        access_time: Option<std::time::SystemTime>,
+    ) -> Result<(), anyhow::Error> {
+        self.check_writable()?;
+        let path = self.check_ignored(FileType::File, path.as_ref())?;
+
+        self.inner.set_times(path, modification_time, access_time)?;
+
+        Ok(())
+    }
+    async fn async_set_times(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        modification_time: std::time::SystemTime,
+        access_time: Option<std::time::SystemTime>,
+    ) -> Result<(), anyhow::Error> {
+        self.check_writable()?;
+        let path = self.check_ignored(FileType::File, path.as_ref())?;
+
+        self.inner
+            .async_set_times(path, modification_time, access_time)
+            .await?;
 
         Ok(())
     }

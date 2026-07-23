@@ -51,6 +51,7 @@ impl VirtualMountFilesystem {
             directory: true,
             file: false,
             symlink: true,
+            r#virtual: true,
             mime: MimeCacheValue::directory().mime,
             modified: Default::default(),
             created: Default::default(),
@@ -195,6 +196,24 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
 
         let existing_names: HashSet<&str> = inner_listing.iter().map(|e| e.name.as_str()).collect();
 
+        let gateway_names: HashSet<String> = self
+            .mounts
+            .iter()
+            .filter_map(|mount| {
+                let remaining = if listing_path == Path::new("") {
+                    Some(mount.relative_target.as_path())
+                } else if mount.relative_target.starts_with(listing_path) {
+                    mount.relative_target.strip_prefix(listing_path).ok()
+                } else {
+                    None
+                };
+
+                remaining
+                    .and_then(|remaining| remaining.components().next())
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            })
+            .collect();
+
         let mut virtual_dirs = Vec::new();
         let mut seen_virtual = HashSet::new();
 
@@ -235,6 +254,12 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
 
         let (mut inner_dirs, inner_non_dirs): (Vec<_>, Vec<_>) =
             inner_listing.into_iter().partition(|e| e.directory);
+
+        for entry in &mut inner_dirs {
+            if gateway_names.contains(entry.name.as_str()) {
+                entry.r#virtual = true;
+            }
+        }
 
         virtual_dirs.sort_unstable_by(|a, b| a.name.cmp_ascii_case_insensitive(&b.name));
         if matches!(sort, DirectorySortingMode::NameDesc) {

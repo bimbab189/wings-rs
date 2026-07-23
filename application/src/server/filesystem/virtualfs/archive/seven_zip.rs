@@ -166,6 +166,7 @@ impl VirtualSevenZipArchive {
             directory: true,
             file: false,
             symlink: false,
+            r#virtual: true,
             mime: detected_mime.mime,
             modified: Default::default(),
             created: *archive_created,
@@ -232,6 +233,7 @@ impl VirtualSevenZipArchive {
             directory: entry.is_directory(),
             file: !entry.is_directory(),
             symlink: false,
+            r#virtual: true,
             mime: detected_mime.mime,
             modified: if entry.has_last_modified_date {
                 std::time::SystemTime::from(entry.last_modified_date).into()

@@ -1489,7 +1489,7 @@ impl Filesystem {
         &self,
         path: PathBuf,
         metadata: &Metadata,
-        no_directory_size: bool,
+        options: DirectoryEntryOptions,
         buffer: Option<&[u8]>,
         symlink_destination: Option<PathBuf>,
         symlink_destination_metadata: Option<Metadata>,
@@ -1498,7 +1498,7 @@ impl Filesystem {
         let real_path = symlink_destination.as_ref().unwrap_or(&path);
 
         let (size, size_physical) = if real_metadata.is_dir() {
-            if !no_directory_size && !self.config.load().api.disable_directory_size {
+            if options.directory_size && !self.config.load().api.disable_directory_size {
                 let space = self.disk_usage.read().await.get_size(real_path);
 
                 space.map_or((0, 0), |s| (s.get_logical(), s.get_physical()))
@@ -1535,6 +1535,7 @@ impl Filesystem {
             directory: real_metadata.is_dir(),
             file: real_metadata.is_file(),
             symlink: metadata.is_symlink(),
+            r#virtual: options.r#virtual,
             mime: detected_mime.mime,
             modified: chrono::DateTime::from_timestamp(
                 metadata
@@ -1569,7 +1570,7 @@ impl Filesystem {
         &self,
         path: PathBuf,
         metadata: &Metadata,
-        no_directory_size: bool,
+        options: DirectoryEntryOptions,
         mime_type: Option<MimeCacheValue>,
         symlink_destination: Option<PathBuf>,
         symlink_destination_metadata: Option<Metadata>,
@@ -1578,7 +1579,7 @@ impl Filesystem {
         let real_path = symlink_destination.as_ref().unwrap_or(&path);
 
         let (size, size_physical) = if real_metadata.is_dir() {
-            if !no_directory_size && !self.config.load().api.disable_directory_size {
+            if options.directory_size && !self.config.load().api.disable_directory_size {
                 let space = self.disk_usage.read().await.get_size(real_path);
 
                 space.map_or((0, 0), |s| (s.get_logical(), s.get_physical()))
@@ -1615,6 +1616,7 @@ impl Filesystem {
             directory: real_metadata.is_dir(),
             file: real_metadata.is_file(),
             symlink: metadata.is_symlink(),
+            r#virtual: options.r#virtual,
             mime: detected_mime.mime,
             modified: chrono::DateTime::from_timestamp(
                 metadata
@@ -1650,10 +1652,10 @@ impl Filesystem {
         filesystem: &cap::CapFilesystem,
         path: PathBuf,
         metadata: Metadata,
-        no_directory_size: bool,
+        options: DirectoryEntryOptions,
     ) -> crate::models::DirectoryEntry {
         let prepared = self.prepare_api_entry_cap(filesystem, path, metadata).await;
-        self.finish_api_entry_cap(filesystem, prepared, no_directory_size)
+        self.finish_api_entry_cap(filesystem, prepared, options)
             .await
     }
 
@@ -1693,7 +1695,7 @@ impl Filesystem {
     pub async fn prepared_entry_sort_size(
         &self,
         prepared: &PreparedDirectoryEntry,
-        no_directory_size: bool,
+        options: DirectoryEntryOptions,
     ) -> (u64, u64) {
         let real_metadata = prepared
             .symlink_destination_metadata
@@ -1705,7 +1707,7 @@ impl Filesystem {
             .unwrap_or(&prepared.path);
 
         if real_metadata.is_dir() {
-            if !no_directory_size && !self.config.load().api.disable_directory_size {
+            if options.directory_size && !self.config.load().api.disable_directory_size {
                 let space = self.disk_usage.read().await.get_size(real_path);
 
                 space.map_or((0, 0), |s| (s.get_logical(), s.get_physical()))
@@ -1721,7 +1723,7 @@ impl Filesystem {
         &self,
         filesystem: &cap::CapFilesystem,
         prepared: PreparedDirectoryEntry,
-        no_directory_size: bool,
+        options: DirectoryEntryOptions,
     ) -> crate::models::DirectoryEntry {
         let PreparedDirectoryEntry {
             path,
@@ -1780,12 +1782,27 @@ impl Filesystem {
         self.to_api_entry_mime_type(
             path,
             &metadata,
-            no_directory_size,
+            options,
             Some(detected_mime),
             symlink_destination,
             symlink_destination_metadata,
         )
         .await
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct DirectoryEntryOptions {
+    pub directory_size: bool,
+    pub r#virtual: bool,
+}
+
+impl DirectoryEntryOptions {
+    pub fn server_fs(is_primary_server_fs: bool) -> Self {
+        Self {
+            directory_size: is_primary_server_fs,
+            r#virtual: !is_primary_server_fs,
+        }
     }
 }
 

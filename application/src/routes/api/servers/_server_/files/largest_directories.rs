@@ -147,7 +147,17 @@ mod get {
 
             let mut entry = server
                 .filesystem
-                .to_api_entry_buffer(abs_path, &metadata, false, None, None, None)
+                .to_api_entry_buffer(
+                    abs_path,
+                    &metadata,
+                    crate::server::filesystem::DirectoryEntryOptions {
+                        directory_size: true,
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    None,
+                )
                 .await;
             entry.name = path.to_string_lossy().to_compact_string();
 

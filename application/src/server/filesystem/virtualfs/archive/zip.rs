@@ -212,6 +212,7 @@ impl VirtualZipArchive {
             directory: true,
             file: false,
             symlink: false,
+            r#virtual: true,
             mime: detected_mime.mime,
             modified: Default::default(),
             created: *archive_created,
@@ -280,6 +281,7 @@ impl VirtualZipArchive {
             directory: entry.is_dir(),
             file: entry.is_file(),
             symlink: entry.is_symlink(),
+            r#virtual: true,
             mime: detected_mime.mime,
             modified: crate::server::filesystem::archive::zip_entry_get_modified_time(&entry)
                 .map(|dt| dt.into())

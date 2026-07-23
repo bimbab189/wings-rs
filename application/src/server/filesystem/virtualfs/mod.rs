@@ -124,9 +124,9 @@ impl From<ByteRange> for (Bound<u64>, Bound<u64>) {
 pub type ReadableFileStream = Box<dyn std::io::Read + Send + Sync>;
 pub type AsyncReadableFileStream = Box<dyn AsyncRead + Unpin + Send + Sync>;
 
-pub type WritableFileStream = Box<dyn std::io::Write + Send>;
+pub type WritableFileStream = Box<dyn std::io::Write + Send + Sync>;
 pub type AsyncWritableFileStream = Box<dyn AsyncWrite + Unpin + Send>;
-pub type WritableSeekableFileStream = Box<dyn crate::io::WriteSeek + Send>;
+pub type WritableSeekableFileStream = Box<dyn crate::io::WriteSeek + Send + Sync>;
 pub type AsyncWritableSeekableFileStream = Box<dyn crate::io::AsyncWriteSeek + Send>;
 pub type ReadableWritableSeekableFileStream = Box<dyn crate::io::ReadWriteSeek + Send>;
 pub type AsyncReadableWritableSeekableFileStream = Box<dyn crate::io::AsyncReadWriteSeek + Send>;
@@ -658,6 +658,18 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
         permissions: PortablePermissions,
+    ) -> Result<(), anyhow::Error>;
+    fn set_times(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        modification_time: std::time::SystemTime,
+        access_time: Option<std::time::SystemTime>,
+    ) -> Result<(), anyhow::Error>;
+    async fn async_set_times(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        modification_time: std::time::SystemTime,
+        access_time: Option<std::time::SystemTime>,
     ) -> Result<(), anyhow::Error>;
     fn rename(
         &self,

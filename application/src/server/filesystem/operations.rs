@@ -50,6 +50,9 @@ pub enum FilesystemOperation {
         #[serde(serialize_with = "serialize_arc")]
         #[schema(value_type = u64)]
         bytes_total: Arc<AtomicU64>,
+        #[serde(serialize_with = "serialize_arc")]
+        #[schema(value_type = u64)]
+        files_processed: Arc<AtomicU64>,
     },
     Pull {
         #[schema(value_type = String)]

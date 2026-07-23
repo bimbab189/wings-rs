@@ -290,6 +290,7 @@ impl VirtualDdupBakArchive {
             directory: entry.is_directory(),
             file: entry.is_file(),
             symlink: entry.is_symlink(),
+            r#virtual: true,
             mime: detected_mime.mime,
             modified: chrono::DateTime::from_timestamp(
                 entry
