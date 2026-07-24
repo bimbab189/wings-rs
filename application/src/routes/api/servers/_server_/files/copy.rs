@@ -26,6 +26,8 @@ mod post {
         path: compact_str::CompactString,
         name: Option<compact_str::CompactString>,
 
+        #[serde(default)]
+        overwrite: bool,
         #[serde(default = "foreground")]
         foreground: bool,
     }
@@ -39,6 +41,7 @@ mod post {
         (status = OK, body = crate::models::DirectoryEntry),
         (status = ACCEPTED, body = inline(Response)),
         (status = NOT_FOUND, body = ApiError),
+        (status = CONFLICT, body = ApiError),
         (status = EXPECTATION_FAILED, body = ApiError),
     ), params(
         (
@@ -148,6 +151,7 @@ mod post {
                 .ok();
         }
 
+        let explicit_name = data.name.is_some();
         let new_name = if let Some(name) = data.name {
             name
         } else {
@@ -160,6 +164,18 @@ mod post {
         let destination_path = server
             .filesystem
             .relative_path(&destination_path.join(&new_name));
+
+        if explicit_name
+            && !data.overwrite
+            && destination_filesystem
+                .async_metadata(&destination_path)
+                .await
+                .is_ok()
+        {
+            return ApiResponse::error("a file with that name already exists")
+                .with_status(StatusCode::CONFLICT)
+                .ok();
+        }
 
         let total_size = match filesystem.async_directory_entry_buffer(&path, &[]).await {
             Ok(entry) => entry.size,
