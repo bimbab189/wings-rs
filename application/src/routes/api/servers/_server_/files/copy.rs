@@ -159,11 +159,30 @@ mod post {
         };
         let file_name = parent.join(&new_name);
 
-        let (destination_path, destination_filesystem) =
-            server.filesystem.resolve_writable_fs(&server, parent).await;
+        let destination_parent = match file_name.parent() {
+            Some(parent) => parent,
+            None => {
+                return ApiResponse::error("destination has no parent")
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            }
+        };
+        let destination_file_name = match file_name.file_name() {
+            Some(name) => name,
+            None => {
+                return ApiResponse::error("invalid destination file name")
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            }
+        };
+
+        let (destination_path, destination_filesystem) = server
+            .filesystem
+            .resolve_writable_fs(&server, destination_parent)
+            .await;
         let destination_path = server
             .filesystem
-            .relative_path(&destination_path.join(&new_name));
+            .relative_path(&destination_path.join(destination_file_name));
 
         if explicit_name
             && !data.overwrite
