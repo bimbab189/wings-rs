@@ -433,11 +433,17 @@ fn docker_network_network_mtu() -> u64 {
     1500
 }
 
+fn docker_network_interfaces_v4_enabled() -> bool {
+    true
+}
 fn docker_network_interfaces_v4_subnet() -> String {
     "172.18.0.0/16".to_string()
 }
 fn docker_network_interfaces_v4_gateway() -> String {
     "172.18.0.1".to_string()
+}
+fn docker_network_interfaces_v6_enabled() -> bool {
+    true
 }
 fn docker_network_interfaces_v6_subnet() -> String {
     "fdba:17c8:6c94::/64".to_string()
@@ -962,6 +968,8 @@ nestify::nest! {
                     #[serde(default)]
                     #[schema(inline)]
                     pub v4: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerNetworkInterfacesV4 {
+                        #[serde(default = "docker_network_interfaces_v4_enabled")]
+                        pub enabled: bool,
                         #[serde(default = "docker_network_interfaces_v4_subnet")]
                         pub subnet: String,
                         #[serde(default = "docker_network_interfaces_v4_gateway")]
@@ -970,6 +978,8 @@ nestify::nest! {
                     #[serde(default)]
                     #[schema(inline)]
                     pub v6: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerNetworkInterfacesV6 {
+                        #[serde(default = "docker_network_interfaces_v6_enabled")]
+                        pub enabled: bool,
                         #[serde(default = "docker_network_interfaces_v6_subnet")]
                         pub subnet: String,
                         #[serde(default = "docker_network_interfaces_v6_gateway")]
@@ -1735,25 +1745,32 @@ impl Config {
                 client: &bollard::Docker,
                 cfg: &InnerConfig,
             ) -> Result<(), bollard::errors::Error> {
+                let mut ipam_config = Vec::new();
+
+                if cfg.docker.network.interfaces.v4.enabled {
+                    ipam_config.push(bollard::models::IpamConfig {
+                        subnet: Some(cfg.docker.network.interfaces.v4.subnet.clone()),
+                        gateway: Some(cfg.docker.network.interfaces.v4.gateway.clone()),
+                        ..Default::default()
+                    });
+                }
+                if cfg.docker.network.interfaces.v6.enabled {
+                    ipam_config.push(bollard::models::IpamConfig {
+                        subnet: Some(cfg.docker.network.interfaces.v6.subnet.clone()),
+                        gateway: Some(cfg.docker.network.interfaces.v6.gateway.clone()),
+                        ..Default::default()
+                    });
+                }
+
                 client
                     .create_network(bollard::plugin::NetworkCreateRequest {
                         name: cfg.docker.network.name.to_string(),
                         driver: Some(cfg.docker.network.driver.to_string()),
-                        enable_ipv6: Some(true),
+                        enable_ipv4: Some(cfg.docker.network.interfaces.v4.enabled),
+                        enable_ipv6: Some(cfg.docker.network.interfaces.v6.enabled),
                         internal: Some(cfg.docker.network.is_internal),
                         ipam: Some(bollard::models::Ipam {
-                            config: Some(vec![
-                                bollard::models::IpamConfig {
-                                    subnet: Some(cfg.docker.network.interfaces.v4.subnet.clone()),
-                                    gateway: Some(cfg.docker.network.interfaces.v4.gateway.clone()),
-                                    ..Default::default()
-                                },
-                                bollard::models::IpamConfig {
-                                    subnet: Some(cfg.docker.network.interfaces.v6.subnet.clone()),
-                                    gateway: Some(cfg.docker.network.interfaces.v6.gateway.clone()),
-                                    ..Default::default()
-                                },
-                            ]),
+                            config: Some(ipam_config),
                             ..Default::default()
                         }),
                         options: Some(HashMap::from([
@@ -1788,6 +1805,15 @@ impl Config {
                     .await?;
 
                 Ok(())
+            }
+
+            if !self.load().docker.network.interfaces.v4.enabled
+                && !self.load().docker.network.interfaces.v6.enabled
+            {
+                return Err(anyhow::anyhow!(
+                    "docker network {} has both v4 and v6 disabled, aborting creation",
+                    self.load().docker.network.name
+                ));
             }
 
             let initial_result = create_network(client, &self.load()).await;

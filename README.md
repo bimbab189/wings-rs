@@ -206,6 +206,14 @@ docker:
     # whether to disable binding to a specific ip
     disable_interface_binding: false
 
+    interfaces:
+      v4:
+        # whether to enable ipv4 support for the docker network
+        enabled: true
+      v6:
+        # whether to enable ipv6 support for the docker network
+        enabled: true
+
   registry_image_fetch_cache:
     # whether to enable caching of docker registry image fetches (pulls)
     enabled: true
