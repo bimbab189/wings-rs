@@ -239,9 +239,13 @@ impl BackupFindExt for ResticBackup {
             return Ok(true);
         }
 
-        if tokio::fs::metadata(&state.config.load().system.backups.restic.password_file)
-            .await
-            .is_ok()
+        if tokio::fs::metadata(
+            state
+                .config
+                .resolve_as_path(|cfg| &cfg.system.backups.restic.password_file),
+        )
+        .await
+        .is_ok()
         {
             let config = state.config.load();
             let output = match Command::new("restic")
@@ -249,9 +253,9 @@ impl BackupFindExt for ResticBackup {
                 .arg("--json")
                 .arg("--no-lock")
                 .arg("--repo")
-                .arg(&config.system.backups.restic.repository)
+                .arg(&*config.system.backups.restic.repository.as_str(&config))
                 .arg("--password-file")
-                .arg(&config.system.backups.restic.password_file)
+                .arg(&*config.system.backups.restic.password_file.as_str(&config))
                 .arg("--cache-dir")
                 .arg(Self::get_restic_cache_dir(&state.config))
                 .arg("snapshots")
@@ -274,8 +278,22 @@ impl BackupFindExt for ResticBackup {
                     let config = state.config.load();
 
                     Arc::new(ResticBackupConfiguration {
-                        repository: config.system.backups.restic.repository.clone(),
-                        password_file: Some(config.system.backups.restic.password_file.clone()),
+                        repository: config
+                            .system
+                            .backups
+                            .restic
+                            .repository
+                            .as_str(&config)
+                            .into(),
+                        password_file: Some(
+                            config
+                                .system
+                                .backups
+                                .restic
+                                .password_file
+                                .as_str(&config)
+                                .into(),
+                        ),
                         retry_lock_seconds: config.system.backups.restic.retry_lock_seconds,
                         environment: config.system.backups.restic.environment.clone(),
                     })
@@ -384,9 +402,13 @@ impl BackupFindExt for ResticBackup {
             })));
         }
 
-        if tokio::fs::metadata(&state.config.load().system.backups.restic.password_file)
-            .await
-            .is_ok()
+        if tokio::fs::metadata(
+            state
+                .config
+                .resolve_as_path(|cfg| &cfg.system.backups.restic.password_file),
+        )
+        .await
+        .is_ok()
         {
             let config = state.config.load();
             let output = match Command::new("restic")
@@ -394,9 +416,9 @@ impl BackupFindExt for ResticBackup {
                 .arg("--json")
                 .arg("--no-lock")
                 .arg("--repo")
-                .arg(&config.system.backups.restic.repository)
+                .arg(&*config.system.backups.restic.repository.as_str(&config))
                 .arg("--password-file")
-                .arg(&config.system.backups.restic.password_file)
+                .arg(&*config.system.backups.restic.password_file.as_str(&config))
                 .arg("--cache-dir")
                 .arg(Self::get_restic_cache_dir(&state.config))
                 .arg("snapshots")
@@ -416,8 +438,22 @@ impl BackupFindExt for ResticBackup {
                     let config = state.config.load();
 
                     Arc::new(ResticBackupConfiguration {
-                        repository: config.system.backups.restic.repository.clone(),
-                        password_file: Some(config.system.backups.restic.password_file.clone()),
+                        repository: config
+                            .system
+                            .backups
+                            .restic
+                            .repository
+                            .as_str(&config)
+                            .into(),
+                        password_file: Some(
+                            config
+                                .system
+                                .backups
+                                .restic
+                                .password_file
+                                .as_str(&config)
+                                .into(),
+                        ),
                         retry_lock_seconds: config.system.backups.restic.retry_lock_seconds,
                         environment: config.system.backups.restic.environment.clone(),
                     })
@@ -548,14 +584,10 @@ impl BackupCreateExt for ResticBackup {
         }
 
         let (mut child, configuration) = if tokio::fs::metadata(
-            &server
+            server
                 .app_state
                 .config
-                .load()
-                .system
-                .backups
-                .restic
-                .password_file,
+                .resolve_as_path(|cfg| &cfg.system.backups.restic.password_file),
         )
         .await
         .is_ok()
@@ -567,9 +599,9 @@ impl BackupCreateExt for ResticBackup {
                     .envs(&config.system.backups.restic.environment)
                     .arg("--json")
                     .arg("--repo")
-                    .arg(&config.system.backups.restic.repository)
+                    .arg(&*config.system.backups.restic.repository.as_str(&config))
                     .arg("--password-file")
-                    .arg(&config.system.backups.restic.password_file)
+                    .arg(&*config.system.backups.restic.password_file.as_str(&config))
                     .arg("--cache-dir")
                     .arg(Self::get_restic_cache_dir(&server.app_state.config))
                     .arg("--retry-lock")
@@ -592,8 +624,22 @@ impl BackupCreateExt for ResticBackup {
                     .stderr(std::process::Stdio::piped())
                     .spawn()?,
                 ResticBackupConfiguration {
-                    repository: config.system.backups.restic.repository.clone(),
-                    password_file: Some(config.system.backups.restic.password_file.clone()),
+                    repository: config
+                        .system
+                        .backups
+                        .restic
+                        .repository
+                        .as_str(&config)
+                        .into(),
+                    password_file: Some(
+                        config
+                            .system
+                            .backups
+                            .restic
+                            .password_file
+                            .as_str(&config)
+                            .into(),
+                    ),
                     retry_lock_seconds: config.system.backups.restic.retry_lock_seconds,
                     environment: config.system.backups.restic.environment.clone(),
                 },

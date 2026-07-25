@@ -330,24 +330,24 @@ fn system_backup_ddup_bak_create_threads() -> usize {
     4
 }
 
-fn system_backup_restic_repository() -> String {
+fn system_backup_restic_repository() -> SystemPath {
     #[cfg(unix)]
     {
-        "{root_directory}/backups/restic".to_string()
+        SystemPath::new("{root_directory}/backups/restic")
     }
     #[cfg(windows)]
     {
-        "{root_directory}\\backups\\restic".to_string()
+        SystemPath::new("{root_directory}\\backups\\restic")
     }
 }
-fn system_backup_restic_password_file() -> String {
+fn system_backup_restic_password_file() -> SystemPath {
     #[cfg(unix)]
     {
-        "{root_directory}/backups/restic_password".to_string()
+        SystemPath::new("{root_directory}/backups/restic_password")
     }
     #[cfg(windows)]
     {
-        "{root_directory}\\backups\\restic_password".to_string()
+        SystemPath::new("{root_directory}\\backups\\restic_password")
     }
 }
 fn system_backup_restic_retry_lock_seconds() -> u64 {
@@ -901,9 +901,9 @@ nestify::nest! {
                 #[schema(inline)]
                 pub restic: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemBackupsRestic {
                     #[serde(default = "system_backup_restic_repository")]
-                    pub repository: String,
+                    pub repository: SystemPath,
                     #[serde(default = "system_backup_restic_password_file")]
-                    pub password_file: String,
+                    pub password_file: SystemPath,
 
                     #[serde(default = "system_backup_restic_retry_lock_seconds")]
                     pub retry_lock_seconds: u64,
@@ -1155,8 +1155,9 @@ pub const FORBIDDEN_PATHS: &[&str] = &[
     "remote_headers",
     "system.root_directory",
     "system.log_directory",
-    "system.vmount_directory",
     "system.data",
+    "system.diffs_directory",
+    "system.vmount_directory",
     "system.archive_directory",
     "system.backup_directory",
     "system.tmp_directory",
