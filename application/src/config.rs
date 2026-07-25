@@ -5,6 +5,7 @@ use compact_str::ToCompactString;
 use serde::{Deserialize, Serialize};
 use serde_default::DefaultFromSerde;
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap},
     fs::File,
     io::BufRead,
@@ -22,14 +23,7 @@ use tracing_subscriber::{
 use utoipa::ToSchema;
 
 fn app_name() -> String {
-    #[cfg(unix)]
-    {
-        "Pterodactyl".to_string()
-    }
-    #[cfg(windows)]
-    {
-        "Calagopus".to_string()
-    }
+    "Calagopus".to_string()
 }
 fn api_host() -> String {
     "0.0.0.0".to_string()
@@ -76,85 +70,88 @@ fn api_max_jwt_uses() -> usize {
     5
 }
 
-fn system_root_directory() -> String {
+fn system_root_directory() -> SystemPath {
     #[cfg(unix)]
     {
-        "/var/lib/pterodactyl".to_string()
+        SystemPath::new("/var/lib/calagopus-wings")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings".to_string()
+        SystemPath::new("C:\\ProgramData\\Calagopus-Wings")
     }
 }
-fn system_log_directory() -> String {
+fn system_log_directory() -> SystemPath {
     #[cfg(unix)]
     {
-        "/var/log/pterodactyl".to_string()
+        SystemPath::new("/var/log/calagopus-wings")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\logs".to_string()
+        SystemPath::new("{root_directory}\\logs")
     }
 }
-fn system_vmount_directory() -> String {
+fn system_data_directory() -> SystemPath {
     #[cfg(unix)]
     {
-        "/var/lib/pterodactyl/vmounts".to_string()
+        SystemPath::new("{root_directory}/volumes")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\vmounts".to_string()
+        SystemPath::new("{root_directory}\\volumes")
     }
 }
-fn system_data() -> String {
+fn system_diffs_directory() -> SystemPath {
     #[cfg(unix)]
     {
-        "/var/lib/pterodactyl/volumes".to_string()
+        SystemPath::new("{root_directory}/diffs")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\volumes".to_string()
+        SystemPath::new("{root_directory}\\diffs")
     }
 }
-fn system_archive_directory() -> String {
+fn system_vmount_directory() -> SystemPath {
     #[cfg(unix)]
     {
-        "/var/lib/pterodactyl/archives".to_string()
+        SystemPath::new("{root_directory}/vmounts")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\archives".to_string()
+        SystemPath::new("{root_directory}\\vmounts")
     }
 }
-fn system_backup_directory() -> String {
+fn system_archive_directory() -> SystemPath {
     #[cfg(unix)]
     {
-        "/var/lib/pterodactyl/backups".to_string()
+        SystemPath::new("{root_directory}/archives")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\backups".to_string()
+        SystemPath::new("{root_directory}\\archives")
     }
 }
-fn system_tmp_directory() -> String {
+fn system_backup_directory() -> SystemPath {
     #[cfg(unix)]
     {
-        "/tmp/pterodactyl".to_string()
+        SystemPath::new("{root_directory}/backups")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\tmp".to_string()
+        SystemPath::new("{root_directory}\\backups")
+    }
+}
+fn system_tmp_directory() -> SystemPath {
+    #[cfg(unix)]
+    {
+        SystemPath::new("/tmp/calagopus-wings")
+    }
+    #[cfg(windows)]
+    {
+        SystemPath::new("{root_directory}\\tmp")
     }
 }
 fn system_username() -> compact_str::CompactString {
-    #[cfg(unix)]
-    {
-        "pterodactyl".into()
-    }
-    #[cfg(windows)]
-    {
-        "calagopus-wings".into()
-    }
+    "calagopus".into()
 }
 fn system_timezone() -> compact_str::CompactString {
     if let Ok(tz) = std::env::var("TZ") {
@@ -170,8 +167,8 @@ fn system_timezone() -> compact_str::CompactString {
     chrono::Local::now().offset().to_compact_string()
 }
 #[cfg(unix)]
-fn system_passwd_directory() -> String {
-    "/run/wings/etc".to_string()
+fn system_passwd_directory() -> SystemPath {
+    SystemPath::new("/run/calagopus-wings/etc")
 }
 #[cfg(unix)]
 fn system_machine_id_enabled() -> bool {
@@ -336,21 +333,21 @@ fn system_backup_ddup_bak_create_threads() -> usize {
 fn system_backup_restic_repository() -> String {
     #[cfg(unix)]
     {
-        "/var/lib/pterodactyl/backups/restic".to_string()
+        "{root_directory}/backups/restic".to_string()
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\backups\\restic".to_string()
+        "{root_directory}\\backups\\restic".to_string()
     }
 }
 fn system_backup_restic_password_file() -> String {
     #[cfg(unix)]
     {
-        "/var/lib/pterodactyl/backups/restic_password".to_string()
+        "{root_directory}/backups/restic_password".to_string()
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\backups\\restic_password".to_string()
+        "{root_directory}\\backups\\restic_password".to_string()
     }
 }
 fn system_backup_restic_retry_lock_seconds() -> u64 {
@@ -404,27 +401,13 @@ fn docker_network_dns_options() -> Vec<String> {
     ]
 }
 fn docker_network_name() -> String {
-    #[cfg(unix)]
-    {
-        "pterodactyl_nw".to_string()
-    }
-    #[cfg(windows)]
-    {
-        "calagopus_nw".to_string()
-    }
+    "calagopus_nw".to_string()
 }
 fn docker_network_driver() -> String {
     "bridge".to_string()
 }
 fn docker_network_mode() -> String {
-    #[cfg(unix)]
-    {
-        "pterodactyl_nw".to_string()
-    }
-    #[cfg(windows)]
-    {
-        "calagopus_nw".to_string()
-    }
+    "calagopus_nw".to_string()
 }
 fn docker_network_enable_icc() -> bool {
     true
@@ -549,6 +532,38 @@ impl From<i64> for MiB {
     }
 }
 
+#[derive(ToSchema, Deserialize, Serialize, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct SystemPath(String);
+
+impl SystemPath {
+    pub fn new(value: impl Into<String>) -> Self {
+        SystemPath(value.into())
+    }
+
+    pub fn as_str(&self, cfg: &InnerConfig) -> Cow<'_, str> {
+        if self.0.contains("{root_directory}") {
+            Cow::Owned(
+                self.0
+                    .replace("{root_directory}", &cfg.system.root_directory.0),
+            )
+        } else {
+            Cow::Borrowed(&self.0)
+        }
+    }
+
+    pub fn as_path(&self, cfg: &InnerConfig) -> PathBuf {
+        PathBuf::from(self.as_str(cfg).into_owned())
+    }
+}
+
+impl From<String> for SystemPath {
+    fn from(value: String) -> Self {
+        SystemPath(value)
+    }
+}
+
 nestify::nest! {
     #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)]
     pub struct InnerConfig {
@@ -622,19 +637,21 @@ nestify::nest! {
         #[schema(inline)]
         pub system: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct System {
             #[serde(default = "system_root_directory")]
-            pub root_directory: String,
+            pub root_directory: SystemPath,
             #[serde(default = "system_log_directory")]
-            pub log_directory: String,
+            pub log_directory: SystemPath,
+            #[serde(default = "system_data_directory", rename = "data")]
+            pub data_directory: SystemPath,
+            #[serde(default = "system_diffs_directory")]
+            pub diffs_directory: SystemPath,
             #[serde(default = "system_vmount_directory")]
-            pub vmount_directory: String,
-            #[serde(default = "system_data", rename = "data")]
-            pub data_directory: String,
+            pub vmount_directory: SystemPath,
             #[serde(default = "system_archive_directory")]
-            pub archive_directory: String,
+            pub archive_directory: SystemPath,
             #[serde(default = "system_backup_directory")]
-            pub backup_directory: String,
+            pub backup_directory: SystemPath,
             #[serde(default = "system_tmp_directory")]
-            pub tmp_directory: String,
+            pub tmp_directory: SystemPath,
 
             #[serde(default = "system_username")]
             pub username: compact_str::CompactString,
@@ -670,7 +687,7 @@ nestify::nest! {
                 pub enabled: bool,
                 #[cfg(unix)]
                 #[serde(default = "system_passwd_directory")]
-                pub directory: String,
+                pub directory: SystemPath,
             },
 
             #[cfg(unix)]
@@ -1189,6 +1206,30 @@ pub struct Config {
 }
 
 impl Config {
+    #[cfg(unix)]
+    pub const DEFAULT_PATH: &'static str = "/etc/calagopus-wings/config.yml";
+    #[cfg(windows)]
+    pub const DEFAULT_PATH: &'static str = "C:\\ProgramData\\Calagopus-Wings\\config.yml";
+
+    pub fn find() -> Option<&'static str> {
+        let paths = [
+            #[cfg(unix)]
+            "/etc/calagopus-wings/config.yml",
+            #[cfg(unix)]
+            "/etc/pterodactyl/config.yml",
+            #[cfg(unix)]
+            "/etc/pelican/config.yml",
+            #[cfg(windows)]
+            "C:\\ProgramData\\Calagopus-Wings\\config.yml",
+            "./config.yml",
+        ];
+
+        paths
+            .iter()
+            .find(|path| std::path::Path::new(path).exists())
+            .copied()
+    }
+
     pub fn open(
         path: &str,
         debug: bool,
@@ -1204,7 +1245,7 @@ impl Config {
 
         let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
 
-        let latest_log_path = Path::new(&inner.system.log_directory).join("wings.log");
+        let latest_log_path = inner.system.log_directory.as_path(&inner).join("wings.log");
         let latest_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1216,7 +1257,7 @@ impl Config {
             .filename_suffix("log")
             .max_log_files(30)
             .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .build(&inner.system.log_directory)
+            .build(inner.system.log_directory.as_path(&inner))
             .context("failed to create rolling log file appender")?;
 
         let (file_appender, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
@@ -1460,15 +1501,16 @@ impl Config {
         let directories = &[
             (&cfg.system.root_directory, "root_directory"),
             (&cfg.system.log_directory, "log_directory"),
-            (&cfg.system.vmount_directory, "vmount_directory"),
             (&cfg.system.data_directory, "data_directory"),
+            (&cfg.system.diffs_directory, "diffs_directory"),
+            (&cfg.system.vmount_directory, "vmount_directory"),
             (&cfg.system.archive_directory, "archive_directory"),
             (&cfg.system.backup_directory, "backup_directory"),
             (&cfg.system.tmp_directory, "tmp_directory"),
         ];
 
         for (dir, name) in directories {
-            let path = Path::new(dir);
+            let path = dir.as_path(cfg);
             let segments = path
                 .components()
                 .filter(|c| matches!(c, std::path::Component::Normal(_)))
@@ -1477,7 +1519,7 @@ impl Config {
                 return Err(anyhow::anyhow!(
                     "the {} '{}' must have at least {} segment(s)",
                     name,
-                    dir,
+                    path.display(),
                     MIN_DIRECTORY_SEGMENTS
                 ));
             }
@@ -1490,32 +1532,34 @@ impl Config {
         let directories = vec![
             &cfg.system.root_directory,
             &cfg.system.log_directory,
-            &cfg.system.vmount_directory,
             &cfg.system.data_directory,
+            &cfg.system.diffs_directory,
+            &cfg.system.vmount_directory,
             &cfg.system.archive_directory,
             &cfg.system.backup_directory,
             &cfg.system.tmp_directory,
         ];
 
         for dir in directories {
-            if !Path::new(dir).exists() {
-                std::fs::create_dir_all(dir)?;
+            let path = dir.as_path(cfg);
+            if !path.exists() {
+                std::fs::create_dir_all(&path)?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
                 }
             }
         }
 
         #[cfg(unix)]
-        if cfg.system.passwd.enabled && !Path::new(&cfg.system.passwd.directory).exists() {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::create_dir_all(&cfg.system.passwd.directory)?;
-            std::fs::set_permissions(
-                &cfg.system.passwd.directory,
-                std::fs::Permissions::from_mode(0o755),
-            )?;
+        {
+            let passwd_dir = cfg.system.passwd.directory.as_path(cfg);
+            if cfg.system.passwd.enabled && !passwd_dir.exists() {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::create_dir_all(&passwd_dir)?;
+                std::fs::set_permissions(&passwd_dir, std::fs::Permissions::from_mode(0o755))?;
+            }
         }
 
         Ok(())
@@ -1668,8 +1712,10 @@ impl Config {
         use std::os::unix::fs::PermissionsExt;
 
         if cfg.system.passwd.enabled {
+            let passwd_dir = cfg.system.passwd.directory.as_path(cfg);
+
             std::fs::write(
-                Path::new(&cfg.system.passwd.directory).join("group"),
+                passwd_dir.join("group"),
                 format!(
                     "root:x:0:\ncontainer:x:{}:\nnogroup:x:65534:",
                     cfg.system.user.gid
@@ -1677,23 +1723,19 @@ impl Config {
             )
             .context(format!(
                 "failed to write group file {}",
-                Path::new(&cfg.system.passwd.directory)
-                    .join("group")
-                    .display()
+                passwd_dir.join("group").display()
             ))?;
             std::fs::set_permissions(
-                Path::new(&cfg.system.passwd.directory).join("group"),
+                passwd_dir.join("group"),
                 std::fs::Permissions::from_mode(0o644),
             )
             .context(format!(
                 "failed to set permissions for group file {}",
-                Path::new(&cfg.system.passwd.directory)
-                    .join("group")
-                    .display()
+                passwd_dir.join("group").display()
             ))?;
 
             std::fs::write(
-                Path::new(&cfg.system.passwd.directory).join("passwd"),
+                passwd_dir.join("passwd"),
                 format!(
                     "root:x:0:0::/root:/bin/sh\ncontainer:x:{}:{}::/home/container:/bin/sh\nnobody:x:65534:65534::/var/empty:/bin/sh\n",
                     cfg.system.user.uid, cfg.system.user.gid
@@ -1701,17 +1743,15 @@ impl Config {
             )
             .context(format!(
                 "failed to write passwd file {}",
-                Path::new(&cfg.system.passwd.directory).join("passwd").display()
+                passwd_dir.join("passwd").display()
             ))?;
             std::fs::set_permissions(
-                Path::new(&cfg.system.passwd.directory).join("passwd"),
+                passwd_dir.join("passwd"),
                 std::fs::Permissions::from_mode(0o644),
             )
             .context(format!(
                 "failed to set permissions for passwd file {}",
-                Path::new(&cfg.system.passwd.directory)
-                    .join("passwd")
-                    .display()
+                passwd_dir.join("passwd").display()
             ))?;
         }
 
@@ -1719,11 +1759,18 @@ impl Config {
     }
 
     pub fn vmount_path(&self, server_uuid: uuid::Uuid) -> PathBuf {
-        Path::new(&self.load().system.vmount_directory).join(server_uuid.to_compact_string())
+        self.resolve_as_path(|cfg| &cfg.system.vmount_directory)
+            .join(server_uuid.to_compact_string())
     }
 
     pub fn data_path(&self, server_uuid: uuid::Uuid) -> PathBuf {
-        Path::new(&self.load().system.data_directory).join(server_uuid.to_compact_string())
+        self.resolve_as_path(|cfg| &cfg.system.data_directory)
+            .join(server_uuid.to_compact_string())
+    }
+
+    pub fn tmp_data_path(&self, server_uuid: uuid::Uuid) -> PathBuf {
+        self.resolve_as_path(|cfg| &cfg.system.tmp_directory)
+            .join(server_uuid.to_compact_string())
     }
 
     pub fn daemon_prelude(&self) -> compact_str::CompactString {
@@ -1731,6 +1778,18 @@ impl Config {
             .bold()
             .paint(format!("[{} Daemon]:", self.load().app_name))
             .to_compact_string()
+    }
+
+    #[inline]
+    pub fn resolve_as_str(&self, path: impl FnOnce(&InnerConfig) -> &SystemPath) -> String {
+        let cfg = self.load();
+        path(&cfg).as_str(&cfg).into_owned()
+    }
+
+    #[inline]
+    pub fn resolve_as_path(&self, path: impl FnOnce(&InnerConfig) -> &SystemPath) -> PathBuf {
+        let cfg = self.load();
+        path(&cfg).as_path(&cfg)
     }
 
     pub async fn ensure_docker_network(

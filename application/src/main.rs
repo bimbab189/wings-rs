@@ -12,7 +12,6 @@ use russh::server::Server;
 use std::{
     fmt::Debug,
     net::SocketAddr,
-    path::Path,
     sync::{Arc, OnceLock},
     time::Instant,
 };
@@ -42,11 +41,6 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_COMMIT: &str = env!("CARGO_GIT_COMMIT");
 const GIT_BRANCH: &str = env!("CARGO_GIT_BRANCH");
 const TARGET: &str = env!("CARGO_TARGET");
-
-#[cfg(unix)]
-const DEFAULT_CONFIG_PATH: &str = "/etc/pterodactyl/config.yml";
-#[cfg(windows)]
-const DEFAULT_CONFIG_PATH: &str = "C:\\ProgramData\\Calagopus-Wings\\config.yml";
 
 /// 32 KiB - used for general IO
 const BUFFER_SIZE: usize = 32 * 1024;
@@ -254,10 +248,11 @@ async fn main_rt() {
         .set(cli.get_command())
         .expect("failed to set CLAP_COMMAND");
 
-    let config_path = matches
-        .get_one::<String>("config")
-        .expect("config path is required")
-        .clone();
+    let config_path = matches.get_one::<String>("config").cloned();
+    let config_path = config_path
+        .as_deref()
+        .or_else(|| crate::config::Config::find())
+        .unwrap_or(crate::config::Config::DEFAULT_PATH);
     let debug = *matches
         .get_one::<bool>("debug")
         .expect("debug flag is required");
@@ -266,7 +261,7 @@ async fn main_rt() {
         .copied()
         .unwrap_or(false);
     let config = crate::config::Config::open(
-        &config_path,
+        config_path,
         debug,
         matches.subcommand().is_some(),
         ignore_certificate_errors,
@@ -540,7 +535,11 @@ async fn main_rt() {
             async move {
                 let mut server = crate::ssh::Server::new(Arc::clone(&state));
 
-                let key_file = Path::new(&state.config.load().system.data_directory)
+                let cfg = state.config.load();
+                let key_file = cfg
+                    .system
+                    .data_directory
+                    .as_path(&cfg)
                     .join(".sftp")
                     .join(format!(
                         "id_{}",
@@ -552,6 +551,8 @@ async fn main_rt() {
                             .key_algorithm
                             .replace("-", "_")
                     ));
+                drop(cfg);
+
                 let key = match tokio::fs::read(&key_file)
                     .await
                     .map(russh::keys::PrivateKey::from_openssh)

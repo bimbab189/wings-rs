@@ -26,7 +26,8 @@ pub struct ZfsBackup {
 impl ZfsBackup {
     #[inline]
     fn get_backup_path(config: &crate::config::Config, uuid: uuid::Uuid) -> PathBuf {
-        Path::new(&config.load().system.backup_directory)
+        config
+            .resolve_as_path(|cfg| &cfg.system.backup_directory)
             .join("zfs")
             .join(uuid.to_string())
     }
@@ -42,8 +43,8 @@ impl ZfsBackup {
         server_uuid: uuid::Uuid,
         uuid: uuid::Uuid,
     ) -> PathBuf {
-        Path::new(&config.load().system.data_directory)
-            .join(server_uuid.to_string())
+        config
+            .data_path(server_uuid)
             .join(".zfs")
             .join("snapshot")
             .join(Self::get_snapshot_name(uuid))

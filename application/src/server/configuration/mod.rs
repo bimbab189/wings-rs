@@ -264,10 +264,16 @@ impl ServerConfiguration {
 
         #[cfg(unix)]
         if config.load().system.passwd.enabled {
+            let cfg = config.load();
+
             mounts.push(Mount {
                 default: false,
                 target: "/etc/group".into(),
-                source: PathBuf::from(&config.load().system.passwd.directory)
+                source: cfg
+                    .system
+                    .passwd
+                    .directory
+                    .as_path(&cfg)
                     .join("group")
                     .to_string_lossy()
                     .to_compact_string(),
@@ -276,7 +282,11 @@ impl ServerConfiguration {
             mounts.push(Mount {
                 default: false,
                 target: "/etc/passwd".into(),
-                source: PathBuf::from(&config.load().system.passwd.directory)
+                source: cfg
+                    .system
+                    .passwd
+                    .directory
+                    .as_path(&cfg)
                     .join("passwd")
                     .to_string_lossy()
                     .to_compact_string(),

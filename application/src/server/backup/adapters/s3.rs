@@ -62,12 +62,16 @@ pub struct S3Backup {
 impl S3Backup {
     #[inline]
     fn get_file_name(config: &crate::config::Config, uuid: uuid::Uuid) -> PathBuf {
-        Path::new(&config.load().system.backup_directory).join(format!("{uuid}.s3.tar.gz"))
+        config
+            .resolve_as_path(|cfg| &cfg.system.backup_directory)
+            .join(format!("{uuid}.s3.tar.gz"))
     }
 
     #[inline]
     fn get_scratch_file_name(config: &crate::config::Config, uuid: uuid::Uuid) -> PathBuf {
-        Path::new(&config.load().system.backup_directory).join(format!("{uuid}.s3.part"))
+        config
+            .resolve_as_path(|cfg| &cfg.system.backup_directory)
+            .join(format!("{uuid}.s3.part"))
     }
 
     async fn upload_part(

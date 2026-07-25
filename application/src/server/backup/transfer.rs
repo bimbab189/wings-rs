@@ -13,7 +13,6 @@ use sha1::Digest;
 use std::{
     collections::BTreeMap,
     io::Write,
-    path::Path,
     pin::Pin,
     str::FromStr,
     sync::{
@@ -391,8 +390,11 @@ impl BackupReceiver {
                     return Ok(());
                 };
 
-                let file_name =
-                    Path::new(&self.state.config.load().system.backup_directory).join(file_name);
+                let file_name = self
+                    .state
+                    .config
+                    .resolve_as_path(|cfg| &cfg.system.backup_directory)
+                    .join(file_name);
                 let reader =
                     tokio_util::io::StreamReader::new(field.into_stream().map_err(|err| {
                         std::io::Error::other(format!("failed to read multipart field: {err}"))

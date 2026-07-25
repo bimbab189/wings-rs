@@ -226,11 +226,10 @@ pub struct ResticBackup {
     configuration: Arc<ResticBackupConfiguration>,
 }
 
-fn get_restic_cache_dir(config: &crate::config::Config) -> String {
-    format!(
-        "{}/.cache/restic",
-        config.load().system.backup_directory.trim_end_matches('/')
-    )
+impl ResticBackup {
+    pub fn get_restic_cache_dir(config: &crate::config::Config) -> String {
+        config.resolve_as_str(|cfg| &cfg.system.backup_directory) + "/.cache/restic"
+    }
 }
 
 #[async_trait::async_trait]
@@ -254,7 +253,7 @@ impl BackupFindExt for ResticBackup {
                 .arg("--password-file")
                 .arg(&config.system.backups.restic.password_file)
                 .arg("--cache-dir")
-                .arg(get_restic_cache_dir(&state.config))
+                .arg(Self::get_restic_cache_dir(&state.config))
                 .arg("snapshots")
                 .output()
                 .await
@@ -315,7 +314,7 @@ impl BackupFindExt for ResticBackup {
                 .arg("--repo")
                 .arg(&configuration.repository)
                 .arg("--cache-dir")
-                .arg(get_restic_cache_dir(&state.config))
+                .arg(Self::get_restic_cache_dir(&state.config))
                 .arg("snapshots")
                 .output()
                 .await
@@ -399,7 +398,7 @@ impl BackupFindExt for ResticBackup {
                 .arg("--password-file")
                 .arg(&config.system.backups.restic.password_file)
                 .arg("--cache-dir")
-                .arg(get_restic_cache_dir(&state.config))
+                .arg(Self::get_restic_cache_dir(&state.config))
                 .arg("snapshots")
                 .output()
                 .await
@@ -472,7 +471,7 @@ impl BackupFindExt for ResticBackup {
                 .arg("--repo")
                 .arg(&configuration.repository)
                 .arg("--cache-dir")
-                .arg(get_restic_cache_dir(&state.config))
+                .arg(Self::get_restic_cache_dir(&state.config))
                 .arg("snapshots")
                 .output()
                 .await
@@ -572,7 +571,7 @@ impl BackupCreateExt for ResticBackup {
                     .arg("--password-file")
                     .arg(&config.system.backups.restic.password_file)
                     .arg("--cache-dir")
-                    .arg(get_restic_cache_dir(&server.app_state.config))
+                    .arg(Self::get_restic_cache_dir(&server.app_state.config))
                     .arg("--retry-lock")
                     .arg(format!(
                         "{}s",
@@ -614,7 +613,7 @@ impl BackupCreateExt for ResticBackup {
                     .arg("--repo")
                     .arg(&configuration.repository)
                     .arg("--cache-dir")
-                    .arg(get_restic_cache_dir(&server.app_state.config))
+                    .arg(Self::get_restic_cache_dir(&server.app_state.config))
                     .arg("--retry-lock")
                     .arg(format!("{}s", configuration.retry_lock_seconds))
                     .arg("backup")
@@ -763,7 +762,7 @@ impl BackupExt for ResticBackup {
                         .arg(&self.configuration.repository)
                         .args(self.configuration.password())
                         .arg("--cache-dir")
-                        .arg(get_restic_cache_dir(&state.config))
+                        .arg(Self::get_restic_cache_dir(&state.config))
                         .arg("dump")
                         .arg(format!("{}:{}", self.short_id, self.server_path.display()))
                         .arg("/")
@@ -835,7 +834,7 @@ impl BackupExt for ResticBackup {
                         .arg(&self.configuration.repository)
                         .args(self.configuration.password())
                         .arg("--cache-dir")
-                        .arg(get_restic_cache_dir(&self.config))
+                        .arg(Self::get_restic_cache_dir(&self.config))
                         .arg("dump")
                         .arg(format!("{}:{}", self.short_id, self.server_path.display()))
                         .arg("/")
@@ -877,7 +876,7 @@ impl BackupExt for ResticBackup {
                         .arg(&self.configuration.repository)
                         .args(self.configuration.password())
                         .arg("--cache-dir")
-                        .arg(get_restic_cache_dir(&self.config))
+                        .arg(Self::get_restic_cache_dir(&self.config))
                         .arg("dump")
                         .arg(format!("{}:{}", self.short_id, self.server_path.display()))
                         .arg("/")
@@ -1040,7 +1039,7 @@ impl BackupExt for ResticBackup {
             .arg(&self.configuration.repository)
             .args(self.configuration.password())
             .arg("--cache-dir")
-            .arg(get_restic_cache_dir(&server.app_state.config))
+            .arg(Self::get_restic_cache_dir(&server.app_state.config))
             .arg("restore")
             .arg(format!("{}:{}", self.short_id, self.server_path.display()))
             .arg("--target")
@@ -1134,7 +1133,7 @@ impl BackupExt for ResticBackup {
             .arg(&self.configuration.repository)
             .args(self.configuration.password())
             .arg("--cache-dir")
-            .arg(get_restic_cache_dir(&self.config))
+            .arg(Self::get_restic_cache_dir(&self.config))
             .arg("--retry-lock")
             .arg(format!("{}s", self.configuration.retry_lock_seconds))
             .arg("forget")
@@ -1174,7 +1173,7 @@ impl BackupExt for ResticBackup {
             .arg(&self.configuration.repository)
             .args(self.configuration.password())
             .arg("--cache-dir")
-            .arg(get_restic_cache_dir(&self.config))
+            .arg(Self::get_restic_cache_dir(&self.config))
             .arg("--retry-lock")
             .arg(format!("{}s", self.configuration.retry_lock_seconds))
             .arg("ls")
@@ -1215,7 +1214,7 @@ impl BackupExt for ResticBackup {
             stderr.read_to_string(&mut stderr_out).await?;
 
             tracing::error!(
-                "failed to list Kopia snapshot for browsing: {}",
+                "failed to list Restic snapshot for browsing: {}",
                 stderr_out.trim()
             );
         }
@@ -1701,7 +1700,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                     .arg(&configuration.repository)
                                     .args(configuration.password())
                                     .arg("--cache-dir")
-                                    .arg(get_restic_cache_dir(&config))
+                                    .arg(ResticBackup::get_restic_cache_dir(&config))
                                     .arg("dump")
                                     .arg(format!("{}:{}", short_id, full_path.display()))
                                     .arg("/")
@@ -1763,7 +1762,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                 .arg(&configuration.repository)
                                 .args(configuration.password())
                                 .arg("--cache-dir")
-                                .arg(get_restic_cache_dir(&config))
+                                .arg(ResticBackup::get_restic_cache_dir(&config))
                                 .arg("dump")
                                 .arg(format!("{}:{}", short_id, full_path.display()))
                                 .stdout(std::process::Stdio::piped())
@@ -1820,7 +1819,9 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             .arg(&self.configuration.repository)
             .args(self.configuration.password())
             .arg("--cache-dir")
-            .arg(get_restic_cache_dir(&self.server.app_state.config))
+            .arg(ResticBackup::get_restic_cache_dir(
+                &self.server.app_state.config,
+            ))
             .arg("dump")
             .arg(&self.short_id)
             .arg(full_path)
@@ -1859,7 +1860,9 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             .arg(&self.configuration.repository)
             .args(self.configuration.password())
             .arg("--cache-dir")
-            .arg(get_restic_cache_dir(&self.server.app_state.config))
+            .arg(ResticBackup::get_restic_cache_dir(
+                &self.server.app_state.config,
+            ))
             .arg("dump")
             .arg(&self.short_id)
             .arg(full_path)
@@ -1932,7 +1935,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                 .arg(&configuration.repository)
                 .args(configuration.password())
                 .arg("--cache-dir")
-                .arg(get_restic_cache_dir(&config))
+                .arg(ResticBackup::get_restic_cache_dir(&config))
                 .arg("dump")
                 .arg(format!("{}:{}", short_id, full_path.display()))
                 .arg("/")
@@ -2261,7 +2264,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                 .arg(&configuration.repository)
                 .args(configuration.password())
                 .arg("--cache-dir")
-                .arg(get_restic_cache_dir(&config))
+                .arg(ResticBackup::get_restic_cache_dir(&config))
                 .arg("dump")
                 .args(if is_dir {
                     vec![

@@ -3,7 +3,6 @@ use compact_str::ToCompactString;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    path::Path,
     sync::{Arc, atomic::Ordering},
 };
 use tokio::{io::AsyncWriteExt, sync::Mutex};
@@ -52,7 +51,10 @@ impl ServerInstaller {
     }
 
     pub fn get_install_logs_path(server: &super::Server) -> std::path::PathBuf {
-        std::path::PathBuf::from(&server.app_state.config.load().system.log_directory)
+        server
+            .app_state
+            .config
+            .resolve_as_path(|cfg| &cfg.system.log_directory)
             .join(server.uuid.to_string())
             .join("install.log")
     }
@@ -113,12 +115,9 @@ impl ServerInstaller {
             );
         }
 
-        tokio::fs::remove_dir_all(
-            Path::new(&self.server.app_state.config.load().system.tmp_directory)
-                .join(self.server.uuid.to_string()),
-        )
-        .await
-        .ok();
+        tokio::fs::remove_dir_all(self.server.app_state.config.tmp_data_path(self.server.uuid))
+            .await
+            .ok();
         if let Err(err) = self
             .server
             .app_state

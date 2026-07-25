@@ -28,7 +28,10 @@ pub async fn handle_ws(
         }
 
         let mut file = match tokio::fs::File::open(
-            std::path::Path::new(&state.config.load().system.log_directory).join(&file_path),
+            state
+                .config
+                .resolve_as_path(|cfg| &cfg.system.log_directory)
+                .join(&file_path),
         )
         .await
         {

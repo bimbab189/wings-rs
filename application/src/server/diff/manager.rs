@@ -32,18 +32,8 @@ pub struct DiffManager {
 
 impl DiffManager {
     pub fn new(server: uuid::Uuid, config: &Arc<crate::config::Config>) -> Self {
-        let dir = std::path::Path::new(&config.load().system.root_directory).join("diffs");
-        let db_path = dir.join(format!("{server}.db"));
-
-        if config.load().system.file_history.enabled
-            && let Err(err) = std::fs::create_dir_all(&dir)
-        {
-            tracing::error!(
-                server = %server,
-                "failed to create diff directory {}: {err:#}",
-                dir.display()
-            );
-        }
+        let diffs_directory = config.resolve_as_path(|cfg| &cfg.system.diffs_directory);
+        let db_path = diffs_directory.join(format!("{server}.db"));
 
         let storage: Arc<Mutex<Option<Storage>>> = Arc::new(Mutex::new(None));
         let pending_forgets: Arc<Mutex<HashMap<compact_str::CompactString, PendingForget>>> =

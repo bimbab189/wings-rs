@@ -84,7 +84,9 @@ impl KopiaBackup {
     }
 
     fn get_kopia_state_path(config: &crate::config::Config) -> PathBuf {
-        Path::new(config.load().system.backup_directory.trim_end_matches('/')).join(".kopia")
+        config
+            .resolve_as_path(|cfg| &cfg.system.backup_directory)
+            .join(".kopia")
     }
 
     fn get_config_file_path(

@@ -20,13 +20,6 @@ pub struct ResticTaskResult {
     stderr: compact_str::CompactString,
 }
 
-fn get_restic_cache_dir(config: &crate::config::Config) -> compact_str::CompactString {
-    compact_str::format_compact!(
-        "{}/.cache/restic",
-        config.load().system.backup_directory.trim_end_matches('/')
-    )
-}
-
 fn build_restic_command(
     config: &crate::config::Config,
     configuration: &ResticBackupConfiguration,
@@ -38,7 +31,7 @@ fn build_restic_command(
         .arg("--repo")
         .arg(&configuration.repository)
         .arg("--cache-dir")
-        .arg(get_restic_cache_dir(config));
+        .arg(crate::server::backup::adapters::restic::ResticBackup::get_restic_cache_dir(config));
 
     if let Some(password_file) = &configuration.password_file {
         command.arg("--password-file").arg(password_file);

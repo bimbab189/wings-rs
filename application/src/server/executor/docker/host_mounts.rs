@@ -75,26 +75,24 @@ impl HostMountTable {
 
     pub fn validate_directories(
         &self,
-        config: &crate::config::InnerConfig,
+        cfg: &crate::config::InnerConfig,
     ) -> Result<(), anyhow::Error> {
         let mut directories = vec![
-            (&config.system.data_directory, "system.data_directory"),
-            (&config.system.tmp_directory, "system.tmp_directory"),
+            (&cfg.system.data_directory, "system.data_directory"),
+            (&cfg.system.tmp_directory, "system.tmp_directory"),
+            (&cfg.system.vmount_directory, "system.vmount_directory"),
         ];
         #[cfg(unix)]
-        {
-            if config.system.machine_id.enabled {
-                directories.push((&config.system.vmount_directory, "system.vmount_directory"));
-            }
-            if config.system.passwd.enabled {
-                directories.push((&config.system.passwd.directory, "system.passwd.directory"));
-            }
+        if cfg.system.passwd.enabled {
+            directories.push((&cfg.system.passwd.directory, "system.passwd.directory"));
         }
 
         for (directory, name) in directories {
-            if self.translate(Path::new(directory)).is_none() {
+            let directory = directory.as_path(cfg);
+            if self.translate(&directory).is_none() {
                 return Err(anyhow::anyhow!(
-                    "{name} '{directory}' is not covered by any mount of the wings container, so the container engine on the host cannot see it. add a volume for it (e.g. '/path/on/host:{directory}')"
+                    "{name} '{directory}' is not covered by any mount of the wings container, so the container engine on the host cannot see it. add a volume for it (e.g. '/path/on/host:{directory}')",
+                    directory = directory.display(),
                 ));
             }
         }

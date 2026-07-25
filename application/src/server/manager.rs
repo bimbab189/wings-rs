@@ -1,7 +1,6 @@
 use super::{Server, state::ServerState};
 use std::{
     collections::HashMap,
-    path::Path,
     sync::{Arc, atomic::Ordering},
 };
 use tokio::{
@@ -28,8 +27,11 @@ impl ServerManager {
         app_state: &crate::routes::State,
         raw_servers: Vec<crate::remote::servers::RawServer>,
     ) {
-        let states_path =
-            Path::new(&app_state.config.load().system.root_directory).join("states.json");
+        let root_directory = app_state
+            .config
+            .resolve_as_path(|cfg| &cfg.system.root_directory);
+
+        let states_path = root_directory.join("states.json");
         let mut states: HashMap<uuid::Uuid, ServerState> = serde_json::from_str(
             tokio::fs::read_to_string(&states_path)
                 .await
@@ -38,8 +40,7 @@ impl ServerManager {
         )
         .unwrap_or_default();
 
-        let installing_path =
-            Path::new(&app_state.config.load().system.root_directory).join("installing.json");
+        let installing_path = root_directory.join("installing.json");
         let mut installing: HashMap<uuid::Uuid, (bool, super::installation::InstallationScript)> =
             serde_json::from_str(
                 tokio::fs::read_to_string(&installing_path)

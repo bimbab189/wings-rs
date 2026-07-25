@@ -47,7 +47,8 @@ impl WingsBackup {
         uuid: uuid::Uuid,
         format: ArchiveFormat,
     ) -> PathBuf {
-        Path::new(&config.load().system.backup_directory)
+        config
+            .resolve_as_path(|cfg| &cfg.system.backup_directory)
             .join(format!("{uuid}.{}", format.extension()))
     }
 

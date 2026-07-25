@@ -33,7 +33,12 @@ mod get {
     pub async fn route(state: GetState) -> ApiResponseResult {
         let mut log_files = Vec::new();
 
-        let mut directory = tokio::fs::read_dir(&state.config.load().system.log_directory).await?;
+        let mut directory = tokio::fs::read_dir(
+            state
+                .config
+                .resolve_as_path(|cfg| &cfg.system.log_directory),
+        )
+        .await?;
         while let Ok(Some(entry)) = directory.next_entry().await {
             let metadata = match entry.metadata().await {
                 Ok(metadata) => metadata,

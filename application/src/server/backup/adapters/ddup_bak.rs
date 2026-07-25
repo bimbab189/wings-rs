@@ -41,7 +41,7 @@ pub async fn get_repository(
         return Ok(Arc::clone(repository));
     }
 
-    let path = PathBuf::from(&config.load().system.backup_directory);
+    let path = config.resolve_as_path(|cfg| &cfg.system.backup_directory);
     if tokio::fs::metadata(path.join(".ddup-bak")).await.is_ok() {
         let repository = Arc::new(
             tokio::task::spawn_blocking(move || {

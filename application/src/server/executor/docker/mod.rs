@@ -1513,8 +1513,7 @@ impl super::ServerExecutor for DockerExecutor {
 
         drop(server_config);
 
-        let tmp_dir =
-            Path::new(&self.app_config.load().system.tmp_directory).join(server.uuid.to_string());
+        let tmp_dir = self.app_config.tmp_data_path(server.uuid);
         tokio::fs::create_dir_all(&tmp_dir).await?;
         tokio::fs::write(
             tmp_dir.join("install.sh"),
@@ -1727,8 +1726,7 @@ impl super::ServerExecutor for DockerExecutor {
 
         drop(server_config);
 
-        let tmp_dir =
-            Path::new(&self.app_config.load().system.tmp_directory).join(server.uuid.to_string());
+        let tmp_dir = self.app_config.tmp_data_path(server.uuid);
         tokio::fs::create_dir_all(&tmp_dir).await?;
         tokio::fs::write(
             tmp_dir.join("script.sh"),

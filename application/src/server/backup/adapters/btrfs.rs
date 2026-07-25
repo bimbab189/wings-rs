@@ -9,6 +9,7 @@ use crate::{
         },
     },
 };
+use compact_str::ToCompactString;
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -31,9 +32,10 @@ pub struct BtrfsSendStream {
 impl BtrfsBackup {
     #[inline]
     pub fn get_backup_path(config: &crate::config::Config, uuid: uuid::Uuid) -> PathBuf {
-        Path::new(&config.load().system.backup_directory)
+        config
+            .resolve_as_path(|cfg| &cfg.system.backup_directory)
             .join("btrfs")
-            .join(uuid.to_string())
+            .join(uuid.to_compact_string())
     }
 
     #[inline]
@@ -120,7 +122,9 @@ impl BtrfsBackup {
     }
 
     pub async fn cleanup_stale_btrfs_send_snapshots(config: &crate::config::Config) {
-        let btrfs_dir = Path::new(&config.load().system.backup_directory).join("btrfs");
+        let btrfs_dir = config
+            .resolve_as_path(|cfg| &cfg.system.backup_directory)
+            .join("btrfs");
 
         let mut backups = match tokio::fs::read_dir(&btrfs_dir).await {
             Ok(backups) => backups,
