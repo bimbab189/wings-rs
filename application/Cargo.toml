@@ -103,7 +103,7 @@ croner = { version = "3.0.1", features = ["serde"] }
 tikv-jemallocator = "0.6.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-ktls = { version = "6.0.2", features = ["aws_lc_rs"] }
+ktls = { version = "6.0.2", git = "https://github.com/KnorpelSenf/ktls.git", rev = "047f134ce25380087a55d6bfbfd2f14d839c0ba0", features = ["aws_lc_rs"] }
 tokio-rustls = "0.26.4"
 
 [target.'cfg(target_arch = "riscv64gc")'.dependencies]
