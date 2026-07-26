@@ -593,6 +593,8 @@ nestify::nest! {
                 #[serde(default)]
                 pub enabled: bool,
                 #[serde(default)]
+                pub ktls_enabled: bool,
+                #[serde(default)]
                 pub cert: String,
                 #[serde(default)]
                 pub key: String,

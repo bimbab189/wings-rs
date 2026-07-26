@@ -102,6 +102,10 @@ croner = { version = "3.0.1", features = ["serde"] }
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 tikv-jemallocator = "0.6.0"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ktls = { version = "6.0.2", features = ["aws_lc_rs"] }
+tokio-rustls = "0.26.4"
+
 [target.'cfg(target_arch = "riscv64gc")'.dependencies]
 libz-ng-sys = "=1.1.23" # temporary pin due to riscv64 issues
 

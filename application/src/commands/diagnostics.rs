@@ -11,7 +11,7 @@ pub struct DiagnosticsArgs {
         short = 'l',
         long = "log-lines",
         help = "number of log lines to include in the report",
-        default_value_t = 100
+        default_value_t = 500
     )]
     pub log_lines: usize,
 }
@@ -93,6 +93,11 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
                 )?;
                 write_line(&mut output, "ssl certificate", &config.api.ssl.cert)?;
                 write_line(&mut output, "ssl key", &config.api.ssl.key)?;
+                write_line(
+                    &mut output,
+                    "ssl kernel tls",
+                    &format!("{}", config.api.ssl.ktls_enabled),
+                )?;
                 writeln!(output)?;
                 write_line(
                     &mut output,

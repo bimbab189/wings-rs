@@ -33,6 +33,7 @@ mod routes;
 mod server;
 mod ssh;
 mod stats;
+mod tls;
 mod utils;
 
 use payload::Payload;
@@ -676,13 +677,33 @@ async fn main_rt() {
         if config.load().api.ssl.enabled {
             tracing::info!("loading ssl certs");
 
-            let rustls_config = match axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            #[cfg(not(target_os = "linux"))]
+            if config.load().api.ssl.ktls_enabled {
+                tracing::warn!("kernel tls is only supported on linux, using userspace tls");
+            }
+
+            #[cfg(target_os = "linux")]
+            let ktls_ciphers = if config.load().api.ssl.ktls_enabled {
+                crate::tls::detect_ktls_support().await
+            } else {
+                None
+            };
+
+            #[cfg(target_os = "linux")]
+            let ktls = ktls_ciphers.is_some();
+            #[cfg(not(target_os = "linux"))]
+            let ktls = false;
+
+            let rustls_config = match crate::tls::server_config(
                 config.load().api.ssl.cert.as_str(),
                 config.load().api.ssl.key.as_str(),
+                ktls,
             )
             .await
             {
-                Ok(config) => config,
+                Ok(server_config) => {
+                    axum_server::tls_rustls::RustlsConfig::from_config(server_config)
+                }
                 Err(err) => exit_error!("failed to load SSL certificate and key: {:?}", err),
             };
 
@@ -695,16 +716,23 @@ async fn main_rt() {
                         tokio::time::sleep(std::time::Duration::from_hours(24)).await;
                         tracing::info!("reloading ssl certs");
 
-                        if let Err(err) = rustls_config
-                            .reload_from_pem_file(
-                                config.load().api.ssl.cert.as_str(),
-                                config.load().api.ssl.key.as_str(),
-                            )
-                            .await
+                        match crate::tls::server_config(
+                            config.load().api.ssl.cert.as_str(),
+                            config.load().api.ssl.key.as_str(),
+                            ktls,
+                        )
+                        .await
                         {
-                            tracing::error!("failed to reload SSL certificate and key: {:?}", err);
-                        } else {
-                            tracing::info!("ssl certs reloaded successfully");
+                            Ok(server_config) => {
+                                rustls_config.reload_from_config(server_config);
+                                tracing::info!("ssl certs reloaded successfully");
+                            }
+                            Err(err) => {
+                                tracing::error!(
+                                    "failed to reload SSL certificate and key: {:?}",
+                                    err
+                                );
+                            }
                         }
                     }
                 }
@@ -712,10 +740,27 @@ async fn main_rt() {
 
             tracing::info!("https listening on {}", address.to_string());
 
-            match axum_server::bind_rustls(address, rustls_config)
+            #[cfg(target_os = "linux")]
+            let result = match ktls_ciphers {
+                Some(ciphers) => {
+                    axum_server::bind(address)
+                        .acceptor(crate::tls::KtlsAcceptor::new(rustls_config, ciphers))
+                        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                        .await
+                }
+                None => {
+                    axum_server::bind_rustls(address, rustls_config)
+                        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                        .await
+                }
+            };
+
+            #[cfg(not(target_os = "linux"))]
+            let result = axum_server::bind_rustls(address, rustls_config)
                 .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-            {
+                .await;
+
+            match result {
                 Ok(_) => {}
                 Err(err) => {
                     if err.kind() == std::io::ErrorKind::AddrInUse {
