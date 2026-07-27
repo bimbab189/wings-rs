@@ -278,23 +278,24 @@ pub async fn run(ctx: DiskCheckerContext) {
                 "skipping disk usage check due to server state inactivity"
             );
         } else {
-            let paths_to_scan = if full_disk_check_counter
-                % config.load().system.full_disk_check_every
-                == 0
-            {
-                None
-            } else if use_server_notifier.load(Ordering::Relaxed) && server_notifier.is_trusted() {
-                let paths = server_notifier.take_modified_paths();
+            let paths_to_scan =
+                if full_disk_check_counter % config.load().system.full_disk_check_every == 0 {
+                    None
+                } else if use_server_notifier.load(Ordering::Relaxed)
+                    && server_notifier.is_trusted()
+                    && !force_scan
+                {
+                    let paths = server_notifier.take_modified_paths();
 
-                tracing::debug!(
-                    path = %cap_filesystem.base_path.display(),
-                    "checking disk usage for {} modified paths",
-                    paths.len()
-                );
-                Some(paths)
-            } else {
-                None
-            };
+                    tracing::debug!(
+                        path = %cap_filesystem.base_path.display(),
+                        "checking disk usage for {} modified paths",
+                        paths.len()
+                    );
+                    Some(paths)
+                } else {
+                    None
+                };
 
             full_disk_check_counter += 1;
 
