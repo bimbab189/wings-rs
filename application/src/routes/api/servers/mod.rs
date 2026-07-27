@@ -65,7 +65,15 @@ mod post {
 
         state
             .server_manager
-            .create_server(&state, server_data, !data.skip_scripts)
+            .create_server(
+                &state,
+                server_data,
+                if data.skip_scripts {
+                    crate::server::manager::ServerCreation::SkipInstall
+                } else {
+                    crate::server::manager::ServerCreation::Install
+                },
+            )
             .await;
 
         ApiResponse::new_serialized(Response {}).ok()

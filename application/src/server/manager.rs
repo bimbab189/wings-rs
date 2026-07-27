@@ -9,6 +9,17 @@ use tokio::{
     sync::{RwLock, Semaphore},
 };
 
+#[derive(Clone, Copy)]
+pub enum ServerCreation {
+    /// Run the installation script, then report the result to the panel.
+    Install,
+    /// Skip the installation script, but still report a successful install to the panel.
+    SkipInstall,
+    /// The server is the destination of a transfer, its contents arrive over the wire and
+    /// the panel is notified through the transfer endpoints instead.
+    Transferred,
+}
+
 pub struct ServerManager {
     servers: Arc<RwLock<Vec<Server>>>,
 }
@@ -289,7 +300,7 @@ impl ServerManager {
         &self,
         app_state: &crate::routes::State,
         raw_server: crate::remote::servers::RawServer,
-        install_server: bool,
+        creation: ServerCreation,
     ) -> Server {
         let server = Server::new(
             raw_server.settings,
@@ -299,37 +310,41 @@ impl ServerManager {
 
         server.filesystem.setup().await;
 
-        if install_server {
-            tokio::spawn({
-                let server = server.clone();
+        match creation {
+            ServerCreation::Install => {
+                tokio::spawn({
+                    let server = server.clone();
 
-                async move {
-                    let mut installer = Arc::new(
-                        super::installation::ServerInstaller::new(&server, false, None).await,
-                    );
-
-                    if let Err(err) = installer.start(false).await {
-                        tracing::error!(
-                            server = %server.uuid,
-                            "failed to install server: {:#?}",
-                            err
+                    async move {
+                        let mut installer = Arc::new(
+                            super::installation::ServerInstaller::new(&server, false, None).await,
                         );
+
+                        if let Err(err) = installer.start(false).await {
+                            tracing::error!(
+                                server = %server.uuid,
+                                "failed to install server: {:#?}",
+                                err
+                            );
+                        }
+
+                        server.installer.write().await.replace(installer);
                     }
+                });
+            }
+            ServerCreation::SkipInstall => {
+                tokio::spawn({
+                    let server = server.clone();
 
-                    server.installer.write().await.replace(installer);
-                }
-            });
-        } else {
-            tokio::spawn({
-                let server = server.clone();
+                    async move {
+                        let installer =
+                            super::installation::ServerInstaller::new(&server, false, None).await;
 
-                async move {
-                    let installer =
-                        super::installation::ServerInstaller::new(&server, false, None).await;
-
-                    installer.unset_installing(true).await.ok();
-                }
-            });
+                        installer.unset_installing(true).await.ok();
+                    }
+                });
+            }
+            ServerCreation::Transferred => {}
         }
 
         self.servers.write().await.push(server.clone());

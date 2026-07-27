@@ -31,6 +31,8 @@ pub struct BackupSender {
 
     btrfs_parent: Option<std::path::PathBuf>,
     btrfs_cleanup_dirs: Vec<std::path::PathBuf>,
+
+    sent: Vec<uuid::Uuid>,
 }
 
 impl BackupSender {
@@ -49,7 +51,13 @@ impl BackupSender {
             bytes_total: Arc::clone(bytes_total),
             btrfs_parent: None,
             btrfs_cleanup_dirs: Vec::new(),
+            sent: Vec::new(),
         }
+    }
+
+    #[inline]
+    pub fn sent(&self) -> &[uuid::Uuid] {
+        &self.sent
     }
 
     pub async fn finish(self) {
@@ -255,6 +263,8 @@ impl BackupSender {
             );
         }
 
+        self.sent.push(uuid);
+
         form
     }
 }
@@ -265,6 +275,7 @@ pub struct BackupMigration {
     pub checksum_type: compact_str::CompactString,
     pub browsable: bool,
     pub streaming: bool,
+    pub adapter: super::adapters::BackupAdapter,
 }
 
 #[derive(Debug, Default)]
@@ -292,9 +303,14 @@ impl BackupReceiver {
         }
     }
 
-    #[inline]
-    pub fn into_received(self) -> ReceivedBackups {
-        self.received
+    pub fn into_received(self) -> Result<ReceivedBackups, anyhow::Error> {
+        if self.checksum.is_some() {
+            return Err(anyhow::anyhow!(
+                "a transferred backup was not followed by a checksum, cannot verify integrity"
+            ));
+        }
+
+        Ok(self.received)
     }
 
     pub fn handle_field(
@@ -453,6 +469,7 @@ impl BackupReceiver {
                             ArchiveFormat::Zip | ArchiveFormat::SevenZip
                         ),
                         streaming: false,
+                        adapter: crate::server::backup::adapters::BackupAdapter::Wings,
                     },
                 );
                 self.checksum = Some(checksum);
@@ -582,6 +599,7 @@ impl BackupReceiver {
                             checksum_type: "btrfs-subvolume".into(),
                             browsable: true,
                             streaming: true,
+                            adapter: crate::server::backup::adapters::BackupAdapter::Btrfs,
                         },
                     );
 

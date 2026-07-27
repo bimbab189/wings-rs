@@ -72,11 +72,20 @@ mod post {
                 data.token,
                 data.backups,
                 data.delete_backups,
-                data.multiplex_streams,
+                data.multiplex_streams
+                    .min(crate::server::transfer::MAX_MULTIPLEX_STREAMS),
             )
             .is_ok()
         {
             server.outgoing_transfer.write().await.replace(transfer);
+        } else {
+            server
+                .transferring
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+
+            return ApiResponse::error("failed to start server transfer")
+                .with_status(StatusCode::EXPECTATION_FAILED)
+                .ok();
         }
 
         ApiResponse::new_serialized(Response {})

@@ -180,10 +180,12 @@ mod post {
                     async move {
                         tokio::task::spawn_blocking(move || {
                             let mut archive_checksum = None;
+                            let mut archive_received = false;
 
                             while let Some(mut field) = runtime.block_on(multipart.next_field())? {
                                 match field.name() {
                                     Some("archive") => {
+                                        archive_received = true;
                                         let file_name = field.file_name().unwrap_or("archive.tar.gz").to_string();
                                         let reader =
                                             tokio_util::io::StreamReader::new(field.into_stream().map_err(|err| {
@@ -414,6 +416,18 @@ mod post {
                                     }
                                     _ => {}
                                 }
+                            }
+
+                            if !archive_received {
+                                return Err(anyhow::anyhow!("transfer did not contain an archive"));
+                            }
+
+                            // the checksum field takes the computed hash, anything left over
+                            // means the sender never provided one to compare against.
+                            if archive_checksum.is_some() {
+                                return Err(anyhow::anyhow!(
+                                    "transfer did not contain an archive checksum, cannot verify integrity"
+                                ));
                             }
 
                             Ok(())
