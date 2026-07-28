@@ -154,6 +154,7 @@ pub enum WebsocketEvent {
 #[derive(Debug, Clone)]
 pub struct TargetedWebsocketMessage {
     user_uuids: Arc<HashSet<uuid::Uuid>>,
+    connection_uuids: Arc<HashSet<uuid::Uuid>>,
     permissions: Arc<Permissions>,
     message: WebsocketMessage,
 }
@@ -166,13 +167,33 @@ impl TargetedWebsocketMessage {
     ) -> Self {
         Self {
             user_uuids: Arc::new(user_uuids),
+            connection_uuids: Arc::new(HashSet::new()),
             permissions: Arc::new(permissions),
             message,
         }
     }
 
-    pub fn matches(&self, user_uuid: &uuid::Uuid, permissions: &Permissions) -> bool {
+    pub fn new_connections(
+        connection_uuids: HashSet<uuid::Uuid>,
+        permissions: Permissions,
+        message: WebsocketMessage,
+    ) -> Self {
+        Self {
+            user_uuids: Arc::new(HashSet::new()),
+            connection_uuids: Arc::new(connection_uuids),
+            permissions: Arc::new(permissions),
+            message,
+        }
+    }
+
+    pub fn matches(
+        &self,
+        connection_id: &uuid::Uuid,
+        user_uuid: &uuid::Uuid,
+        permissions: &Permissions,
+    ) -> bool {
         (self.user_uuids.is_empty() || self.user_uuids.contains(user_uuid))
+            && (self.connection_uuids.is_empty() || self.connection_uuids.contains(connection_id))
             && self
                 .permissions
                 .iter()

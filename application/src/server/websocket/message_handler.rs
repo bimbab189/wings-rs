@@ -440,13 +440,19 @@ pub async fn handle_message(
                             user_name,
                             user_avatar,
                             &path,
+                            message.args.get(1).map(|s| s.as_str()),
                         )
                         .await
                 }
                 WebsocketEvent::FileCollabUnsubscribe => {
                     server
                         .collab
-                        .unsubscribe(server, websocket_handler.connection_id, &path)
+                        .unsubscribe(
+                            server,
+                            websocket_handler.connection_id,
+                            &path,
+                            message.args.get(1).map(|s| s.as_str()),
+                        )
                         .await
                 }
                 WebsocketEvent::FileCollabUpdate => {
@@ -465,6 +471,7 @@ pub async fn handle_message(
                             &path,
                             finished == "1",
                             chunk,
+                            message.args.get(3).map(|s| s.as_str()),
                         )
                         .await
                 }

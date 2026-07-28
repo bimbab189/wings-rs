@@ -298,6 +298,12 @@ fn system_file_collaboration_max_sessions_per_server() -> u64 {
 fn system_file_collaboration_max_sessions_per_connection() -> u64 {
     8
 }
+fn system_file_collaboration_max_editors_per_session() -> u64 {
+    32
+}
+fn system_file_collaboration_max_cursors_per_connection() -> u64 {
+    64
+}
 fn system_file_collaboration_session_grace_period() -> u64 {
     30
 }
@@ -839,6 +845,10 @@ nestify::nest! {
                 pub max_sessions_per_server: u64,
                 #[serde(default = "system_file_collaboration_max_sessions_per_connection")]
                 pub max_sessions_per_connection: u64,
+                #[serde(default = "system_file_collaboration_max_editors_per_session")]
+                pub max_editors_per_session: u64,
+                #[serde(default = "system_file_collaboration_max_cursors_per_connection")]
+                pub max_cursors_per_connection: u64,
 
                 #[serde(default = "system_file_collaboration_session_grace_period")]
                 pub session_grace_period: u64,

@@ -116,7 +116,11 @@ impl Server {
         );
 
         let activity = activity::ActivityManager::new(configuration.uuid, &app_state.config);
-        let collab = collab::manager::CollabManager::new(configuration.uuid, &app_state.config);
+        let collab = collab::manager::CollabManager::new(
+            configuration.uuid,
+            targeted_websocket_tx.clone(),
+            &app_state.config,
+        );
         let diff = diff::manager::DiffManager::new(configuration.uuid, &app_state.config);
         let schedules = Arc::new(schedule::manager::ScheduleManager::new(Arc::clone(
             &app_state.config,

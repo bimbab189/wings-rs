@@ -2,10 +2,13 @@ use super::{CollabConflict, CollabError, CollabParticipant, CollabSaved, CollabS
 use crate::server::{
     activity::{Activity, ActivityEvent},
     filesystem::virtualfs::VirtualWritableFilesystem,
-    websocket::{ServerWebsocketHandler, WebsocketEvent, WebsocketMessage},
+    permissions::{Permission, Permissions},
+    websocket::{
+        ServerWebsocketHandler, TargetedWebsocketMessage, WebsocketEvent, WebsocketMessage,
+    },
 };
 use base64::Engine;
-use compact_str::{CompactString, ToCompactString};
+use compact_str::ToCompactString;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -15,13 +18,134 @@ use std::{
     },
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
 use yrs::{
-    Doc, GetString, ReadTxn, StateVector, Text, TextRef, Transact, Update, updates::decoder::Decode,
+    Doc, GetString, ReadTxn, StateVector, Text, TextRef, Transact, Update,
+    encoding::{
+        read::{Cursor, Read},
+        write::Write,
+    },
+    updates::decoder::Decode,
 };
 
 const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+const MAX_AWARENESS_INT: u64 = (1 << 53) - 1;
+
+struct AwarenessEntry {
+    client: u64,
+    clock: u64,
+    removed: bool,
+}
+
+fn decode_awareness(update: &[u8]) -> Option<Vec<AwarenessEntry>> {
+    let mut cursor = Cursor::new(update);
+    let count: u64 = cursor.read_var().ok()?;
+
+    let mut entries = Vec::with_capacity((count as usize).min(64));
+    for _ in 0..count {
+        let client: u64 = cursor.read_var().ok()?;
+        let clock: u64 = cursor.read_var().ok()?;
+        let state = cursor.read_buf().ok()?;
+
+        entries.push(AwarenessEntry {
+            client,
+            clock,
+            removed: state == b"null",
+        });
+    }
+
+    Some(entries)
+}
+
+fn encode_awareness_removal(clients: &HashMap<u64, u64>) -> Vec<u8> {
+    let mut update = Vec::new();
+    update.write_var(clients.len() as u64);
+
+    for (&client, &clock) in clients {
+        update.write_var(client);
+        update.write_var(clock);
+        Write::write_buf(&mut update, b"null");
+    }
+
+    update
+}
+
+const MAX_EDITOR_ID_LEN: usize = 64;
+
+fn editor_id(editor: Option<&str>) -> Result<compact_str::CompactString, CollabError> {
+    match editor {
+        None => Ok(compact_str::CompactString::const_new("")),
+        Some(editor) if editor.len() <= MAX_EDITOR_ID_LEN => Ok(editor.to_compact_string()),
+        Some(_) => Err(CollabError::User("editor id is too long")),
+    }
+}
+
+#[derive(Default)]
+struct ConnectionState {
+    subscriptions: HashMap<compact_str::CompactString, HashSet<compact_str::CompactString>>,
+    keys: HashMap<compact_str::CompactString, compact_str::CompactString>,
+}
+
+impl ConnectionState {
+    fn subscribe(
+        &mut self,
+        raw_path: &str,
+        key: &compact_str::CompactString,
+        editor: compact_str::CompactString,
+    ) {
+        self.subscriptions
+            .entry(key.clone())
+            .or_default()
+            .insert(editor);
+        self.keys.insert(raw_path.to_compact_string(), key.clone());
+    }
+
+    fn unsubscribe(
+        &mut self,
+        raw_path: &str,
+        resolved: Option<compact_str::CompactString>,
+        editor: &str,
+    ) -> Option<Unsubscribed> {
+        let key = self.keys.get(raw_path).cloned().or(resolved)?;
+        let editors = self.subscriptions.get_mut(&key)?;
+
+        editors.remove(editor);
+        if !editors.is_empty() {
+            return Some(Unsubscribed { key, last: false });
+        }
+
+        self.subscriptions.remove(&key);
+        self.keys.retain(|_, resolved| resolved != &key);
+
+        Some(Unsubscribed { key, last: true })
+    }
+}
+
+#[derive(PartialEq, Eq, Debug)]
+struct Unsubscribed {
+    key: compact_str::CompactString,
+    last: bool,
+}
+
+fn track_awareness_clients(
+    clients: &mut HashMap<u64, u64>,
+    entries: &[AwarenessEntry],
+    max_cursors: usize,
+) {
+    for entry in entries {
+        if entry.client > MAX_AWARENESS_INT || entry.clock > MAX_AWARENESS_INT {
+            continue;
+        }
+
+        if entry.removed {
+            clients.remove(&entry.client);
+        } else if clients.len() < max_cursors || clients.contains_key(&entry.client) {
+            let clock = clients.entry(entry.client).or_default();
+            *clock = (*clock).max(entry.clock);
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ConflictState {
@@ -40,9 +164,15 @@ impl From<ConflictState> for CollabConflict {
 
 struct Participant {
     user_uuid: uuid::Uuid,
-    user_name: CompactString,
+    user_name: compact_str::CompactString,
     user_avatar: Option<String>,
-    handler: Arc<ServerWebsocketHandler>,
+}
+
+fn broadcast_permissions() -> Permissions {
+    let mut permissions = Permissions::default();
+    permissions.insert(Permission::FileReadContent);
+
+    permissions
 }
 
 struct CollabDoc {
@@ -82,30 +212,40 @@ impl CollabDoc {
 }
 
 pub struct CollabSession {
-    path: CompactString,
+    path: compact_str::CompactString,
     abs_path: PathBuf,
     filesystem: Arc<dyn VirtualWritableFilesystem>,
-    doc: std::sync::Mutex<CollabDoc>,
+    websocket: tokio::sync::broadcast::Sender<TargetedWebsocketMessage>,
+    doc: parking_lot::Mutex<CollabDoc>,
     dirty: AtomicBool,
-    conflict: std::sync::Mutex<Option<ConflictState>>,
-    participants: Mutex<HashMap<uuid::Uuid, Participant>>,
-    save_lock: Mutex<()>,
+    conflict: parking_lot::Mutex<Option<ConflictState>>,
+    participants: tokio::sync::Mutex<HashMap<uuid::Uuid, Participant>>,
+    awareness: parking_lot::Mutex<HashMap<uuid::Uuid, HashMap<u64, u64>>>,
+    save_lock: tokio::sync::Mutex<()>,
 }
 
 impl CollabSession {
     async fn broadcast(&self, except: Option<uuid::Uuid>, message: WebsocketMessage) {
-        let handlers: Vec<Arc<ServerWebsocketHandler>> = {
+        let connections: HashSet<uuid::Uuid> = {
             let participants = self.participants.lock().await;
             participants
-                .iter()
-                .filter(|(connection, _)| Some(**connection) != except)
-                .map(|(_, p)| Arc::clone(&p.handler))
+                .keys()
+                .copied()
+                .filter(|connection| Some(*connection) != except)
                 .collect()
         };
 
-        for handler in handlers {
-            handler.send_message(message.clone()).await;
+        if connections.is_empty() {
+            return;
         }
+
+        self.websocket
+            .send(TargetedWebsocketMessage::new_connections(
+                connections,
+                broadcast_permissions(),
+                message,
+            ))
+            .ok();
     }
 
     async fn broadcast_conflict(&self, state: Option<ConflictState>) {
@@ -131,7 +271,7 @@ impl CollabSession {
     }
 
     fn set_conflict(&self, state: Option<ConflictState>) -> bool {
-        let mut conflict = self.conflict.lock().expect("collab conflict lock poisoned");
+        let mut conflict = self.conflict.lock();
         if *conflict != state {
             *conflict = state;
             true
@@ -141,7 +281,37 @@ impl CollabSession {
     }
 
     fn current_conflict(&self) -> Option<ConflictState> {
-        *self.conflict.lock().expect("collab conflict lock poisoned")
+        *self.conflict.lock()
+    }
+
+    fn track_awareness(
+        &self,
+        connection_id: uuid::Uuid,
+        entries: &[AwarenessEntry],
+        max_cursors: usize,
+    ) {
+        let mut awareness = self.awareness.lock();
+        let clients = awareness.entry(connection_id).or_default();
+
+        track_awareness_clients(clients, entries, max_cursors);
+
+        if clients.is_empty() {
+            awareness.remove(&connection_id);
+        }
+    }
+
+    fn awareness_removal_message(&self, connection_id: uuid::Uuid) -> Option<WebsocketMessage> {
+        let clients = self.awareness.lock().remove(&connection_id)?;
+        if clients.is_empty() {
+            return None;
+        }
+
+        Some(
+            WebsocketMessage::builder(WebsocketEvent::FileCollabAwareness)
+                .arg(self.path.clone())
+                .arg(BASE64.encode(encode_awareness_removal(&clients)))
+                .build(),
+        )
     }
 
     async fn participants_message(&self) -> WebsocketMessage {
@@ -168,22 +338,38 @@ impl CollabSession {
 
 pub struct CollabManager {
     server: uuid::Uuid,
+    websocket: tokio::sync::broadcast::Sender<TargetedWebsocketMessage>,
     config: Arc<crate::config::Config>,
-    sessions: Arc<Mutex<HashMap<CompactString, Arc<CollabSession>>>>,
-    connections: Mutex<HashMap<uuid::Uuid, HashSet<CompactString>>>,
-    pending_updates: Mutex<HashMap<(uuid::Uuid, CompactString), Vec<u8>>>,
-    pending_teardowns: Arc<Mutex<HashMap<CompactString, tokio::task::AbortHandle>>>,
+    sessions: Arc<tokio::sync::Mutex<HashMap<compact_str::CompactString, Arc<CollabSession>>>>,
+    connections: tokio::sync::Mutex<HashMap<uuid::Uuid, ConnectionState>>,
+    pending_updates: parking_lot::Mutex<
+        HashMap<
+            (
+                uuid::Uuid,
+                compact_str::CompactString,
+                compact_str::CompactString,
+            ),
+            Vec<u8>,
+        >,
+    >,
+    pending_teardowns:
+        Arc<parking_lot::Mutex<HashMap<compact_str::CompactString, tokio::task::AbortHandle>>>,
 }
 
 impl CollabManager {
-    pub fn new(server: uuid::Uuid, config: &Arc<crate::config::Config>) -> Self {
+    pub fn new(
+        server: uuid::Uuid,
+        websocket: tokio::sync::broadcast::Sender<TargetedWebsocketMessage>,
+        config: &Arc<crate::config::Config>,
+    ) -> Self {
         Self {
             server,
+            websocket,
             config: Arc::clone(config),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            connections: Mutex::new(HashMap::new()),
-            pending_updates: Mutex::new(HashMap::new()),
-            pending_teardowns: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            connections: tokio::sync::Mutex::new(HashMap::new()),
+            pending_updates: parking_lot::Mutex::new(HashMap::new()),
+            pending_teardowns: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -191,7 +377,16 @@ impl CollabManager {
         &self,
         server: &crate::server::Server,
         raw_path: &str,
-    ) -> Result<(PathBuf, CompactString, Arc<dyn VirtualWritableFilesystem>), CollabError> {
+    ) -> Result<
+        (
+            PathBuf,
+            compact_str::CompactString,
+            Arc<dyn VirtualWritableFilesystem>,
+        ),
+        CollabError,
+    > {
+        use compact_str::ToCompactString;
+
         if !self.config.load().system.file_collaboration.enabled {
             return Err(CollabError::User("collaborative editing is disabled"));
         }
@@ -252,8 +447,8 @@ impl CollabManager {
         }
 
         let mut buf = Vec::with_capacity(handle.size as usize);
-        handle
-            .reader
+        (&mut handle.reader)
+            .take(size_cap.saturating_add(1))
             .read_to_end(&mut buf)
             .await
             .map_err(|err| CollabError::Internal(err.into()))?;
@@ -266,15 +461,18 @@ impl CollabManager {
         String::from_utf8(buf).map_err(|_| CollabError::User("file is not editable as text"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn subscribe(
         &self,
         server: &crate::server::Server,
         handler: &Arc<ServerWebsocketHandler>,
         user_uuid: uuid::Uuid,
-        user_name: CompactString,
+        user_name: compact_str::CompactString,
         user_avatar: Option<String>,
         raw_path: &str,
+        editor: Option<&str>,
     ) -> Result<(), CollabError> {
+        let editor = editor_id(editor)?;
         let (path, key, filesystem) = self.resolve(server, raw_path).await?;
 
         let config = self.config.load();
@@ -282,21 +480,32 @@ impl CollabManager {
         let max_sessions = config.system.file_collaboration.max_sessions_per_server as usize;
         let max_subscriptions =
             config.system.file_collaboration.max_sessions_per_connection as usize;
+        let max_editors = config.system.file_collaboration.max_editors_per_session as usize;
         drop(config);
 
         {
             let connections = self.connections.lock().await;
-            if let Some(subscribed) = connections.get(&handler.connection_id)
-                && !subscribed.contains(&key)
-                && subscribed.len() >= max_subscriptions
-            {
-                return Err(CollabError::User(
-                    "too many collaborative sessions open on this connection",
-                ));
+            if let Some(connection) = connections.get(&handler.connection_id) {
+                if !connection.subscriptions.contains_key(&key)
+                    && connection.subscriptions.len() >= max_subscriptions
+                {
+                    return Err(CollabError::User(
+                        "too many collaborative sessions open on this connection",
+                    ));
+                }
+
+                if let Some(editors) = connection.subscriptions.get(&key)
+                    && !editors.contains(&editor)
+                    && editors.len() >= max_editors
+                {
+                    return Err(CollabError::User(
+                        "too many editors open for this file on this connection",
+                    ));
+                }
             }
         }
 
-        if let Some(abort) = self.pending_teardowns.lock().await.remove(&key) {
+        if let Some(abort) = self.pending_teardowns.lock().remove(&key) {
             abort.abort();
         }
 
@@ -312,12 +521,13 @@ impl CollabManager {
                     {
                         let content = Self::read_content(&filesystem, &path, size_cap).await?;
                         {
-                            let mut doc = session.doc.lock().expect("collab doc lock poisoned");
+                            let mut doc = session.doc.lock();
                             if doc.disk_hash != blake3::hash(content.as_bytes()) {
                                 *doc = CollabDoc::new(&content);
                             }
                         }
                         session.set_conflict(None);
+                        session.awareness.lock().clear();
                     }
 
                     session
@@ -334,11 +544,13 @@ impl CollabManager {
                         path: key.clone(),
                         abs_path: path.clone(),
                         filesystem: Arc::clone(&filesystem),
-                        doc: std::sync::Mutex::new(CollabDoc::new(&content)),
+                        websocket: self.websocket.clone(),
+                        doc: parking_lot::Mutex::new(CollabDoc::new(&content)),
                         dirty: AtomicBool::new(false),
-                        conflict: std::sync::Mutex::new(None),
-                        participants: Mutex::new(HashMap::new()),
-                        save_lock: Mutex::new(()),
+                        conflict: parking_lot::Mutex::new(None),
+                        participants: tokio::sync::Mutex::new(HashMap::new()),
+                        awareness: parking_lot::Mutex::new(HashMap::new()),
+                        save_lock: tokio::sync::Mutex::new(()),
                     });
 
                     sessions.insert(key.clone(), Arc::clone(&session));
@@ -359,7 +571,6 @@ impl CollabManager {
                     user_uuid,
                     user_name,
                     user_avatar,
-                    handler: Arc::clone(handler),
                 },
             );
 
@@ -370,10 +581,10 @@ impl CollabManager {
             .await
             .entry(handler.connection_id)
             .or_default()
-            .insert(key.clone());
+            .subscribe(raw_path, &key, editor);
 
         let (state, dirty) = {
-            let doc = session.doc.lock().expect("collab doc lock poisoned");
+            let doc = session.doc.lock();
             (
                 doc.encode_full_state(),
                 session.dirty.load(Ordering::Relaxed),
@@ -416,7 +627,7 @@ impl CollabManager {
 
                 if session.dirty.load(Ordering::Relaxed) {
                     let converged = {
-                        let doc = session.doc.lock().expect("collab doc lock poisoned");
+                        let doc = session.doc.lock();
                         blake3::hash(doc.content().as_bytes()) == doc.disk_hash
                     };
                     if converged {
@@ -452,7 +663,7 @@ impl CollabManager {
 
                         let disk_hash = blake3::hash(content.as_bytes());
                         let matches = {
-                            let doc = session.doc.lock().expect("collab doc lock poisoned");
+                            let doc = session.doc.lock();
                             doc.disk_hash == disk_hash
                         };
 
@@ -475,7 +686,7 @@ impl CollabManager {
                             }
                         } else {
                             let reloaded = {
-                                let mut doc = session.doc.lock().expect("collab doc lock poisoned");
+                                let mut doc = session.doc.lock();
                                 if !session.dirty.load(Ordering::Relaxed)
                                     && doc.disk_hash != disk_hash
                                 {
@@ -521,7 +732,7 @@ impl CollabManager {
         server: &crate::server::Server,
         connection_id: uuid::Uuid,
         raw_path: &str,
-    ) -> Result<(CompactString, Arc<CollabSession>), CollabError> {
+    ) -> Result<(compact_str::CompactString, Arc<CollabSession>), CollabError> {
         let (_, key, _) = self.resolve(server, raw_path).await?;
 
         if !self
@@ -529,7 +740,7 @@ impl CollabManager {
             .lock()
             .await
             .get(&connection_id)
-            .is_some_and(|subscribed| subscribed.contains(&key))
+            .is_some_and(|connection| connection.subscriptions.contains_key(&key))
         {
             return Err(CollabError::User("not subscribed to this file"));
         }
@@ -552,7 +763,9 @@ impl CollabManager {
         raw_path: &str,
         finished: bool,
         chunk: &str,
+        editor: Option<&str>,
     ) -> Result<(), CollabError> {
+        let editor = editor_id(editor)?;
         let (key, session) = self
             .subscribed_session(server, connection_id, raw_path)
             .await?;
@@ -564,8 +777,8 @@ impl CollabManager {
             .map_err(|_| CollabError::User("invalid update encoding"))?;
 
         let update = {
-            let mut pending = self.pending_updates.lock().await;
-            let pending_key = (connection_id, key.clone());
+            let mut pending = self.pending_updates.lock();
+            let pending_key = (connection_id, editor, key.clone());
 
             match pending.get_mut(&pending_key) {
                 Some(buffer) => {
@@ -597,7 +810,7 @@ impl CollabManager {
             Update::decode_v1(&update).map_err(|_| CollabError::User("invalid update encoding"))?;
 
         let needs_resync = {
-            let mut guard = session.doc.lock().expect("collab doc lock poisoned");
+            let mut guard = session.doc.lock();
 
             let overflow = {
                 let doc = &mut *guard;
@@ -661,6 +874,29 @@ impl CollabManager {
             .subscribed_session(server, connection_id, raw_path)
             .await?;
 
+        match BASE64
+            .decode(payload)
+            .ok()
+            .as_deref()
+            .and_then(decode_awareness)
+        {
+            Some(entries) => {
+                let max_cursors = self
+                    .config
+                    .load()
+                    .system
+                    .file_collaboration
+                    .max_cursors_per_connection as usize;
+
+                session.track_awareness(connection_id, &entries, max_cursors)
+            }
+            None => tracing::debug!(
+                server = %self.server,
+                path = %key,
+                "received an unparseable collaborative editing awareness update"
+            ),
+        }
+
         session
             .broadcast(
                 Some(connection_id),
@@ -696,7 +932,7 @@ impl CollabManager {
         let _save_guard = session.save_lock.lock().await;
 
         let (content, doc_disk_hash) = {
-            let doc = session.doc.lock().expect("collab doc lock poisoned");
+            let doc = session.doc.lock();
             (doc.content(), doc.disk_hash)
         };
 
@@ -719,7 +955,11 @@ impl CollabManager {
                 match filesystem.async_read_file(&path, None).await {
                     Ok(mut handle) if handle.size <= read_cap => {
                         let mut buf = Vec::with_capacity(handle.size as usize);
-                        match handle.reader.read_to_end(&mut buf).await {
+                        match (&mut handle.reader)
+                            .take(read_cap.saturating_add(1))
+                            .read_to_end(&mut buf)
+                            .await
+                        {
                             Ok(_) if buf.len() as u64 <= read_cap => Some(buf),
                             _ => None,
                         }
@@ -812,7 +1052,7 @@ impl CollabManager {
         }
 
         {
-            let mut doc = session.doc.lock().expect("collab doc lock poisoned");
+            let mut doc = session.doc.lock();
             doc.disk_hash = blake3::hash(content.as_bytes());
             session
                 .dirty
@@ -863,7 +1103,7 @@ impl CollabManager {
 
         let content = Self::read_content(&session.filesystem, &session.abs_path, size_cap).await?;
         {
-            let mut doc = session.doc.lock().expect("collab doc lock poisoned");
+            let mut doc = session.doc.lock();
             *doc = CollabDoc::new(&content);
         }
         session.dirty.store(false, Ordering::Relaxed);
@@ -885,40 +1125,59 @@ impl CollabManager {
         server: &crate::server::Server,
         connection_id: uuid::Uuid,
         raw_path: &str,
+        editor: Option<&str>,
     ) -> Result<(), CollabError> {
-        let (_, key, _) = self.resolve(server, raw_path).await?;
-        self.leave(connection_id, &key).await;
+        let editor = editor_id(editor)?;
+
+        let resolved = self
+            .resolve(server, raw_path)
+            .await
+            .ok()
+            .map(|(_, key, _)| key);
+
+        let unsubscribed = {
+            let mut connections = self.connections.lock().await;
+            let Some(connection) = connections.get_mut(&connection_id) else {
+                return Ok(());
+            };
+
+            let unsubscribed = connection.unsubscribe(raw_path, resolved, &editor);
+            if connection.subscriptions.is_empty() {
+                connections.remove(&connection_id);
+            }
+
+            unsubscribed
+        };
+
+        let Some(Unsubscribed { key, last }) = unsubscribed else {
+            return Ok(());
+        };
+
+        self.pending_updates
+            .lock()
+            .remove(&(connection_id, editor, key.clone()));
+
+        if last {
+            self.leave_session(connection_id, &key).await;
+        }
 
         Ok(())
     }
 
     pub async fn disconnect(&self, connection_id: uuid::Uuid) {
-        let subscribed = self.connections.lock().await.remove(&connection_id);
+        let connection = self.connections.lock().await.remove(&connection_id);
         self.pending_updates
             .lock()
-            .await
-            .retain(|(connection, _), _| *connection != connection_id);
+            .retain(|(connection, _, _), _| *connection != connection_id);
 
-        if let Some(subscribed) = subscribed {
-            for key in subscribed {
+        if let Some(connection) = connection {
+            for key in connection.subscriptions.into_keys() {
                 self.leave_session(connection_id, &key).await;
             }
         }
     }
 
-    async fn leave(&self, connection_id: uuid::Uuid, key: &CompactString) {
-        if let Some(subscribed) = self.connections.lock().await.get_mut(&connection_id) {
-            subscribed.remove(key);
-        }
-        self.pending_updates
-            .lock()
-            .await
-            .remove(&(connection_id, key.clone()));
-
-        self.leave_session(connection_id, key).await;
-    }
-
-    async fn leave_session(&self, connection_id: uuid::Uuid, key: &CompactString) {
+    async fn leave_session(&self, connection_id: uuid::Uuid, key: &compact_str::CompactString) {
         let session = match self.sessions.lock().await.get(key) {
             Some(session) => Arc::clone(session),
             None => return,
@@ -930,15 +1189,21 @@ impl CollabManager {
             participants.is_empty()
         };
 
+        let removal = session.awareness_removal_message(connection_id);
+
         if empty {
-            self.schedule_teardown(key.clone()).await;
+            self.schedule_teardown(key.clone());
         } else {
+            if let Some(removal) = removal {
+                session.broadcast(None, removal).await;
+            }
+
             let participants = session.participants_message().await;
             session.broadcast(None, participants).await;
         }
     }
 
-    async fn schedule_teardown(&self, key: CompactString) {
+    fn schedule_teardown(&self, key: compact_str::CompactString) {
         let grace = std::time::Duration::from_secs(
             self.config
                 .load()
@@ -970,11 +1235,11 @@ impl CollabManager {
                     sessions.remove(&key);
                 }
 
-                pending_teardowns.lock().await.remove(&key);
+                pending_teardowns.lock().remove(&key);
             }
         });
 
-        let mut pending_teardowns = self.pending_teardowns.lock().await;
+        let mut pending_teardowns = self.pending_teardowns.lock();
         if let Some(old) = pending_teardowns.insert(key, task.abort_handle()) {
             old.abort();
         }
