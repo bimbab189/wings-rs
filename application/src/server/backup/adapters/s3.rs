@@ -794,20 +794,20 @@ impl BackupExt for S3Backup {
             let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
             for entry in entries {
                 let mut entry = entry?;
-                let path = entry.path()?;
+                let path = server.filesystem.relative_path(&entry.path()?);
 
-                if path.is_absolute() {
+                if path.as_os_str().is_empty() {
                     continue;
                 }
 
                 let header = entry.header();
                 match header.entry_type() {
                     tar::EntryType::Directory => {
-                        server.filesystem.create_chowned_dir_all(path.as_ref())?;
+                        server.filesystem.create_chowned_dir_all(path.as_path())?;
                         server
                             .filesystem
                             .set_permissions(
-                                path.as_ref(),
+                                path.as_path(),
                                 PortablePermissions::from_mode_dir(header.mode().unwrap_or(0o755)),
                             )?;
 
@@ -843,7 +843,7 @@ impl BackupExt for S3Backup {
                     tar::EntryType::Symlink => {
                         let link = entry.link_name().unwrap_or_default().unwrap_or_default();
 
-                        if let Err(err) = server.filesystem.symlink(link, path.as_ref()) {
+                        if let Err(err) = server.filesystem.symlink(link, path.as_path()) {
                             tracing::debug!(path = %path.display(), "failed to create symlink from backup: {:?}", err);
                         } else {
                             progress.increment_files();
@@ -852,7 +852,7 @@ impl BackupExt for S3Backup {
                                 server
                                     .filesystem
                                     .set_times(
-                                        path.as_ref(),
+                                        path.as_path(),
                                         std::time::UNIX_EPOCH
                                             + std::time::Duration::from_secs(modified_time),
                                         None,

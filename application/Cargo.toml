@@ -63,7 +63,7 @@ new_mime_guess = "4.0.4"
 async-trait = "0.1.88"
 chrono-tz = "0.10.4"
 gzp = "2.0.0"
-lzma-rust2 = { version = "0.17.0", features = ["optimization"] }
+lzma-rust2 = { version = "0.18.0", features = ["optimization"] }
 bzip2 = "0.6.0"
 zstd = { workspace = true }
 base64 = "0.23.0"
@@ -88,7 +88,7 @@ sntpc = { version = "0.11.0", features = ["std"] }
 notify = "8.2.0"
 hex = { workspace = true }
 json-patch = "4.2.0"
-itaf = "0.2.0"
+itaf = "0.3.0"
 arc-swap = "1.9.1"
 rusqlite = { version = "0.40.0", features = ["bundled"] }
 blake3 = "1.8.5"

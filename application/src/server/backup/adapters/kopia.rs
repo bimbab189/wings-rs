@@ -1561,7 +1561,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
         let base_path = path.as_ref().to_path_buf();
         let base_oid = match self.resolve_dir_oid(&base_path).await {
             Ok(oid) => oid,
@@ -1578,6 +1578,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
         let config_file = self.config_file.clone();
         let remote = Arc::clone(&self.remote);
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         let spawn_restore = move || -> Result<std::process::ChildStdout, anyhow::Error> {
             let child = KopiaBackup::get_std_command(&config_file, &remote)
@@ -1596,7 +1597,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let stdout = spawn_restore()?;
 
                     let writer = tokio_util::io::SyncIoBridge::new(writer);
@@ -1682,7 +1683,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
                 });
             }
             f if f.is_tar() => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let stdout = spawn_restore()?;
 
                     let writer = CompressionWriter::new(

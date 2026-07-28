@@ -263,9 +263,7 @@ impl<'a> DiskLimiterExt for ZfsDatasetLimiter<'a> {
             .await?;
 
         if !output.status.success() {
-            tokio::fs::remove_dir_all(&self.filesystem.base_path)
-                .await
-                .ok();
+            super::remove_volume(self.filesystem).await.ok();
         }
 
         DISK_USAGE.write().await.remove(&self.filesystem.uuid);

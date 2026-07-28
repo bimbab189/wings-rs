@@ -1568,7 +1568,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
         let base_path = path.as_ref().to_path_buf();
         let node = match self.tree.lookup_dir(&base_path) {
             Some(node) => node,
@@ -1592,10 +1592,11 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             .api
             .file_compression_threads;
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = SyncIoBridge::new(writer);
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
@@ -1654,7 +1655,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
                 });
             }
             f if f.is_tar() => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = CompressionWriter::new(
                         SyncIoBridge::new(writer),
                         f.compression_format(),
@@ -1707,7 +1708,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
                 });
             }
             f if f.is_itaf() => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = CompressionWriter::new(
                         SyncIoBridge::new(writer),
                         f.compression_format(),

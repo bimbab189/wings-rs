@@ -202,7 +202,7 @@ impl BtrfsBackup {
         state: &crate::routes::State,
         archive_format: StreamableArchiveFormat,
         compression_level: crate::io::compression::CompressionLevel,
-    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
         let subvolume_path = Self::get_subvolume_path(&state.config, self.uuid);
 
         if tokio::fs::metadata(&subvolume_path).await.is_err() {
@@ -219,6 +219,7 @@ impl BtrfsBackup {
         let threads = state.config.load().api.file_compression_threads;
 
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         tokio::spawn(async move {
             let writer = tokio_util::io::SyncIoBridge::new(writer);
@@ -275,9 +276,11 @@ impl BtrfsBackup {
             match result {
                 Ok(mut inner) => {
                     inner.shutdown().await.ok();
+                    signal.succeed();
                 }
                 Err(err) => {
                     tracing::error!("failed to create archive for btrfs backup: {err}");
+                    signal.fail(err);
                 }
             }
         });

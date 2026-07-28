@@ -28,6 +28,16 @@ pub trait DiskLimiterExt: Send + Sync {
     async fn update_disk_limit(&self, limit: u64) -> Result<(), std::io::Error>;
 }
 
+pub(crate) async fn remove_volume(
+    filesystem: &crate::server::filesystem::Filesystem,
+) -> Result<(), std::io::Error> {
+    filesystem
+        .async_remove_dir_all(std::path::Path::new(""))
+        .await?;
+
+    tokio::fs::remove_dir(&filesystem.base_path).await
+}
+
 #[derive(ToSchema, Deserialize, Serialize, Clone, Copy, Default, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum DiskLimiterMode {

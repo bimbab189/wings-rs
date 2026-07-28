@@ -1379,7 +1379,6 @@ impl Server {
         crate::server::installation::ServerInstaller::delete_install_logs(self).await;
 
         self.diff.close().await;
-        self.filesystem.close();
 
         tokio::spawn({
             let server = self.clone();
@@ -1387,6 +1386,7 @@ impl Server {
             async move {
                 server.diff.destroy().await;
                 server.filesystem.destroy().await;
+                server.filesystem.close();
 
                 if let Some(installer) = server.installer.read().await.as_ref() {
                     installer.abort();

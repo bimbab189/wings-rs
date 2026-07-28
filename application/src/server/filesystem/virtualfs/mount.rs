@@ -347,7 +347,7 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
         self.inner
             .async_read_dir_archive(
                 path,

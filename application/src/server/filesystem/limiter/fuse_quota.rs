@@ -318,7 +318,7 @@ impl<'a> DiskLimiterExt for FuseQuotaLimiter<'a> {
             registry.write().await.remove(&self.filesystem.uuid);
         }
 
-        tokio::fs::remove_dir_all(&self.filesystem.base_path).await?;
+        super::remove_volume(self.filesystem).await?;
 
         match self.talk_to_socket("do end").await {
             Ok(response) if response.contains("OK") => {

@@ -335,7 +335,7 @@ impl<'a> DiskLimiterExt for XfsQuotaLimiter<'a> {
 
         atomic_write_etc_projects(project_id, &self.filesystem.base_path, true).await?;
 
-        tokio::fs::remove_dir_all(&self.filesystem.base_path).await?;
+        super::remove_volume(self.filesystem).await?;
         DISK_USAGE.write().await.remove(&self.filesystem.uuid);
 
         Ok(())

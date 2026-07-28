@@ -260,9 +260,7 @@ mod post {
                                     for entry in entries {
                                         let mut entry = entry?;
                                         let destination_path = entry.enclosed_path();
-                                        if destination_path.as_os_str().is_empty()
-                                            || destination_path.is_absolute()
-                                        {
+                                        if destination_path.as_os_str().is_empty() {
                                             continue;
                                         }
 
@@ -340,9 +338,7 @@ mod post {
                                             }
                                             itaf::decoder::ArchiveEntry::Hardlink(link) => {
                                                 let target_path = link.enclosed_target();
-                                                if target_path.as_os_str().is_empty()
-                                                    || target_path.is_absolute()
-                                                {
+                                                if target_path.as_os_str().is_empty() {
                                                     tracing::debug!(
                                                         path = %destination_path.display(),
                                                         "skipping hardlink with invalid target: {}",
@@ -399,13 +395,13 @@ mod post {
                                     let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
                                     for entry in entries {
                                         let mut entry = entry?;
-                                        let path = entry.path()?;
+                                        let path = server.filesystem.relative_path(&entry.path()?);
 
-                                        if path.is_absolute() {
+                                        if path.as_os_str().is_empty() {
                                             continue;
                                         }
 
-                                        let destination_path = path.as_ref();
+                                        let destination_path = path.as_path();
                                         let header = entry.header();
 
                                         match header.entry_type() {

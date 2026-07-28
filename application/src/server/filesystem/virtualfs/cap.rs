@@ -498,7 +498,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
         let names = self.inner.async_read_dir_all(path).await?;
         let file_compression_threads = self
             .server
@@ -508,6 +508,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
             .api
             .file_compression_threads;
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         tokio::spawn({
             let filesystem = self.inner.clone();
@@ -538,12 +539,14 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                         {
                             Ok(inner) => {
                                 inner.into_inner().shutdown().await.ok();
+                                signal.succeed();
                             }
                             Err(err) => {
                                 tracing::error!(
                                     "failed to create zip archive for cap vfs: {}",
                                     err
                                 );
+                                signal.fail(err);
                             }
                         }
                     }
@@ -565,12 +568,14 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                         {
                             Ok(inner) => {
                                 inner.into_inner().shutdown().await.ok();
+                                signal.succeed();
                             }
                             Err(err) => {
                                 tracing::error!(
                                     "failed to create tar archive for cap vfs: {}",
                                     err
                                 );
+                                signal.fail(err);
                             }
                         }
                     }
@@ -593,12 +598,14 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                         {
                             Ok(inner) => {
                                 inner.into_inner().shutdown().await.ok();
+                                signal.succeed();
                             }
                             Err(err) => {
                                 tracing::error!(
                                     "failed to create itaf archive for cap vfs: {}",
                                     err
                                 );
+                                signal.fail(err);
                             }
                         }
                     }
@@ -607,6 +614,10 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                             "unsupported archive format for cap vfs: {}",
                             archive_format.extension()
                         );
+                        signal.fail(format!(
+                            "unsupported archive format: {}",
+                            archive_format.extension()
+                        ));
                     }
                 }
             }

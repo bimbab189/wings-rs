@@ -433,13 +433,13 @@ impl BackupExt for WingsBackup {
                     let mut read_buffer = vec![0; crate::BUFFER_SIZE];
                     for entry in entries {
                         let mut entry = entry?;
-                        let path = entry.path()?;
+                        let path = server.filesystem.relative_path(&entry.path()?);
 
-                        if path.is_absolute() {
+                        if path.as_os_str().is_empty() {
                             continue;
                         }
 
-                        let destination_path = path.as_ref();
+                        let destination_path = path.as_path();
                         let header = entry.header();
 
                         match header.entry_type() {
@@ -585,10 +585,6 @@ impl BackupExt for WingsBackup {
                                         None => continue,
                                     };
 
-                                    if path.is_absolute() {
-                                        continue;
-                                    }
-
                                     if entry.is_dir() {
                                         server.filesystem.create_chowned_dir_all(&path)?;
                                         server.filesystem.set_permissions(
@@ -663,10 +659,6 @@ impl BackupExt for WingsBackup {
                                 Some(path) => path,
                                 None => continue,
                             };
-
-                            if path.is_absolute() {
-                                continue;
-                            }
 
                             if server
                                 .filesystem

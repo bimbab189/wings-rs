@@ -558,7 +558,7 @@ pub trait VirtualReadableFilesystem: Send + Sync {
         compression_level: CompressionLevel,
         progress: super::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error>;
+    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error>;
     async fn async_read_dir_files_archive(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
@@ -567,7 +567,7 @@ pub trait VirtualReadableFilesystem: Send + Sync {
         compression_level: CompressionLevel,
         progress: super::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
         let root_path = path.as_ref().to_path_buf();
         let is_ignored = move |file_type, path: PathBuf| {
             let stripped_path = path.strip_prefix(&root_path).unwrap_or(&path);

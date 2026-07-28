@@ -282,6 +282,7 @@ impl BackupExt for ZfsBackup {
         let ignore = Self::get_ignore(&state.config, self.uuid).await?;
 
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         tokio::spawn({
             let config = Arc::clone(&state.config);
@@ -306,12 +307,14 @@ impl BackupExt for ZfsBackup {
                         {
                             Ok(inner) => {
                                 inner.into_inner().shutdown().await.ok();
+                                signal.succeed();
                             }
                             Err(err) => {
                                 tracing::error!(
                                     "failed to create zip archive for zfs backup: {}",
                                     err
                                 );
+                                signal.fail(err);
                             }
                         }
                     }
@@ -333,12 +336,14 @@ impl BackupExt for ZfsBackup {
                         {
                             Ok(inner) => {
                                 inner.into_inner().shutdown().await.ok();
+                                signal.succeed();
                             }
                             Err(err) => {
                                 tracing::error!(
                                     "failed to create tar archive for zfs backup: {}",
                                     err
                                 );
+                                signal.fail(err);
                             }
                         }
                     }
@@ -361,12 +366,14 @@ impl BackupExt for ZfsBackup {
                         {
                             Ok(inner) => {
                                 inner.into_inner().shutdown().await.ok();
+                                signal.succeed();
                             }
                             Err(err) => {
                                 tracing::error!(
                                     "failed to create itaf archive for zfs backup: {}",
                                     err
                                 );
+                                signal.fail(err);
                             }
                         }
                     }

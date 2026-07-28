@@ -35,6 +35,6 @@ impl<'a> DiskLimiterExt for NoneLimiter<'a> {
     }
 
     async fn destroy(&self) -> Result<(), std::io::Error> {
-        tokio::fs::remove_dir_all(&self.filesystem.base_path).await
+        super::remove_volume(self.filesystem).await
     }
 }

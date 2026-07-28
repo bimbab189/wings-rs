@@ -304,7 +304,7 @@ impl<'a> DiskLimiterExt for BtrfsSubvolumeLimiter<'a> {
             .await?;
 
         if !output.status.success() {
-            tokio::fs::remove_dir_all(&self.filesystem.base_path).await?;
+            super::remove_volume(self.filesystem).await?;
         }
 
         DISK_USAGE.write().await.remove(&self.filesystem.uuid);

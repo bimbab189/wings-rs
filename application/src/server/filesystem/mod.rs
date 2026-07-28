@@ -1048,16 +1048,8 @@ impl Filesystem {
         self.disk_usage_cached_physical.store(0, Ordering::Relaxed);
         self.resource_usage.publish_disk_usage(0);
 
-        let mut directory = self.async_read_dir(Path::new("")).await?;
-        while let Some(Ok((file_type, path))) = directory.next_entry().await {
-            if file_type.is_dir() {
-                self.async_remove_dir_all(&path).await?;
-            } else {
-                self.async_remove_file(&path).await?;
-            }
-        }
-
-        Ok(())
+        // an empty path clears the contents and leaves the root itself in place
+        self.async_remove_dir_all(Path::new("")).await
     }
 
     fn chown_impl(
