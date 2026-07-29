@@ -39,8 +39,6 @@ mod get {
         Path(file_path): Path<compact_str::CompactString>,
         Query(params): Query<Params>,
     ) -> ApiResponseResult {
-        // axum percent-decodes the captured segment before this runs, so `%2F` arrives as a real
-        // separator and `join` would discard the log directory for an absolute value.
         if !crate::utils::is_single_component_file_name(&file_path) {
             return ApiResponse::error("log file not found").ok();
         }

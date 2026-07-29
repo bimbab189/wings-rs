@@ -59,13 +59,15 @@ pub struct PbsBackup {
 }
 
 fn build_config(remote: PbsBackupConfiguration) -> PbsConfig {
+    let fingerprint = remote.fingerprint().map(Into::into);
+
     PbsConfig {
         url: remote.url.into(),
         datastore: remote.datastore.into(),
         namespace: remote.namespace.map(Into::into),
         token_id: remote.token_id.into(),
         token_secret: remote.token_secret.into(),
-        fingerprint: remote.fingerprint.into(),
+        fingerprint,
         backup_id_prefix: remote.backup_id_prefix.map(Into::into),
     }
 }

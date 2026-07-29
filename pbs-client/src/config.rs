@@ -8,7 +8,7 @@ pub struct PbsConfig {
     pub namespace: Option<CompactString>,
     pub token_id: CompactString,
     pub token_secret: CompactString,
-    pub fingerprint: CompactString,
+    pub fingerprint: Option<CompactString>,
     pub backup_id_prefix: Option<CompactString>,
 }
 
@@ -33,7 +33,6 @@ impl PbsConfig {
             ("datastore", &self.datastore),
             ("token_id", &self.token_id),
             ("token_secret", &self.token_secret),
-            ("fingerprint", &self.fingerprint),
         ] {
             if value.trim().is_empty() {
                 return Err(PbsError::Config(compact_str::format_compact!(
@@ -48,7 +47,9 @@ impl PbsConfig {
             ));
         }
 
-        super::tls::normalize_fingerprint(&self.fingerprint).map_err(PbsError::Config)?;
+        if let Some(fingerprint) = &self.fingerprint {
+            super::tls::normalize_fingerprint(fingerprint).map_err(PbsError::Config)?;
+        }
 
         Ok(())
     }

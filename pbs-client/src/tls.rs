@@ -5,6 +5,7 @@ use rustls::{
     crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature},
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
+use rustls_platform_verifier::BuilderVerifierExt;
 use sha2::{Digest, Sha256};
 use std::{fmt::Write, sync::Arc};
 
@@ -123,16 +124,29 @@ impl ServerCertVerifier for FingerprintVerifier {
     }
 }
 
-pub fn build_client_config(fingerprint: &str) -> Result<ClientConfig, CompactString> {
-    let expected = normalize_fingerprint(fingerprint)?;
+pub fn build_client_config(fingerprint: Option<&str>) -> Result<ClientConfig, CompactString> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-
-    let config = ClientConfig::builder_with_provider(Arc::clone(&provider))
+    let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()
-        .map_err(|err| CompactString::from(err.to_string()))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(FingerprintVerifier { expected, provider }))
-        .with_no_client_auth();
+        .map_err(|err| CompactString::from(err.to_string()))?;
+
+    let config = match fingerprint {
+        Some(fingerprint) => {
+            let expected = normalize_fingerprint(fingerprint)?;
+
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(FingerprintVerifier {
+                    expected,
+                    provider,
+                }))
+                .with_no_client_auth()
+        }
+        None => builder
+            .with_platform_verifier()
+            .map_err(|err| CompactString::from(err.to_string()))?
+            .with_no_client_auth(),
+    };
 
     Ok(config)
 }

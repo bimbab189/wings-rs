@@ -50,11 +50,22 @@ pub struct PbsBackupConfiguration {
     pub namespace: Option<String>,
     pub token_id: String,
     pub token_secret: String,
-    pub fingerprint: String,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
     pub backup_id_prefix: Option<String>,
     #[serde(default)]
     pub server_uuid: Option<uuid::Uuid>,
     pub backup_created: chrono::DateTime<chrono::Utc>,
+}
+
+impl PbsBackupConfiguration {
+    #[inline]
+    pub fn fingerprint(&self) -> Option<&str> {
+        self.fingerprint
+            .as_deref()
+            .map(str::trim)
+            .filter(|fingerprint| !fingerprint.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, ToSchema, Deserialize)]
@@ -62,8 +73,19 @@ pub struct KopiaBackupConfiguration {
     pub url: String,
     pub username: String,
     pub password: String,
-    pub fingerprint: String,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
     pub tags: BTreeMap<String, String>,
+}
+
+impl KopiaBackupConfiguration {
+    #[inline]
+    pub fn fingerprint(&self) -> Option<&str> {
+        self.fingerprint
+            .as_deref()
+            .map(str::trim)
+            .filter(|fingerprint| !fingerprint.is_empty())
+    }
 }
 
 pub async fn set_backup_status(

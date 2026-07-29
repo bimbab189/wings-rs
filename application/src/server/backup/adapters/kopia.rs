@@ -191,14 +191,19 @@ impl KopiaBackup {
             .split_once('@')
             .unwrap_or((&remote.username, "wings"));
 
-        let output = Self::get_tokio_command(config_file, remote)
+        let mut command = Self::get_tokio_command(config_file, remote);
+        command
             .arg("repository")
             .arg("connect")
             .arg("server")
             .arg("--url")
-            .arg(&remote.url)
-            .arg("--server-cert-fingerprint")
-            .arg(&remote.fingerprint)
+            .arg(&remote.url);
+
+        if let Some(fingerprint) = remote.fingerprint() {
+            command.arg("--server-cert-fingerprint").arg(fingerprint);
+        }
+
+        let output = command
             .arg("--override-username")
             .arg(username)
             .arg("--override-hostname")
