@@ -1,5 +1,32 @@
 use super::ServerConfigurationFile;
 
+const MAX_NESTING_DEPTH: usize = 256;
+
+fn check_nesting_depth(content: &str) -> Result<(), anyhow::Error> {
+    let mut reader = xml::reader::EventReader::new(content.as_bytes());
+    let mut depth = 0;
+
+    loop {
+        match reader.next() {
+            Ok(xml::reader::XmlEvent::StartElement { .. }) => {
+                depth += 1;
+
+                if depth > MAX_NESTING_DEPTH {
+                    return Err(anyhow::anyhow!(
+                        "xml nesting exceeds the maximum depth of {MAX_NESTING_DEPTH}"
+                    ));
+                }
+            }
+            Ok(xml::reader::XmlEvent::EndElement { .. }) => depth = depth.saturating_sub(1),
+            Ok(xml::reader::XmlEvent::EndDocument) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
 pub struct XmlFileParser;
 
 #[async_trait::async_trait]
@@ -19,6 +46,8 @@ impl super::ProcessConfigurationFileParser for XmlFileParser {
         } else {
             content
         };
+
+        check_nesting_depth(content)?;
 
         let mut root = xmltree::Element::parse(content.as_bytes())?;
 
@@ -227,6 +256,60 @@ fn update_xml_wildcard(
 mod tests {
     use super::{super::*, *};
     use serde_json::json;
+
+    // check_nesting_depth
+
+    fn nested(depth: usize) -> String {
+        let mut xml = String::new();
+        for _ in 0..depth {
+            xml.push_str("<a>");
+        }
+        for _ in 0..depth {
+            xml.push_str("</a>");
+        }
+
+        xml
+    }
+
+    #[test]
+    fn depth_accepts_ordinary_configs() {
+        assert!(check_nesting_depth("<root><a><b>x</b></a></root>").is_ok());
+        assert!(check_nesting_depth(&nested(MAX_NESTING_DEPTH)).is_ok());
+    }
+
+    #[test]
+    fn depth_rejects_beyond_the_limit() {
+        assert!(check_nesting_depth(&nested(MAX_NESTING_DEPTH + 1)).is_err());
+    }
+
+    #[test]
+    fn depth_rejects_the_unclosed_overflow_payload() {
+        // the exploit shape: unclosed elements, ~5KiB is enough to abort the process unguarded
+        let mut xml = String::new();
+        for _ in 0..5000 {
+            xml.push_str("<a>");
+        }
+
+        assert!(check_nesting_depth(&xml).is_err());
+    }
+
+    #[test]
+    fn depth_counts_siblings_separately_from_nesting() {
+        let mut xml = String::from("<root>");
+        for _ in 0..(MAX_NESTING_DEPTH * 4) {
+            xml.push_str("<a>x</a>");
+        }
+        xml.push_str("</root>");
+
+        assert!(check_nesting_depth(&xml).is_ok());
+    }
+
+    #[test]
+    fn depth_leaves_malformed_content_to_the_parser() {
+        // not our error to report - shallow enough to parse, xmltree gives the real message
+        assert!(check_nesting_depth("<a></b>").is_ok());
+        assert!(check_nesting_depth("not xml at all").is_ok());
+    }
 
     fn rep(
         m: &str,

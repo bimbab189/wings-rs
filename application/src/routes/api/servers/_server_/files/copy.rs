@@ -184,6 +184,16 @@ mod post {
             .filesystem
             .relative_path(&destination_path.join(destination_file_name));
 
+        if destination_filesystem.is_primary_server_fs()
+            && server
+                .filesystem
+                .is_ignored(&destination_path, metadata.file_type.is_dir())
+        {
+            return ApiResponse::error("destination file not found")
+                .with_status(StatusCode::EXPECTATION_FAILED)
+                .ok();
+        }
+
         if explicit_name
             && !data.overwrite
             && destination_filesystem

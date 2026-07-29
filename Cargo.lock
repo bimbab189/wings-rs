@@ -6113,6 +6113,7 @@ dependencies = [
  "utoipa",
  "utoipa-axum",
  "uuid",
+ "xml",
  "xmltree",
  "yrs",
  "zip",

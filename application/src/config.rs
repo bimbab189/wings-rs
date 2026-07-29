@@ -1498,6 +1498,13 @@ impl Config {
             tracing::warn!("you are treading on thin ice. proceed at your own risk.");
         }
 
+        #[cfg(unix)]
+        if cfg.system.user.uid == 0 || cfg.system.user.gid == 0 {
+            return Err(anyhow::anyhow!(
+                "refusing to use user with UID or GID of 0 (root), please check your wings config and change system.username to a non-root user"
+            ));
+        }
+
         if cfg.remote.is_empty() {
             return Err(anyhow::anyhow!(
                 "invalid remote configuration, cannot connect to panel without a remote"

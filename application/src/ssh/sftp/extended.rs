@@ -39,7 +39,7 @@ pub async fn handle_extended(
 
     match command.as_str() {
         "check-file" | "check-file-name" => {
-            if !sftp_session.has_permission(Permission::FileRead) {
+            if !sftp_session.has_permission(Permission::FileReadContent) {
                 return Err(StatusCode::PermissionDenied);
             }
 

@@ -180,6 +180,8 @@ impl UserPermissionsMap {
         path: impl AsRef<std::path::Path>,
         is_dir: bool,
     ) -> bool {
+        let path = crate::server::filesystem::cap::CapFilesystem::resolve_path(path.as_ref());
+
         let mut map = self.map.lock();
         if let Some((_, ignored, last_access)) = map.get_mut(&user_uuid) {
             *last_access = std::time::Instant::now();

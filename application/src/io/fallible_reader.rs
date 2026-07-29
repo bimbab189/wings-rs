@@ -83,21 +83,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for FallibleReader<R> {
 
         let filled = buf.filled().len();
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
-            // Bytes came through, so the producer is still mid-stream and its
-            // outcome cannot matter yet. Anything already buffered is handed
-            // over before a failure is surfaced.
             Poll::Ready(Ok(())) if buf.filled().len() != filled => return Poll::Ready(Ok(())),
             Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            // Either EOF, or drained but still open. Both mean the inner stream
-            // has nothing left to give right now, so the outcome decides.
             Poll::Ready(Ok(())) | Poll::Pending => {}
         }
 
-        // Note the `Poll::Pending` arm above: dropping a `tokio::io::simplex`
-        // write half does *not* close the stream, only `shutdown` does, and the
-        // producer failure paths cannot shut down a writer they no longer own.
-        // Consulting the outcome on EOF alone would therefore park here forever
-        // whenever a producer failed, instead of reporting the failure.
         if let Outcome::Waiting(receiver) = &mut this.outcome {
             let resolved = match Pin::new(receiver).poll(cx) {
                 Poll::Pending => return Poll::Pending,
@@ -112,11 +102,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for FallibleReader<R> {
         }
 
         match &this.outcome {
-            // Kept, rather than taken, so a failure keeps being reported instead
-            // of decaying into a clean end of stream on the next read.
             Outcome::Failed(err) => Poll::Ready(Err(std::io::Error::other(err.clone()))),
-            // A producer that reported success has no more bytes to hand over,
-            // so a drained stream is the end of the stream.
             _ => Poll::Ready(Ok(())),
         }
     }

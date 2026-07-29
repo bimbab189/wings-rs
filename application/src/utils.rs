@@ -32,6 +32,15 @@ pub fn draw_progress_bar(width: usize, current: f64, total: f64) -> String {
     format!("[{bar}] {formatted_percentage}")
 }
 
+pub fn is_single_component_file_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(component)), None) => component.to_str() == Some(name),
+        _ => false,
+    }
+}
+
 pub fn parse_content_disposition_filename(header: &str) -> Option<String> {
     static RE_STAR: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"(?i)filename\*=utf-8''([^;]+)").expect("Failed to compile regex")
@@ -181,6 +190,11 @@ pub fn strip_paths(value: &mut serde_json::Value, paths: &[&str]) {
             };
 
             if parts.peek().is_none() {
+                map.remove(part);
+                break;
+            }
+
+            if map.get(part).is_some_and(|next| !next.is_object()) {
                 map.remove(part);
                 break;
             }
@@ -441,6 +455,42 @@ mod tests {
     use super::*;
     use std::cmp::Ordering;
 
+    // is_single_component_file_name
+
+    #[test]
+    fn single_component_accepts_plain_file_names() {
+        assert!(is_single_component_file_name("loot.txt"));
+        assert!(is_single_component_file_name("wings.log"));
+        assert!(is_single_component_file_name("wings.log.gz"));
+        assert!(is_single_component_file_name("server.tar.gz"));
+        assert!(is_single_component_file_name(".env"));
+        assert!(is_single_component_file_name("..hidden"));
+    }
+
+    #[test]
+    fn single_component_rejects_traversal_and_separators() {
+        assert!(!is_single_component_file_name("../protected.jar"));
+        assert!(!is_single_component_file_name("../protected.jar/."));
+        assert!(!is_single_component_file_name("a/b"));
+        assert!(!is_single_component_file_name("protected.jar/"));
+    }
+
+    #[test]
+    fn single_component_rejects_the_decoded_log_traversals() {
+        // what `%2Fetc%2Fshadow` and `%2Froot%2F.ssh%2Fid_rsa` decode to before the join
+        assert!(!is_single_component_file_name("/etc/shadow"));
+        assert!(!is_single_component_file_name("/root/.ssh/id_rsa"));
+        assert!(!is_single_component_file_name("/proc/self/environ"));
+    }
+
+    #[test]
+    fn single_component_rejects_empty_and_dot_names() {
+        assert!(!is_single_component_file_name(""));
+        assert!(!is_single_component_file_name("."));
+        assert!(!is_single_component_file_name(".."));
+        assert!(!is_single_component_file_name("./x"));
+    }
+
     // draw_progress_bar
 
     fn bar_inner(s: &str) -> &str {
@@ -588,10 +638,29 @@ mod tests {
     }
 
     #[test]
-    fn strip_paths_through_non_object_is_noop() {
+    fn strip_paths_removes_a_non_object_standing_in_for_a_parent() {
         let mut v = serde_json::json!({"a": 5});
         strip_paths(&mut v, &["a.b"]);
-        assert_eq!(v, serde_json::json!({"a": 5}));
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    fn strip_paths_removes_a_nulled_parent() {
+        // `json_patch::merge` treats null as a delete, so a nulled parent would drop the
+        // protected leaf and let it come back as a serde default
+        let mut v = serde_json::json!({"system": null});
+        strip_paths(&mut v, &["system.user.uid"]);
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    fn strip_paths_removes_a_nulled_intermediate() {
+        let mut v = serde_json::json!({"system": {"user": null, "sftp": {"bind_port": 2022}}});
+        strip_paths(&mut v, &["system.user.uid"]);
+        assert_eq!(
+            v,
+            serde_json::json!({"system": {"sftp": {"bind_port": 2022}}})
+        );
     }
 
     #[test]

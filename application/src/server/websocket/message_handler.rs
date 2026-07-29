@@ -450,6 +450,7 @@ pub async fn handle_message(
                         .unsubscribe(
                             server,
                             websocket_handler.connection_id,
+                            user_uuid,
                             &path,
                             message.args.get(1).map(|s| s.as_str()),
                         )
@@ -468,6 +469,7 @@ pub async fn handle_message(
                         .apply_update(
                             server,
                             websocket_handler.connection_id,
+                            user_uuid,
                             &path,
                             finished == "1",
                             chunk,
@@ -482,7 +484,13 @@ pub async fn handle_message(
 
                     server
                         .collab
-                        .relay_awareness(server, websocket_handler.connection_id, &path, payload)
+                        .relay_awareness(
+                            server,
+                            websocket_handler.connection_id,
+                            user_uuid,
+                            &path,
+                            payload,
+                        )
                         .await
                 }
                 WebsocketEvent::FileCollabSave => {
@@ -505,7 +513,7 @@ pub async fn handle_message(
                 WebsocketEvent::FileCollabReload => {
                     server
                         .collab
-                        .reload(server, websocket_handler.connection_id, &path)
+                        .reload(server, websocket_handler.connection_id, user_uuid, &path)
                         .await
                 }
                 _ => return Ok(()),

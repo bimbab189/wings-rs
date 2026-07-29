@@ -208,7 +208,10 @@ impl Filesystem {
     }
 
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        self.disk_ignored.load().matched(path, is_dir).is_ignore()
+        self.disk_ignored
+            .load()
+            .matched(self.relative_path(path), is_dir)
+            .is_ignore()
     }
 
     pub fn get_ignored(&self) -> ignore::gitignore::Gitignore {
@@ -374,6 +377,10 @@ impl Filesystem {
                 break 'archivefs;
             }
 
+            if self.is_ignored(&archive_path, false) {
+                break 'archivefs;
+            }
+
             let inner_path = match path.strip_prefix(&archive_path) {
                 Ok(p) => p,
                 Err(_) => break 'archivefs,
@@ -460,6 +467,11 @@ impl Filesystem {
 
         let (mount_match, mount_infos) = {
             let server_config = server.configuration.read().await;
+            let allowed = if server_config.mounts.is_empty() {
+                crate::server::configuration::AllowedMounts::default()
+            } else {
+                crate::server::configuration::AllowedMounts::load(&server.app_state.config).await
+            };
 
             let mut match_result = None;
             let mut infos = Vec::new();
@@ -468,17 +480,12 @@ impl Filesystem {
                 let Some(relative_target) = mount.target.strip_prefix("/home/container/") else {
                     continue;
                 };
-                if relative_target.is_empty()
-                    || server
-                        .app_state
-                        .config
-                        .load()
-                        .allowed_mounts
-                        .iter()
-                        .all(|am| !mount.source.starts_with(&**am))
-                {
+                if relative_target.is_empty() {
                     continue;
                 }
+                let Ok(source_path) = mount.resolve_allowed_source(&allowed).await else {
+                    continue;
+                };
 
                 infos.push(virtualfs::mount::MountInfo {
                     relative_target: PathBuf::from(relative_target),
@@ -489,11 +496,8 @@ impl Filesystem {
                     if path.starts_with(relative_target_path)
                         && let Ok(inner_path) = path.strip_prefix(relative_target_path)
                     {
-                        match_result = Some((
-                            inner_path.to_path_buf(),
-                            PathBuf::from(&*mount.source),
-                            mount.read_only,
-                        ));
+                        match_result =
+                            Some((inner_path.to_path_buf(), source_path, mount.read_only));
                     }
                 }
             }
@@ -542,6 +546,11 @@ impl Filesystem {
 
         let mount_match = {
             let server_config = server.configuration.read().await;
+            let allowed = if server_config.mounts.is_empty() {
+                crate::server::configuration::AllowedMounts::default()
+            } else {
+                crate::server::configuration::AllowedMounts::load(&server.app_state.config).await
+            };
 
             let mut result: Option<(PathBuf, PathBuf, bool)> = None;
             for mount in &server_config.mounts {
@@ -551,28 +560,18 @@ impl Filesystem {
                 if relative_target.is_empty() {
                     continue;
                 }
-                if server
-                    .app_state
-                    .config
-                    .load()
-                    .allowed_mounts
-                    .iter()
-                    .all(|am| !mount.source.starts_with(&**am))
-                {
-                    continue;
-                }
 
                 let relative_target_path = Path::new(relative_target);
                 if !path.starts_with(relative_target_path) {
                     continue;
                 }
 
+                let Ok(source_path) = mount.resolve_allowed_source(&allowed).await else {
+                    continue;
+                };
+
                 if let Ok(inner_path) = path.strip_prefix(relative_target_path) {
-                    result = Some((
-                        inner_path.to_path_buf(),
-                        PathBuf::from(&*mount.source),
-                        mount.read_only,
-                    ));
+                    result = Some((inner_path.to_path_buf(), source_path, mount.read_only));
                     break;
                 }
             }
@@ -1048,7 +1047,6 @@ impl Filesystem {
         self.disk_usage_cached_physical.store(0, Ordering::Relaxed);
         self.resource_usage.publish_disk_usage(0);
 
-        // an empty path clears the contents and leaves the root itself in place
         self.async_remove_dir_all(Path::new("")).await
     }
 

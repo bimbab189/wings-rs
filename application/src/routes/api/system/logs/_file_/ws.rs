@@ -23,7 +23,7 @@ pub async fn handle_ws(
     Query(params): Query<Params>,
 ) -> Response {
     ws.on_upgrade(move |socket| async move {
-        if file_path.contains("..") {
+        if !crate::utils::is_single_component_file_name(&file_path) {
             return;
         }
 

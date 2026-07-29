@@ -1361,7 +1361,13 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::PermissionDenied);
         }
 
-        let end = offset.saturating_add(data.len() as u64);
+        let Some(end) = offset
+            .checked_add(data.len() as u64)
+            .filter(|end| *end <= i64::MAX as u64)
+        else {
+            return Err(StatusCode::BadMessage);
+        };
+
         let delta = if handle.append {
             data.len() as i64
         } else {
@@ -1400,7 +1406,7 @@ impl russh_sftp::server::Handler for SftpSession {
                             .path_components
                             .get(0..handle.path_components.len() - 1)
                             .ok_or(StatusCode::Failure)?,
-                        -delta,
+                        delta.saturating_neg(),
                         true,
                     )
                     .await;
@@ -1414,7 +1420,7 @@ impl russh_sftp::server::Handler for SftpSession {
                             .path_components
                             .get(0..handle.path_components.len() - 1)
                             .ok_or(StatusCode::Failure)?,
-                        -delta,
+                        delta.saturating_neg(),
                         true,
                     )
                     .await;

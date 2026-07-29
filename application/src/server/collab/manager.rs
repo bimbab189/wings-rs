@@ -376,6 +376,7 @@ impl CollabManager {
     async fn resolve(
         &self,
         server: &crate::server::Server,
+        user_uuid: uuid::Uuid,
         raw_path: &str,
     ) -> Result<
         (
@@ -406,7 +407,9 @@ impl CollabManager {
         }
 
         let path = root.join(file_name);
-        if server.filesystem.is_ignored(&path, false) {
+        if server.filesystem.is_ignored(&path, false)
+            || server.user_permissions.is_ignored(user_uuid, &path, false)
+        {
             return Err(CollabError::User("file not found"));
         }
 
@@ -473,7 +476,7 @@ impl CollabManager {
         editor: Option<&str>,
     ) -> Result<(), CollabError> {
         let editor = editor_id(editor)?;
-        let (path, key, filesystem) = self.resolve(server, raw_path).await?;
+        let (path, key, filesystem) = self.resolve(server, user_uuid, raw_path).await?;
 
         let config = self.config.load();
         let size_cap = config.system.file_collaboration.file_size_cap;
@@ -731,9 +734,10 @@ impl CollabManager {
         &self,
         server: &crate::server::Server,
         connection_id: uuid::Uuid,
+        user_uuid: uuid::Uuid,
         raw_path: &str,
     ) -> Result<(compact_str::CompactString, Arc<CollabSession>), CollabError> {
-        let (_, key, _) = self.resolve(server, raw_path).await?;
+        let (_, key, _) = self.resolve(server, user_uuid, raw_path).await?;
 
         if !self
             .connections
@@ -756,10 +760,12 @@ impl CollabManager {
         Ok((key, session))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn apply_update(
         &self,
         server: &crate::server::Server,
         connection_id: uuid::Uuid,
+        user_uuid: uuid::Uuid,
         raw_path: &str,
         finished: bool,
         chunk: &str,
@@ -767,7 +773,7 @@ impl CollabManager {
     ) -> Result<(), CollabError> {
         let editor = editor_id(editor)?;
         let (key, session) = self
-            .subscribed_session(server, connection_id, raw_path)
+            .subscribed_session(server, connection_id, user_uuid, raw_path)
             .await?;
 
         let size_cap = self.config.load().system.file_collaboration.file_size_cap;
@@ -824,10 +830,11 @@ impl CollabManager {
 
             if overflow {
                 let mut content = guard.content();
-                content.truncate(size_cap as usize);
-                while !content.is_char_boundary(content.len()) {
-                    content.pop();
+                let mut cap = (size_cap as usize).min(content.len());
+                while cap > 0 && !content.is_char_boundary(cap) {
+                    cap -= 1;
                 }
+                content.truncate(cap);
                 *guard = CollabDoc::new(&content);
 
                 true
@@ -867,11 +874,12 @@ impl CollabManager {
         &self,
         server: &crate::server::Server,
         connection_id: uuid::Uuid,
+        user_uuid: uuid::Uuid,
         raw_path: &str,
         payload: &str,
     ) -> Result<(), CollabError> {
         let (key, session) = self
-            .subscribed_session(server, connection_id, raw_path)
+            .subscribed_session(server, connection_id, user_uuid, raw_path)
             .await?;
 
         match BASE64
@@ -922,9 +930,9 @@ impl CollabManager {
         expected_hash: Option<&str>,
     ) -> Result<(), CollabError> {
         let (key, session) = self
-            .subscribed_session(server, connection_id, raw_path)
+            .subscribed_session(server, connection_id, user_uuid, raw_path)
             .await?;
-        let (path, _, filesystem) = self.resolve(server, raw_path).await?;
+        let (path, _, filesystem) = self.resolve(server, user_uuid, raw_path).await?;
         let parent = Path::new(raw_path)
             .parent()
             .ok_or(CollabError::User("file has no parent"))?;
@@ -1092,10 +1100,11 @@ impl CollabManager {
         &self,
         server: &crate::server::Server,
         connection_id: uuid::Uuid,
+        user_uuid: uuid::Uuid,
         raw_path: &str,
     ) -> Result<(), CollabError> {
         let (key, session) = self
-            .subscribed_session(server, connection_id, raw_path)
+            .subscribed_session(server, connection_id, user_uuid, raw_path)
             .await?;
         let size_cap = self.config.load().system.file_collaboration.file_size_cap;
 
@@ -1124,13 +1133,14 @@ impl CollabManager {
         &self,
         server: &crate::server::Server,
         connection_id: uuid::Uuid,
+        user_uuid: uuid::Uuid,
         raw_path: &str,
         editor: Option<&str>,
     ) -> Result<(), CollabError> {
         let editor = editor_id(editor)?;
 
         let resolved = self
-            .resolve(server, raw_path)
+            .resolve(server, user_uuid, raw_path)
             .await
             .ok()
             .map(|(_, key, _)| key);

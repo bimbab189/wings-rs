@@ -22,6 +22,9 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+const MAX_CHECKSUM_LEN: usize = 1024;
+const MAX_IGNORE_LEN: usize = 64 * 1024;
+
 pub struct BackupSender {
     state: crate::routes::State,
     capabilities: Option<crate::server::transfer::TransferCapabilities>,
@@ -316,7 +319,7 @@ impl BackupReceiver {
     pub fn handle_field(
         &mut self,
         runtime: &tokio::runtime::Handle,
-        field: axum::extract::multipart::Field<'_>,
+        mut field: axum::extract::multipart::Field<'_>,
     ) -> Result<(), anyhow::Error> {
         tracing::debug!(
             "processing backup field: {}",
@@ -342,7 +345,10 @@ impl BackupReceiver {
                             ));
                         }
                     };
-                    let expected = runtime.block_on(field.text())?;
+                    let expected = runtime.block_on(crate::utils::read_limited_multipart_field(
+                        &mut field,
+                        MAX_CHECKSUM_LEN,
+                    ))?;
 
                     if checksum != expected {
                         return Err(anyhow::anyhow!(
@@ -367,7 +373,10 @@ impl BackupReceiver {
                             &self.state.config,
                             uuid,
                         );
-                    let contents = runtime.block_on(field.text())?;
+                    let contents = runtime.block_on(crate::utils::read_limited_multipart_field(
+                        &mut field,
+                        MAX_IGNORE_LEN,
+                    ))?;
 
                     if let Err(err) = std::fs::create_dir_all(&backup_path)
                         .and_then(|_| std::fs::write(&ignore_path, contents))

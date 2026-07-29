@@ -25,6 +25,23 @@ use utoipa::ToSchema;
 pub mod create;
 pub mod multi_reader;
 
+fn resolve_entry_path(destination: &Path, path: &Path) -> Option<PathBuf> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+
+    Some(super::cap::CapFilesystem::resolve_path(
+        &destination.join(path),
+    ))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ArchiveType {
     None,
@@ -423,6 +440,12 @@ impl Archive {
                     None => return Err(anyhow::anyhow!("Invalid file name")),
                 };
 
+                if destination_filesystem.is_primary_server_fs()
+                    && self.server.filesystem.is_ignored(&file_name, false)
+                {
+                    return Err(anyhow::anyhow!("Destination file is ignored"));
+                }
+
                 let metadata = self.server.filesystem.async_metadata(&self.path).await?;
 
                 let file = self.file.into_std().await;
@@ -497,11 +520,11 @@ impl Archive {
                         let mut entry = entry?;
                         let path = entry.path()?;
 
-                        if path.is_absolute() {
+                        let Some(destination_path) =
+                            resolve_entry_path(&destination, path.as_ref())
+                        else {
                             continue;
-                        }
-
-                        let destination_path = destination.join(path.as_ref());
+                        };
                         let header = entry.header();
 
                         if destination_filesystem.is_primary_server_fs()
@@ -681,11 +704,11 @@ impl Archive {
                                         None => continue,
                                     };
 
-                                    if path.is_absolute() {
+                                    let Some(destination_path) =
+                                        resolve_entry_path(&destination, &path)
+                                    else {
                                         continue;
-                                    }
-
-                                    let destination_path = destination.join(path);
+                                    };
 
                                     if destination_filesystem.is_primary_server_fs()
                                         && server
@@ -790,11 +813,11 @@ impl Archive {
                                     None => continue,
                                 };
 
-                                if path.is_absolute() {
+                                let Some(destination_path) =
+                                    resolve_entry_path(&destination, &path)
+                                else {
                                     continue;
-                                }
-
-                                let destination_path = destination.join(path);
+                                };
 
                                 if destination_filesystem.is_primary_server_fs()
                                     && self
@@ -879,17 +902,18 @@ impl Archive {
                             None => break,
                         };
 
-                        let path = &entry.entry().filename;
-                        if path.is_absolute() {
+                        let Some(destination_path) =
+                            resolve_entry_path(&destination, &entry.entry().filename)
+                        else {
                             archive = entry.skip()?;
                             continue;
-                        }
+                        };
 
                         if destination_filesystem.is_primary_server_fs()
                             && self
                                 .server
                                 .filesystem
-                                .is_ignored(path, entry.entry().is_directory())
+                                .is_ignored(&destination_path, entry.entry().is_directory())
                         {
                             archive = entry.skip()?;
                             continue;
@@ -898,8 +922,6 @@ impl Archive {
                         if listener.is_aborted() {
                             return Err(anyhow::anyhow!("operation aborted"));
                         }
-
-                        let destination_path = destination.join(path);
 
                         if entry.entry().is_directory() {
                             destination_filesystem.create_dir_all(&destination_path)?;
@@ -1037,7 +1059,11 @@ impl Archive {
                                         return Ok(true);
                                     }
 
-                                    let destination_path = destination.join(path);
+                                    let Some(destination_path) =
+                                        resolve_entry_path(&destination, Path::new(path))
+                                    else {
+                                        return Ok(true);
+                                    };
 
                                     if destination_filesystem.is_primary_server_fs()
                                         && server
@@ -1119,7 +1145,11 @@ impl Archive {
                                     continue;
                                 }
 
-                                let destination_path = destination.join(path);
+                                let Some(destination_path) =
+                                    resolve_entry_path(&destination, Path::new(path))
+                                else {
+                                    continue;
+                                };
 
                                 if destination_filesystem.is_primary_server_fs()
                                     && self
@@ -1198,7 +1228,12 @@ impl Archive {
                             return Ok(());
                         }
 
-                        let destination_path = destination.join(entry.name());
+                        let Some(destination_path) =
+                            resolve_entry_path(destination, Path::new(entry.name()))
+                        else {
+                            return Ok(());
+                        };
+
                         if destination_filesystem.is_primary_server_fs()
                             && server
                                 .filesystem
@@ -1370,7 +1405,10 @@ impl Archive {
                             Ok(relative) if !relative.as_os_str().is_empty() => relative,
                             _ => continue,
                         };
-                        let destination_path = destination.join(relative);
+                        let Some(destination_path) = resolve_entry_path(&destination, relative)
+                        else {
+                            continue;
+                        };
 
                         let is_dir = matches!(entry.kind(), pbs_client::pxar::EntryKind::Directory);
                         if destination_filesystem.is_primary_server_fs()
@@ -1460,5 +1498,64 @@ impl Archive {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // resolve_entry_path
+
+    #[test]
+    fn resolve_entry_path_resolves_plain_entries_under_the_destination() {
+        assert_eq!(
+            resolve_entry_path(Path::new("logs"), Path::new("a/b.txt")),
+            Some(PathBuf::from("logs/a/b.txt"))
+        );
+        assert_eq!(
+            resolve_entry_path(Path::new(""), Path::new("a/b.txt")),
+            Some(PathBuf::from("a/b.txt"))
+        );
+    }
+
+    #[test]
+    fn resolve_entry_path_strips_current_dir_components_that_tar_writers_emit() {
+        assert_eq!(
+            resolve_entry_path(Path::new("logs"), Path::new("./a/./b.txt")),
+            Some(PathBuf::from("logs/a/b.txt"))
+        );
+        assert_eq!(
+            resolve_entry_path(Path::new(""), Path::new("./server.properties")),
+            Some(PathBuf::from("server.properties"))
+        );
+    }
+
+    #[test]
+    fn resolve_entry_path_rejects_parent_dir_escapes() {
+        assert_eq!(
+            resolve_entry_path(Path::new("logs"), Path::new("../config/secrets.yml")),
+            None
+        );
+        assert_eq!(
+            resolve_entry_path(Path::new("logs"), Path::new("a/../../config/secrets.yml")),
+            None
+        );
+        assert_eq!(
+            resolve_entry_path(Path::new(""), Path::new("x/../config/config.yml")),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_entry_path_rejects_absolute_entries() {
+        assert_eq!(
+            resolve_entry_path(Path::new("logs"), Path::new("/config/secrets.yml")),
+            None
+        );
+        assert_eq!(
+            resolve_entry_path(Path::new(""), Path::new("/etc/passwd")),
+            None
+        );
     }
 }

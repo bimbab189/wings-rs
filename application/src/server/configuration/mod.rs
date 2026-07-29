@@ -1,11 +1,25 @@
+use anyhow::Context;
 use compact_str::ToCompactString;
 use serde::{Deserialize, Serialize};
 use serde_default::DefaultFromSerde;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 use utoipa::ToSchema;
 
 pub mod process;
 pub mod seccomp;
+
+fn is_plain_absolute_path(path: &Path) -> bool {
+    path.is_absolute()
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+}
 
 #[derive(ToSchema, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct Mount {
@@ -15,6 +29,84 @@ pub struct Mount {
     pub target: compact_str::CompactString,
     pub source: compact_str::CompactString,
     pub read_only: bool,
+}
+
+#[derive(Default)]
+pub struct AllowedMounts(Vec<PathBuf>);
+
+impl AllowedMounts {
+    pub async fn load(config: &crate::config::Config) -> Self {
+        let configured = config.load().allowed_mounts.clone();
+
+        Self::from_entries(configured).await
+    }
+
+    pub async fn from_entries<E: AsRef<Path>>(entries: impl IntoIterator<Item = E>) -> Self {
+        let entries = entries.into_iter();
+
+        let mut allowed = Vec::with_capacity(entries.size_hint().0);
+        for entry in entries {
+            let entry = entry.as_ref();
+
+            match tokio::fs::canonicalize(entry).await {
+                Ok(path) => allowed.push(path),
+                Err(err) => {
+                    tracing::warn!(
+                        "ignoring allowed_mounts entry {}, it could not be resolved: {:#?}",
+                        entry.display(),
+                        err
+                    );
+                }
+            }
+        }
+
+        Self(allowed)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Mount {
+    pub async fn resolve_allowed_source(
+        &self,
+        allowed: &AllowedMounts,
+    ) -> Result<PathBuf, anyhow::Error> {
+        if allowed.is_empty() {
+            return Err(anyhow::anyhow!("allowed_mounts is empty"));
+        }
+
+        if !is_plain_absolute_path(Path::new(self.target.as_str())) {
+            return Err(anyhow::anyhow!(
+                "target {} is not an absolute, normalized path",
+                self.target
+            ));
+        }
+
+        let source = Path::new(self.source.as_str());
+        if !is_plain_absolute_path(source) {
+            return Err(anyhow::anyhow!(
+                "source {} is not an absolute, normalized path",
+                self.source
+            ));
+        }
+
+        let source = tokio::fs::canonicalize(source)
+            .await
+            .with_context(|| format!("source {} could not be resolved", self.source))?;
+
+        if !allowed.0.iter().any(|allowed| source.starts_with(allowed)) {
+            return Err(anyhow::anyhow!(
+                "source {} resolves to {}, which is outside allowed_mounts",
+                self.source,
+                source.display()
+            ));
+        }
+
+        Ok(source)
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -294,17 +386,30 @@ impl ServerConfiguration {
             });
         }
 
-        for mount in &self.mounts {
-            if config
-                .load()
-                .allowed_mounts
-                .iter()
-                .all(|m| !mount.source.starts_with(&**m))
-            {
-                continue;
-            }
+        if !self.mounts.is_empty() {
+            let allowed = AllowedMounts::load(config).await;
 
-            mounts.push(mount.clone());
+            for mount in &self.mounts {
+                let source = match mount.resolve_allowed_source(&allowed).await {
+                    Ok(source) => source,
+                    Err(err) => {
+                        tracing::warn!(
+                            server = %self.uuid,
+                            "not mounting {} -> {}: {:#}",
+                            mount.source,
+                            mount.target,
+                            err
+                        );
+
+                        continue;
+                    }
+                };
+
+                mounts.push(Mount {
+                    source: source.to_string_lossy().to_compact_string(),
+                    ..mount.clone()
+                });
+            }
         }
 
         mounts
@@ -443,5 +548,213 @@ impl ServerConfiguration {
                 )
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mount(source: impl AsRef<Path>) -> Mount {
+        Mount {
+            default: false,
+            target: "/home/container/mounted".into(),
+            source: source.as_ref().to_string_lossy().to_compact_string(),
+            read_only: false,
+        }
+    }
+
+    // Mount::resolve_allowed_source
+
+    #[test]
+    fn resolve_allowed_source_accepts_a_subdirectory_of_an_allowed_path() {
+        tokio_test::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let allowed_root = root.path().join("allowed");
+            let source = allowed_root.join("server-storage");
+            std::fs::create_dir_all(&source).unwrap();
+
+            let allowed = AllowedMounts::from_entries([&allowed_root]).await;
+
+            assert_eq!(
+                mount(&source)
+                    .resolve_allowed_source(&allowed)
+                    .await
+                    .unwrap(),
+                source.canonicalize().unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_allowed_source_accepts_an_allowed_path_itself() {
+        tokio_test::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let allowed_root = root.path().join("allowed");
+            std::fs::create_dir_all(&allowed_root).unwrap();
+
+            let allowed = AllowedMounts::from_entries([&allowed_root]).await;
+
+            assert_eq!(
+                mount(&allowed_root)
+                    .resolve_allowed_source(&allowed)
+                    .await
+                    .unwrap(),
+                allowed_root.canonicalize().unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_allowed_source_rejects_parent_dir_traversal() {
+        tokio_test::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let allowed_root = root.path().join("allowed");
+            std::fs::create_dir_all(&allowed_root).unwrap();
+
+            let allowed = AllowedMounts::from_entries([&allowed_root]).await;
+
+            assert!(
+                mount(allowed_root.join("../..").as_path())
+                    .resolve_allowed_source(&allowed)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                mount(allowed_root.join("../../../etc").as_path())
+                    .resolve_allowed_source(&allowed)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_allowed_source_rejects_a_sibling_sharing_a_string_prefix() {
+        tokio_test::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let allowed_root = root.path().join("data");
+            let sibling = root.path().join("database");
+            std::fs::create_dir_all(&allowed_root).unwrap();
+            std::fs::create_dir_all(&sibling).unwrap();
+
+            let allowed = AllowedMounts::from_entries([&allowed_root]).await;
+
+            assert!(
+                mount(&sibling)
+                    .resolve_allowed_source(&allowed)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_allowed_source_rejects_a_symlink_out_of_an_allowed_path() {
+        tokio_test::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let allowed_root = root.path().join("allowed");
+            let outside = root.path().join("outside");
+            std::fs::create_dir_all(&allowed_root).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+
+            let escape = allowed_root.join("escape");
+            std::os::unix::fs::symlink(&outside, &escape).unwrap();
+
+            let allowed = AllowedMounts::from_entries([&allowed_root]).await;
+
+            assert!(
+                mount(&escape)
+                    .resolve_allowed_source(&allowed)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_allowed_source_rejects_a_relative_source() {
+        tokio_test::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let allowed_root = root.path().join("allowed");
+            std::fs::create_dir_all(&allowed_root).unwrap();
+
+            let allowed = AllowedMounts::from_entries([&allowed_root]).await;
+
+            assert!(
+                mount(Path::new("allowed"))
+                    .resolve_allowed_source(&allowed)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_allowed_source_rejects_a_source_that_does_not_exist() {
+        tokio_test::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let allowed_root = root.path().join("allowed");
+            std::fs::create_dir_all(&allowed_root).unwrap();
+
+            let allowed = AllowedMounts::from_entries([&allowed_root]).await;
+
+            assert!(
+                mount(allowed_root.join("missing").as_path())
+                    .resolve_allowed_source(&allowed)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_allowed_source_rejects_a_non_normalized_target() {
+        tokio_test::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let allowed_root = root.path().join("allowed");
+            std::fs::create_dir_all(&allowed_root).unwrap();
+
+            let allowed = AllowedMounts::from_entries([&allowed_root]).await;
+
+            let mut mount = mount(&allowed_root);
+            mount.target = "/home/container/../../etc".into();
+
+            assert!(mount.resolve_allowed_source(&allowed).await.is_err());
+        });
+    }
+
+    #[test]
+    fn resolve_allowed_source_rejects_everything_when_the_allowlist_is_empty() {
+        tokio_test::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("anything");
+            std::fs::create_dir_all(&source).unwrap();
+
+            let allowed = AllowedMounts::from_entries(Vec::<PathBuf>::new()).await;
+
+            assert!(allowed.is_empty());
+            assert!(
+                mount(&source)
+                    .resolve_allowed_source(&allowed)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn allowed_mounts_drops_entries_that_do_not_resolve() {
+        tokio_test::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let allowed_root = root.path().join("allowed");
+            std::fs::create_dir_all(&allowed_root).unwrap();
+
+            let allowed =
+                AllowedMounts::from_entries([&allowed_root, &root.path().join("missing")]).await;
+
+            assert_eq!(allowed.0, vec![allowed_root.canonicalize().unwrap()]);
+        });
     }
 }
