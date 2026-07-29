@@ -15,6 +15,7 @@ use russh_sftp::protocol::{
 use serde_json::json;
 use std::{
     collections::HashMap,
+    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -27,10 +28,8 @@ mod extended;
 pub struct FileHandle {
     _guard: super::limiter::SshLimiterHandleGuard,
     path: PathBuf,
-    path_components: Vec<String>,
 
-    file: Arc<Mutex<std::fs::File>>,
-    known_size: u64,
+    file: Arc<Mutex<crate::server::filesystem::file::ServerFile>>,
     append: bool,
 
     diff_track: bool,
@@ -1234,7 +1233,22 @@ impl russh_sftp::server::Handler for SftpSession {
                     open_options.truncate(true);
                 }
 
-                server.filesystem.open_with(path, open_options)
+                let file = server.filesystem.open_with(&path, open_options)?;
+                let initial_size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+
+                let mut file = crate::server::filesystem::file::ServerFile::new_file(
+                    server.clone(),
+                    &path,
+                    file,
+                    initial_size,
+                )
+                .map_err(std::io::Error::other)?;
+
+                if pflags.contains(OpenFlags::APPEND) {
+                    file.seek(SeekFrom::End(0))?;
+                }
+
+                Ok::<_, std::io::Error>(file)
             }
         })
         .await
@@ -1282,13 +1296,7 @@ impl russh_sftp::server::Handler for SftpSession {
                     .open_handle()
                     .map_err(|_| StatusCode::Failure)?,
                 path,
-                path_components,
                 file: Arc::new(Mutex::new(file)),
-                known_size: if pflags.contains(OpenFlags::TRUNCATE) {
-                    0
-                } else {
-                    pre_size.unwrap_or(0)
-                },
                 append: pflags.contains(OpenFlags::APPEND),
                 diff_track,
                 diff_before,
@@ -1361,77 +1369,32 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::PermissionDenied);
         }
 
-        let Some(end) = offset
+        if offset
             .checked_add(data.len() as u64)
-            .filter(|end| *end <= i64::MAX as u64)
-        else {
-            return Err(StatusCode::BadMessage);
-        };
-
-        let delta = if handle.append {
-            data.len() as i64
-        } else {
-            end.saturating_sub(handle.known_size) as i64
-        };
-
-        if !self
-            .server
-            .filesystem
-            .async_allocate_in_path_iterator(
-                handle
-                    .path_components
-                    .get(0..handle.path_components.len() - 1)
-                    .ok_or(StatusCode::Failure)?,
-                delta,
-                false,
-            )
-            .await
+            .is_none_or(|end| end > i64::MAX as u64)
         {
-            return Err(StatusCode::Failure);
+            return Err(StatusCode::BadMessage);
         }
 
-        match tokio::task::spawn_blocking({
+        tokio::task::spawn_blocking({
             let file = Arc::clone(&handle.file);
+            let append = handle.append;
 
-            move || file.lock().write_all_at(offset, &data)
+            move || {
+                let mut file = file.lock();
+
+                if append {
+                    file.write_all(&data)
+                } else {
+                    file.write_all_at(offset, &data)
+                }
+            }
         })
         .await
-        {
-            Ok(Ok(())) => (),
-            Ok(Err(_)) => {
-                self.server
-                    .filesystem
-                    .async_allocate_in_path_iterator(
-                        handle
-                            .path_components
-                            .get(0..handle.path_components.len() - 1)
-                            .ok_or(StatusCode::Failure)?,
-                        delta.saturating_neg(),
-                        true,
-                    )
-                    .await;
-                return Err(StatusCode::Failure);
-            }
-            Err(_) => {
-                self.server
-                    .filesystem
-                    .async_allocate_in_path_iterator(
-                        handle
-                            .path_components
-                            .get(0..handle.path_components.len() - 1)
-                            .ok_or(StatusCode::Failure)?,
-                        delta.saturating_neg(),
-                        true,
-                    )
-                    .await;
-                return Err(StatusCode::Failure);
-            }
-        }
+        .map_err(|_| StatusCode::Failure)?
+        .map_err(|_| StatusCode::Failure)?;
 
         handle.diff_dirty = true;
-        if !handle.append {
-            handle.known_size = handle.known_size.max(end);
-        }
 
         Ok(Status {
             id,

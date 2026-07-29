@@ -311,13 +311,12 @@ impl ScheduleAction {
         }
 
         match self {
-            // control-flow markers are interpreted by the schedule executor and
-            // never reach this method
             ScheduleAction::If { .. }
             | ScheduleAction::ElseIf { .. }
             | ScheduleAction::Else
             | ScheduleAction::EndIf
             | ScheduleAction::Exit { .. } => {}
+
             ScheduleAction::Sleep { duration } => {
                 tokio::time::sleep(std::time::Duration::from_millis(*duration)).await;
             }
@@ -1034,20 +1033,6 @@ impl ScheduleAction {
                     return Err("failed to create parent directory".into());
                 }
 
-                let added_content_size = if *append {
-                    content.len() as i64
-                } else {
-                    content.len() as i64 - old_content_size
-                };
-                if filesystem.is_primary_server_fs()
-                    && !server
-                        .filesystem
-                        .async_allocate_in_path(parent, added_content_size, false)
-                        .await
-                {
-                    return Err("failed to allocate space".into());
-                }
-
                 let mut options = OpenOptions::new();
                 options
                     .write(true)
@@ -1066,11 +1051,26 @@ impl ScheduleAction {
                     }
                 };
 
+                if filesystem.is_primary_server_fs() && !*append && old_content_size > 0 {
+                    server
+                        .filesystem
+                        .async_allocate_in_path(parent, -old_content_size, true)
+                        .await;
+                }
+
                 if let Err(err) = file.write_all(content.as_bytes()).await {
+                    if err.kind() == std::io::ErrorKind::StorageFull {
+                        return Err("failed to allocate space".into());
+                    }
+
                     tracing::error!(path = %path.display(), "failed to write file: {:?}", err);
                     return Err("failed to write file".into());
                 }
                 if let Err(err) = file.shutdown().await {
+                    if err.kind() == std::io::ErrorKind::StorageFull {
+                        return Err("failed to allocate space".into());
+                    }
+
                     tracing::error!(path = %path.display(), "failed to shutdown file: {:?}", err);
                     return Err("failed to shutdown file".into());
                 }

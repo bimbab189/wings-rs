@@ -798,6 +798,7 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
                 self.server.clone(),
                 &path,
                 file,
+                0,
             )?;
 
             Ok(Box::new(file))
@@ -820,6 +821,7 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
                 self.server.clone(),
                 &path,
                 file,
+                0,
             )?;
 
             Ok(Box::new(file))
