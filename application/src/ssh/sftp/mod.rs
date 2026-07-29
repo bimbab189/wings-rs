@@ -737,7 +737,7 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::NoSuchFile);
         }
 
-        let new_path = self.server.filesystem.relative_path(&new_path);
+        let new_path = self.server.filesystem.diff_key(&new_path).await;
         let new_key = new_path.to_string_lossy().to_string();
         let replaced = match self
             .server
@@ -1123,10 +1123,7 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::PermissionDenied);
         }
 
-        let path = match self.server.filesystem.async_canonicalize(&filename).await {
-            Ok(path) => path,
-            Err(_) => PathBuf::from(filename.strip_prefix("/").unwrap_or(&filename)),
-        };
+        let path = self.server.filesystem.diff_key(Path::new(&filename)).await;
 
         let pre_size = match self.server.filesystem.async_symlink_metadata(&path).await {
             Ok(metadata) => {

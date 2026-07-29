@@ -63,11 +63,7 @@ mod post {
 
             if if filesystem.is_primary_server_fs() {
                 if metadata.file_type.is_file() {
-                    let path = server
-                        .filesystem
-                        .async_canonicalize(&source)
-                        .await
-                        .unwrap_or_else(|_| server.filesystem.relative_path(&source));
+                    let path = server.filesystem.diff_key(&source).await;
 
                     if let Err(err) = server.diff.forget_file(&path.to_string_lossy(), None).await {
                         tracing::error!("failed to forget file from diff storage: {:?}", err);

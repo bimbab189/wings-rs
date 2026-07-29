@@ -127,11 +127,7 @@ mod post {
                 .ok();
         }
 
-        let diff_key = server
-            .filesystem
-            .async_canonicalize(&path)
-            .await
-            .unwrap_or_else(|_| server.filesystem.relative_path(&path));
+        let diff_key = server.filesystem.diff_key(&path).await;
         let diff_key = diff_key.to_string_lossy();
         let config_guard = state.config.load();
         let history = &config_guard.system.file_history;

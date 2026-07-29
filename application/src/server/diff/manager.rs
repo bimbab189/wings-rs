@@ -261,6 +261,23 @@ impl DiffManager {
         .await?
     }
 
+    pub async fn revision_path(&self, revision_id: i64) -> Result<Option<String>, anyhow::Error> {
+        if !self.ensure_open().await {
+            return Ok(None);
+        }
+
+        let storage = Arc::clone(&self.storage);
+        tokio::task::spawn_blocking(move || -> Result<Option<String>, anyhow::Error> {
+            let guard = storage.blocking_lock();
+            let Some(storage) = guard.as_ref() else {
+                return Ok(None);
+            };
+
+            storage.revision_path(revision_id)
+        })
+        .await?
+    }
+
     pub async fn get_content(&self, revision_id: i64) -> Result<Option<Vec<u8>>, anyhow::Error> {
         if !self.ensure_open().await {
             return Ok(None);

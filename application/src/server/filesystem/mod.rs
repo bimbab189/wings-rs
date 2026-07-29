@@ -218,6 +218,16 @@ impl Filesystem {
         (**self.disk_ignored.load()).clone()
     }
 
+    /// Derives the key a path is tracked under in the file history storage.
+    ///
+    /// Every writer and reader of file history must derive keys through this,
+    /// otherwise the same file reached through a symlink lands under two keys.
+    pub async fn diff_key(&self, path: &Path) -> PathBuf {
+        self.async_canonicalize(path)
+            .await
+            .unwrap_or_else(|_| self.relative_path(path))
+    }
+
     pub async fn pulls(
         &self,
     ) -> RwLockReadGuard<'_, HashMap<uuid::Uuid, Arc<RwLock<pull::Download>>>> {

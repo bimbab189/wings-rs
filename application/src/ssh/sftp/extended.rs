@@ -895,7 +895,7 @@ pub async fn handle_extended(
                 return Err(StatusCode::NoSuchFile);
             }
 
-            let new_path = sftp_session.server.filesystem.relative_path(&new_path);
+            let new_path = sftp_session.server.filesystem.diff_key(&new_path).await;
             let new_key = new_path.to_string_lossy().to_string();
             let replaced = match sftp_session
                 .server

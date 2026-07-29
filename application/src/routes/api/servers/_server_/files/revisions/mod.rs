@@ -39,7 +39,16 @@ mod get {
     pub async fn route(server: GetServer, Query(data): Query<Params>) -> ApiResponseResult {
         let path = server
             .filesystem
-            .relative_path(std::path::Path::new(&data.file));
+            .diff_key(std::path::Path::new(&data.file))
+            .await;
+
+        if server.filesystem.is_ignored(&path, false) {
+            return ApiResponse::new_serialized(Response {
+                revisions: Vec::new(),
+            })
+            .ok();
+        }
+
         let revisions = server.diff.list(&path.to_string_lossy()).await?;
 
         ApiResponse::new_serialized(Response { revisions }).ok()

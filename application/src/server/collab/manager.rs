@@ -413,10 +413,7 @@ impl CollabManager {
             return Err(CollabError::User("file not found"));
         }
 
-        let key = match server.filesystem.async_canonicalize(&path).await {
-            Ok(key) => key,
-            Err(_) => server.filesystem.relative_path(&path),
-        };
+        let key = server.filesystem.diff_key(&path).await;
 
         Ok((path, key.to_string_lossy().to_compact_string(), filesystem))
     }
