@@ -71,21 +71,17 @@ mod post {
                 Err(_) => continue,
             };
 
-            if filesystem.is_primary_server_fs()
-                && server
-                    .filesystem
-                    .is_ignored(&source, metadata.file_type.is_dir())
-            {
-                continue;
-            }
-
             let mode = match u32::from_str_radix(&file.mode, 8) {
                 Ok(mode) => mode,
                 Err(_) => continue,
             };
 
             if filesystem
-                .async_set_permissions(&source, PortablePermissions::from_mode_file(mode))
+                .async_set_permissions(
+                    &source,
+                    metadata.file_type,
+                    PortablePermissions::from_mode_file(mode),
+                )
                 .await
                 .is_ok()
             {
@@ -117,7 +113,7 @@ mod post {
                                             }
 
                                             if filesystem
-                                                .async_set_permissions(&path, mode)
+                                                .async_set_permissions(&path, file_type, mode)
                                                 .await
                                                 .is_ok()
                                             {

@@ -3,6 +3,7 @@ use crate::{
     io::{SafeDigestExt, SafeSliceExt, SafeWriteExt},
     server::{
         activity::{Activity, ActivityEvent},
+        filesystem::cap::FileType,
         permissions::Permission,
     },
     utils::PortablePermissions,
@@ -86,7 +87,10 @@ pub async fn handle_extended(
                     return Err(StatusCode::NoSuchFile);
                 }
 
-                if sftp_session.is_ignored(&path, metadata.is_dir()) {
+                if sftp_session
+                    .async_is_ignored(&path, metadata.file_type().into())
+                    .await
+                {
                     return Err(StatusCode::NoSuchFile);
                 }
 
@@ -377,13 +381,19 @@ pub async fn handle_extended(
                 return Err(StatusCode::NoSuchFile);
             }
 
-            if sftp_session.is_ignored(&source_path, false) {
+            if sftp_session
+                .async_is_ignored(&source_path, FileType::File)
+                .await
+            {
                 return Err(StatusCode::NoSuchFile);
             }
 
             let destination_path = Path::new(&request.destination);
 
-            if sftp_session.is_ignored(destination_path, false) {
+            if sftp_session
+                .async_is_ignored(destination_path, FileType::File)
+                .await
+            {
                 return Err(StatusCode::NoSuchFile);
             }
 
@@ -633,8 +643,12 @@ pub async fn handle_extended(
             };
 
             if !metadata.is_file()
-                || sftp_session.is_ignored(&targetpath, metadata.is_dir())
-                || sftp_session.is_ignored(&linkpath, false)
+                || sftp_session
+                    .async_is_ignored(&targetpath, metadata.file_type().into())
+                    .await
+                || sftp_session
+                    .async_is_ignored(&linkpath, FileType::File)
+                    .await
             {
                 return Err(StatusCode::NoSuchFile);
             }
@@ -863,8 +877,12 @@ pub async fn handle_extended(
                 Err(_) => return Err(StatusCode::NoSuchFile),
             };
 
-            if sftp_session.is_ignored(&old_path, old_metadata.is_dir())
-                || sftp_session.is_ignored(&new_path, old_metadata.is_dir())
+            if sftp_session
+                .async_is_ignored(&old_path, old_metadata.file_type().into())
+                .await
+                || sftp_session
+                    .async_is_ignored(&new_path, old_metadata.file_type().into())
+                    .await
             {
                 return Err(StatusCode::Failure);
             }

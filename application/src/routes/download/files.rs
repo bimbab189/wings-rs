@@ -121,9 +121,7 @@ mod get {
 
         let metadata = filesystem.async_symlink_metadata(&path).await;
         if let Ok(metadata) = metadata {
-            if !metadata.file_type.is_dir()
-                || (filesystem.is_primary_server_fs() && server.filesystem.is_ignored(&path, true))
-            {
+            if !metadata.file_type.is_dir() {
                 return ApiResponse::error("directory not found")
                     .with_status(StatusCode::NOT_FOUND)
                     .ok();

@@ -787,7 +787,11 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
 
                     let file_type = VirtualSevenZipArchive::seven_zip_entry_to_file_type(entry);
 
-                    if let Some(name) = (self.is_ignored)(file_type, name.to_path_buf()) {
+                    if let Some(name) = self
+                        .is_ignored
+                        .call_async(file_type, name.to_path_buf())
+                        .await
+                    {
                         return Some(Ok((file_type, name)));
                     }
                 }
@@ -1333,14 +1337,12 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                         if relative.components().count() == 0 {
                             continue;
                         }
-                        if (is_ignored)(
+                        let Some(relative) = (is_ignored)(
                             VirtualSevenZipArchive::seven_zip_entry_to_file_type(entry),
-                            relative.clone(),
-                        )
-                        .is_none()
-                        {
+                            relative,
+                        ) else {
                             continue;
-                        }
+                        };
                         entries.push((relative, i));
                     }
                     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));

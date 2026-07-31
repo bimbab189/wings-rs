@@ -5,7 +5,10 @@ mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
-        server::{backup::adapters::BackupAdapter, filesystem::archive::StreamableArchiveFormat},
+        server::{
+            backup::adapters::BackupAdapter,
+            filesystem::{archive::StreamableArchiveFormat, cap::FileType},
+        },
     };
     use axum::{extract::Path, http::StatusCode};
     use futures::StreamExt;
@@ -102,7 +105,10 @@ mod post {
         let destination_path = destination_root.join(file_name);
 
         if destination_filesystem.is_primary_server_fs()
-            && server.filesystem.is_ignored(&destination_path, false)
+            && server
+                .filesystem
+                .async_is_ignored(&destination_path, FileType::File)
+                .await
         {
             return ApiResponse::error("file not found")
                 .with_status(StatusCode::EXPECTATION_FAILED)

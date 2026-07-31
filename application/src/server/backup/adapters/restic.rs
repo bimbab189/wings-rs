@@ -1508,7 +1508,10 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         let mut file_children: Vec<Child<'_>> = Vec::new();
 
         for (name, child_node) in node.dirs.iter() {
-            let child_path = match (is_ignored)(FileType::Dir, path.join(name.as_str())) {
+            let child_path = match is_ignored
+                .call_async(FileType::Dir, path.join(name.as_str()))
+                .await
+            {
                 Some(kept) => kept,
                 None => continue,
             };
@@ -1518,7 +1521,10 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             });
         }
         for (name, meta) in node.files.iter() {
-            let child_path = match (is_ignored)(meta.file_type, path.join(name.as_str())) {
+            let child_path = match is_ignored
+                .call_async(meta.file_type, path.join(name.as_str()))
+                .await
+            {
                 Some(kept) => kept,
                 None => continue,
             };
@@ -1733,7 +1739,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                         skip_notifier = false;
                     }
 
-                    if let Some(path) = (is_ignored)(file_type, entry_path.clone()) {
+                    if let Some(path) = is_ignored.call_async(file_type, entry_path.clone()).await {
                         let full_path = server_path.join(&entry_path);
 
                         if file_type.is_dir() {

@@ -1181,7 +1181,7 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                             let child_type =
                                 VirtualDdupBakArchive::ddup_bak_entry_to_file_type(child);
 
-                            if (self.is_ignored)(child_type, child_path.clone()).is_some() {
+                            if let Some(child_path) = (self.is_ignored)(child_type, child_path) {
                                 self.queue.push_back((child_path, child.clone()));
                             }
                         }
@@ -1201,7 +1201,7 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                 for child in &dir.entries {
                     let child_path = path.join(child.name());
                     let child_type = Self::ddup_bak_entry_to_file_type(child);
-                    if (is_ignored)(child_type, child_path.clone()).is_some() {
+                    if let Some(child_path) = (is_ignored)(child_type, child_path) {
                         queue.push_back((child_path, child.clone()));
                     }
                 }
@@ -1210,7 +1210,7 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
             for child in archive.entries() {
                 let child_path = path.join(child.name());
                 let child_type = Self::ddup_bak_entry_to_file_type(child);
-                if (is_ignored)(child_type, child_path.clone()).is_some() {
+                if let Some(child_path) = (is_ignored)(child_type, child_path) {
                     queue.push_back((child_path, child.clone()));
                 }
             }
@@ -1240,7 +1240,9 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                             let child_type =
                                 VirtualDdupBakArchive::ddup_bak_entry_to_file_type(child);
 
-                            if (self.is_ignored)(child_type, child_path.clone()).is_some() {
+                            if let Some(child_path) =
+                                self.is_ignored.call_async(child_type, child_path).await
+                            {
                                 self.queue.push_back((child_path, child.clone()));
                             }
                         }
@@ -1260,7 +1262,7 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                 for child in &dir.entries {
                     let child_path = path.join(child.name());
                     let child_type = Self::ddup_bak_entry_to_file_type(child);
-                    if (is_ignored)(child_type, child_path.clone()).is_some() {
+                    if let Some(child_path) = is_ignored.call_async(child_type, child_path).await {
                         queue.push_back((child_path, child.clone()));
                     }
                 }
@@ -1269,7 +1271,7 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
             for child in archive.entries() {
                 let child_path = path.join(child.name());
                 let child_type = Self::ddup_bak_entry_to_file_type(child);
-                if (is_ignored)(child_type, child_path.clone()).is_some() {
+                if let Some(child_path) = is_ignored.call_async(child_type, child_path).await {
                     queue.push_back((child_path, child.clone()));
                 }
             }
@@ -1303,7 +1305,9 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                             let child_path = path.join(child.name());
                             let child_type =
                                 VirtualDdupBakArchive::ddup_bak_entry_to_file_type(child);
-                            if (self.is_ignored)(child_type, child_path.clone()).is_some() {
+                            if let Some(child_path) =
+                                self.is_ignored.call_async(child_type, child_path).await
+                            {
                                 self.queue.push_back((child_path, child.clone()));
                             }
                         }
@@ -1364,7 +1368,7 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
                 for child in &dir.entries {
                     let child_path = path.join(child.name());
                     let child_type = Self::ddup_bak_entry_to_file_type(child);
-                    if (is_ignored)(child_type, child_path.clone()).is_some() {
+                    if let Some(child_path) = is_ignored.call_async(child_type, child_path).await {
                         queue.push_back((child_path, child.clone()));
                     }
                 }
@@ -1373,7 +1377,7 @@ impl VirtualReadableFilesystem for VirtualDdupBakArchive {
             for child in archive.entries() {
                 let child_path = path.join(child.name());
                 let child_type = Self::ddup_bak_entry_to_file_type(child);
-                if (is_ignored)(child_type, child_path.clone()).is_some() {
+                if let Some(child_path) = is_ignored.call_async(child_type, child_path).await {
                     queue.push_back((child_path, child.clone()));
                 }
             }

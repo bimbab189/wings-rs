@@ -10,6 +10,7 @@ use crate::{
         backup::{Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt},
         filesystem::{
             archive::StreamableArchiveFormat,
+            cap::FileType,
             virtualfs::{
                 ByteRange, VirtualReadableFilesystem, archive::ddup_bak::VirtualDdupBakArchive,
             },
@@ -659,7 +660,7 @@ impl BackupExt for DdupBakBackup {
 
                     if server
                         .filesystem
-                        .is_ignored(&path, entry.is_directory())
+                        .is_ignored(&path, FileType::from_is_dir(entry.is_directory()))
                     {
                         continue;
                     }

@@ -2,6 +2,7 @@ use crate::{
     routes::State,
     server::{
         activity::{Activity, ActivityEvent},
+        filesystem::cap::FileType,
         permissions::Permission,
     },
     utils::PortablePermissions,
@@ -162,8 +163,8 @@ impl SftpSession {
     }
 
     #[inline]
-    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        Self::is_ignored_server(&self.server, self.user_uuid, path, is_dir)
+    async fn async_is_ignored(&self, path: &Path, file_type: FileType) -> bool {
+        Self::async_is_ignored_server(&self.server, self.user_uuid, path, file_type).await
     }
 
     #[inline]
@@ -171,14 +172,39 @@ impl SftpSession {
         server: &crate::server::Server,
         user_uuid: uuid::Uuid,
         path: &Path,
-        is_dir: bool,
+        file_type: FileType,
     ) -> bool {
-        if path == Path::new("/") || path == Path::new(".") || path == Path::new("") {
+        if Self::is_ignored_root(path) {
             return false;
         }
 
-        server.filesystem.is_ignored(path, is_dir)
-            || server.user_permissions.is_ignored(user_uuid, path, is_dir)
+        server.filesystem.is_ignored(path, file_type)
+            || server
+                .user_permissions
+                .is_ignored(server, user_uuid, path, file_type)
+    }
+
+    #[inline]
+    async fn async_is_ignored_server(
+        server: &crate::server::Server,
+        user_uuid: uuid::Uuid,
+        path: &Path,
+        file_type: FileType,
+    ) -> bool {
+        if Self::is_ignored_root(path) {
+            return false;
+        }
+
+        server.filesystem.async_is_ignored(path, file_type).await
+            || server
+                .user_permissions
+                .async_is_ignored(server, user_uuid, path, file_type)
+                .await
+    }
+
+    #[inline]
+    fn is_ignored_root(path: &Path) -> bool {
+        path == Path::new("/") || path == Path::new(".") || path == Path::new("")
     }
 
     #[inline]
@@ -331,7 +357,7 @@ impl russh_sftp::server::Handler for SftpSession {
             Err(_) => return Err(StatusCode::NoSuchFile),
         };
 
-        if self.is_ignored(&path, true) {
+        if self.async_is_ignored(&path, FileType::Dir).await {
             return Err(StatusCode::NoSuchFile);
         }
 
@@ -414,7 +440,12 @@ impl russh_sftp::server::Handler for SftpSession {
                         Err(_) => continue,
                     };
 
-                    if Self::is_ignored_server(&server, user_uuid, &path, metadata.is_dir()) {
+                    if Self::is_ignored_server(
+                        &server,
+                        user_uuid,
+                        &path,
+                        metadata.file_type().into(),
+                    ) {
                         continue;
                     }
 
@@ -473,7 +504,10 @@ impl russh_sftp::server::Handler for SftpSession {
                 return Err(StatusCode::NoSuchFile);
             }
 
-            if self.is_ignored(&path, metadata.is_dir()) {
+            if self
+                .async_is_ignored(&path, metadata.file_type().into())
+                .await
+            {
                 return Err(StatusCode::NoSuchFile);
             }
 
@@ -554,7 +588,7 @@ impl russh_sftp::server::Handler for SftpSession {
                 return Err(StatusCode::NoSuchFile);
             }
 
-            if self.is_ignored(&path, true) {
+            if self.async_is_ignored(&path, FileType::Dir).await {
                 return Err(StatusCode::NoSuchFile);
             }
 
@@ -604,7 +638,7 @@ impl russh_sftp::server::Handler for SftpSession {
 
         let path = Path::new(&path);
 
-        if self.is_ignored(path, true) {
+        if self.async_is_ignored(path, FileType::Dir).await {
             return Err(StatusCode::NoSuchFile);
         }
         if self
@@ -705,8 +739,12 @@ impl russh_sftp::server::Handler for SftpSession {
             .async_symlink_metadata(&new_path)
             .await
             .is_ok()
-            || self.is_ignored(&old_path, old_metadata.is_dir())
-            || self.is_ignored(&new_path, old_metadata.is_dir())
+            || self
+                .async_is_ignored(&old_path, old_metadata.file_type().into())
+                .await
+            || self
+                .async_is_ignored(&new_path, old_metadata.file_type().into())
+                .await
         {
             return Err(StatusCode::Failure);
         }
@@ -834,7 +872,10 @@ impl russh_sftp::server::Handler for SftpSession {
             Err(_) => return Err(StatusCode::NoSuchFile),
         };
 
-        if self.is_ignored(&path, metadata.is_dir()) {
+        if self
+            .async_is_ignored(&path, metadata.file_type().into())
+            .await
+        {
             return Err(StatusCode::NoSuchFile);
         }
 
@@ -901,7 +942,10 @@ impl russh_sftp::server::Handler for SftpSession {
             Err(_) => return Err(StatusCode::NoSuchFile),
         };
 
-        if self.is_ignored(&path, metadata.is_dir()) {
+        if self
+            .async_is_ignored(&path, metadata.file_type().into())
+            .await
+        {
             return Err(StatusCode::NoSuchFile);
         }
 
@@ -951,7 +995,10 @@ impl russh_sftp::server::Handler for SftpSession {
             Err(_) => return Err(StatusCode::NoSuchFile),
         };
 
-        if self.is_ignored(path, metadata.is_dir()) {
+        if self
+            .async_is_ignored(path, metadata.file_type().into())
+            .await
+        {
             return Err(StatusCode::NoSuchFile);
         }
 
@@ -988,7 +1035,10 @@ impl russh_sftp::server::Handler for SftpSession {
             Err(_) => return Err(StatusCode::NoSuchFile),
         };
 
-        if self.is_ignored(&path, metadata.is_dir()) {
+        if self
+            .async_is_ignored(&path, metadata.file_type().into())
+            .await
+        {
             return Err(StatusCode::NoSuchFile);
         }
 
@@ -1045,8 +1095,10 @@ impl russh_sftp::server::Handler for SftpSession {
         };
 
         if !metadata.is_file()
-            || self.is_ignored(&targetpath, metadata.is_dir())
-            || self.is_ignored(&linkpath, false)
+            || self
+                .async_is_ignored(&targetpath, metadata.file_type().into())
+                .await
+            || self.async_is_ignored(&linkpath, FileType::File).await
         {
             return Err(StatusCode::NoSuchFile);
         }
@@ -1142,7 +1194,7 @@ impl russh_sftp::server::Handler for SftpSession {
             }
         };
 
-        if self.is_ignored(&path, false) {
+        if self.async_is_ignored(&path, FileType::File).await {
             return Err(StatusCode::NoSuchFile);
         }
 

@@ -44,13 +44,7 @@ mod get {
         let ignore = if data.ignored.is_empty() {
             None
         } else {
-            let mut ignore_builder = ignore::gitignore::GitignoreBuilder::new("/");
-
-            for line in data.ignored {
-                ignore_builder.add_line(None, &line).ok();
-            }
-
-            ignore_builder.build().ok()
+            crate::server::filesystem::build_gitignore_matcher(data.ignored.iter()).ok()
         };
 
         let (root, filesystem) = server

@@ -10,7 +10,10 @@ mod post {
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
         server::{
-            filesystem::virtualfs::{AsyncDirectoryStreamWalkFn, IsIgnoredFn},
+            filesystem::{
+                cap::FileType,
+                virtualfs::{AsyncDirectoryStreamWalkFn, IsIgnoredFn},
+            },
             transfer::TransferArchiveFormat,
         },
     };
@@ -90,7 +93,12 @@ mod post {
                 .ok();
         }
 
-        if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(&root, true) {
+        if filesystem.is_primary_server_fs()
+            && server
+                .filesystem
+                .async_is_ignored(&root, FileType::Dir)
+                .await
+        {
             return ApiResponse::error("path not found")
                 .with_status(StatusCode::NOT_FOUND)
                 .ok();
@@ -253,7 +261,7 @@ mod post {
                                                                 .async_create_file(&destination_path)
                                                                 .await?;
                                                             destination_filesystem
-                                                                .async_set_permissions(&destination_path, metadata.permissions)
+                                                                .async_set_permissions(&destination_path, metadata.file_type, metadata.permissions)
                                                                 .await?;
 
                                                             tokio::io::copy(&mut reader, &mut writer).await?;
@@ -264,7 +272,7 @@ mod post {
                                                     } else if metadata.file_type.is_dir() {
                                                         destination_filesystem.async_create_dir_all(&destination_path).await?;
                                                         destination_filesystem
-                                                            .async_set_permissions(&destination_path, metadata.permissions)
+                                                            .async_set_permissions(&destination_path, metadata.file_type, metadata.permissions)
                                                             .await?;
 
                                                         bytes_processed.fetch_add(metadata.size, Ordering::Relaxed);

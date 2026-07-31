@@ -2,7 +2,7 @@ use crate::{
     routes::State,
     server::{
         activity::{Activity, ActivityEvent},
-        filesystem::archive::ArchiveFormat,
+        filesystem::{archive::ArchiveFormat, cap::FileType},
     },
 };
 use cap_std::fs::OpenOptions;
@@ -940,14 +940,22 @@ impl ScheduleAction {
                     return Err("path is not a directory".into());
                 }
 
-                if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(&root, true) {
+                if filesystem.is_primary_server_fs()
+                    && server
+                        .filesystem
+                        .async_is_ignored(&root, FileType::Dir)
+                        .await
+                {
                     return Err("path not found".into());
                 }
 
                 let destination = root.join(name);
 
                 if filesystem.is_primary_server_fs()
-                    && server.filesystem.is_ignored(&destination, true)
+                    && server
+                        .filesystem
+                        .async_is_ignored(&destination, FileType::Dir)
+                        .await
                 {
                     return Err("destination not found".into());
                 }
@@ -1009,7 +1017,12 @@ impl ScheduleAction {
 
                 let metadata = filesystem.async_metadata(&path).await;
 
-                if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true) {
+                if filesystem.is_primary_server_fs()
+                    && server
+                        .filesystem
+                        .async_is_ignored(parent, FileType::Dir)
+                        .await
+                {
                     return Err("file not found".into());
                 }
 
@@ -1023,7 +1036,12 @@ impl ScheduleAction {
                     0
                 };
 
-                if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true) {
+                if filesystem.is_primary_server_fs()
+                    && server
+                        .filesystem
+                        .async_is_ignored(parent, FileType::Dir)
+                        .await
+                {
                     return Err("parent directory not found".into());
                 }
 
@@ -1127,12 +1145,7 @@ impl ScheduleAction {
 
                 let metadata = match filesystem.async_metadata(&path).await {
                     Ok(metadata) => {
-                        if !metadata.file_type.is_file()
-                            || (filesystem.is_primary_server_fs()
-                                && server
-                                    .filesystem
-                                    .is_ignored(&path, metadata.file_type.is_dir()))
-                        {
+                        if !metadata.file_type.is_file() {
                             return Err("file not found".into());
                         } else {
                             metadata
@@ -1143,7 +1156,12 @@ impl ScheduleAction {
                     }
                 };
 
-                if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true) {
+                if filesystem.is_primary_server_fs()
+                    && server
+                        .filesystem
+                        .async_is_ignored(parent, FileType::Dir)
+                        .await
+                {
                     return Err("parent directory not found".into());
                 }
 
@@ -1168,6 +1186,15 @@ impl ScheduleAction {
                 let destination_path = server
                     .filesystem
                     .relative_path(&destination_path.join(destination_file_name));
+
+                if destination_filesystem.is_primary_server_fs()
+                    && server
+                        .filesystem
+                        .async_is_ignored(&destination_path, metadata.file_type)
+                        .await
+                {
+                    return Err("destination file not found".into());
+                }
 
                 let bytes_processed = Arc::new(AtomicU64::new(0));
                 let bytes_total = Arc::new(AtomicU64::new(metadata.size));
@@ -1276,14 +1303,6 @@ impl ScheduleAction {
                         Err(_) => continue,
                     };
 
-                    if filesystem.is_primary_server_fs()
-                        && server
-                            .filesystem
-                            .is_ignored(&source, metadata.file_type.is_dir())
-                    {
-                        continue;
-                    }
-
                     let result = if filesystem.is_primary_server_fs() {
                         server.filesystem.truncate_path(&source).await
                     } else if metadata.file_type.is_dir() {
@@ -1353,10 +1372,12 @@ impl ScheduleAction {
                         || (filesystem.is_primary_server_fs()
                             && (server
                                 .filesystem
-                                .is_ignored(&from, from_metadata.file_type.is_dir())
+                                .async_is_ignored(&from, from_metadata.file_type)
+                                .await
                                 || server
                                     .filesystem
-                                    .is_ignored(&to, from_metadata.file_type.is_dir())))
+                                    .async_is_ignored(&to, from_metadata.file_type)
+                                    .await))
                     {
                         continue;
                     }
@@ -1364,7 +1385,9 @@ impl ScheduleAction {
                     let result = if filesystem.is_primary_server_fs() {
                         server.filesystem.rename_path(from, to).await
                     } else {
-                        filesystem.async_rename(&from, &to).await
+                        filesystem
+                            .async_rename(&from, &to, from_metadata.file_type)
+                            .await
                     };
 
                     if let Err(err) = result {
@@ -1444,7 +1467,10 @@ impl ScheduleAction {
                 let destination_path = destination_root.join(file_name);
 
                 if destination_filesystem.is_primary_server_fs()
-                    && server.filesystem.is_ignored(&destination_path, false)
+                    && server
+                        .filesystem
+                        .async_is_ignored(&destination_path, FileType::File)
+                        .await
                 {
                     return Err("file not found".into());
                 }
@@ -1645,14 +1671,11 @@ impl ScheduleAction {
 
                 let source = root.join(file);
 
-                if server.filesystem.is_ignored(
-                    &source,
-                    server
-                        .filesystem
-                        .async_metadata(&source)
-                        .await
-                        .is_ok_and(|m| m.is_dir()),
-                ) {
+                if server
+                    .filesystem
+                    .async_is_ignored(&source, server.filesystem.probe_file_type(&source).await)
+                    .await
+                {
                     return Err("file not found".into());
                 }
 

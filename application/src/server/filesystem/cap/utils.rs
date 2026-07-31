@@ -13,6 +13,15 @@ pub enum FileType {
 
 impl FileType {
     #[inline]
+    pub fn from_is_dir(is_dir: bool) -> Self {
+        if is_dir {
+            FileType::Dir
+        } else {
+            FileType::File
+        }
+    }
+
+    #[inline]
     pub fn is_file(self) -> bool {
         matches!(self, FileType::File)
     }
@@ -210,7 +219,8 @@ impl AsyncWalkDir {
                 Some(Ok((file_type, name))) => {
                     let full_path = parent_path.join(&name);
 
-                    let Some(full_path) = (self.is_ignored)(file_type, full_path) else {
+                    let Some(full_path) = self.is_ignored.call_async(file_type, full_path).await
+                    else {
                         continue 'stack;
                     };
 

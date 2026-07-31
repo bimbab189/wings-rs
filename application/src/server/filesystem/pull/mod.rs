@@ -1,4 +1,4 @@
-use crate::server::filesystem::virtualfs::VirtualWritableFilesystem;
+use crate::server::filesystem::{cap::FileType, virtualfs::VirtualWritableFilesystem};
 use anyhow::Context;
 use compact_str::ToCompactString;
 use rand::RngExt;
@@ -230,7 +230,10 @@ impl Download {
         real_destination.push(file_name);
 
         if filesystem.is_primary_server_fs()
-            && server.filesystem.is_ignored(&real_destination, false)
+            && server
+                .filesystem
+                .async_is_ignored(&real_destination, FileType::File)
+                .await
         {
             return Err(anyhow::anyhow!("file not found"));
         }

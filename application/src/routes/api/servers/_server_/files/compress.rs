@@ -5,7 +5,7 @@ mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
-        server::filesystem::archive::ArchiveFormat,
+        server::filesystem::{archive::ArchiveFormat, cap::FileType},
     };
     use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
@@ -99,7 +99,10 @@ mod post {
         let destination_path = destination_root.join(file_name);
 
         if destination_filesystem.is_primary_server_fs()
-            && server.filesystem.is_ignored(&destination_path, false)
+            && server
+                .filesystem
+                .async_is_ignored(&destination_path, FileType::File)
+                .await
         {
             return ApiResponse::error("file not found")
                 .with_status(StatusCode::EXPECTATION_FAILED)

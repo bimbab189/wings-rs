@@ -7,6 +7,7 @@ mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::api::servers::_server_::GetServer,
+        server::filesystem::cap::FileType,
     };
     use axum::extract::Query;
     use serde::{Deserialize, Serialize};
@@ -42,7 +43,11 @@ mod get {
             .diff_key(std::path::Path::new(&data.file))
             .await;
 
-        if server.filesystem.is_ignored(&path, false) {
+        if server
+            .filesystem
+            .async_is_ignored(&path, FileType::File)
+            .await
+        {
             return ApiResponse::new_serialized(Response {
                 revisions: Vec::new(),
             })

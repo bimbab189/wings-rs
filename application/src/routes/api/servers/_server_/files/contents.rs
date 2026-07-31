@@ -75,10 +75,7 @@ mod get {
 
         let metadata = match filesystem.async_metadata(&path).await {
             Ok(metadata) => {
-                if !metadata.file_type.is_file()
-                    || (filesystem.is_primary_server_fs()
-                        && server.filesystem.is_ignored(&path, false))
-                {
+                if !metadata.file_type.is_file() {
                     return ApiResponse::error("file not found")
                         .with_status(StatusCode::NOT_FOUND)
                         .ok();

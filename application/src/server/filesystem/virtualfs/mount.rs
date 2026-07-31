@@ -26,13 +26,26 @@ pub struct VirtualMountFilesystem {
 }
 
 impl VirtualMountFilesystem {
+    /// Whether a gateway directory should be synthesized for this path.
+    ///
+    /// A denied path is never one. Without that check the synthesized entry
+    /// would launder the deny rejection from the inner filesystem into a
+    /// successful directory stat, since both a denial and a genuinely missing
+    /// path surface here as an opaque error.
     fn is_virtual_dir(&self, path: &Path) -> bool {
-        if path == Path::new("") {
-            return false;
-        }
-        self.mounts
-            .iter()
-            .any(|m| m.relative_target.starts_with(path))
+        self.is_gateway(path) && !self.inner.is_denied(FileType::Dir, path)
+    }
+
+    async fn async_is_virtual_dir(&self, path: &Path) -> bool {
+        self.is_gateway(path) && !self.inner.async_is_denied(FileType::Dir, path).await
+    }
+
+    fn is_gateway(&self, path: &Path) -> bool {
+        path != Path::new("")
+            && self
+                .mounts
+                .iter()
+                .any(|m| m.relative_target.starts_with(path))
     }
 
     fn virtual_dir_entry(path: &Path) -> DirectoryEntry {
@@ -102,8 +115,13 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
     ) -> Result<FileMetadata, anyhow::Error> {
         match self.inner.async_metadata(path).await {
             Ok(m) => Ok(m),
-            Err(_) if self.is_virtual_dir(path.as_ref()) => Ok(Self::virtual_dir_metadata()),
-            Err(err) => Err(err),
+            Err(err) => {
+                if self.async_is_virtual_dir(path.as_ref()).await {
+                    Ok(Self::virtual_dir_metadata())
+                } else {
+                    Err(err)
+                }
+            }
         }
     }
 
@@ -124,8 +142,13 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
     ) -> Result<FileMetadata, anyhow::Error> {
         match self.inner.async_symlink_metadata(path).await {
             Ok(m) => Ok(m),
-            Err(_) if self.is_virtual_dir(path.as_ref()) => Ok(Self::virtual_dir_metadata()),
-            Err(err) => Err(err),
+            Err(err) => {
+                if self.async_is_virtual_dir(path.as_ref()).await {
+                    Ok(Self::virtual_dir_metadata())
+                } else {
+                    Err(err)
+                }
+            }
         }
     }
 
@@ -135,10 +158,13 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
     ) -> Result<DirectoryEntry, anyhow::Error> {
         match self.inner.async_directory_entry(path).await {
             Ok(e) => Ok(e),
-            Err(_) if self.is_virtual_dir(path.as_ref()) => {
-                Ok(Self::virtual_dir_entry(path.as_ref()))
+            Err(err) => {
+                if self.async_is_virtual_dir(path.as_ref()).await {
+                    Ok(Self::virtual_dir_entry(path.as_ref()))
+                } else {
+                    Err(err)
+                }
             }
-            Err(err) => Err(err),
         }
     }
 
@@ -149,10 +175,13 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
     ) -> Result<DirectoryEntry, anyhow::Error> {
         match self.inner.async_directory_entry_buffer(path, buffer).await {
             Ok(e) => Ok(e),
-            Err(_) if self.is_virtual_dir(path.as_ref()) => {
-                Ok(Self::virtual_dir_entry(path.as_ref()))
+            Err(err) => {
+                if self.async_is_virtual_dir(path.as_ref()).await {
+                    Ok(Self::virtual_dir_entry(path.as_ref()))
+                } else {
+                    Err(err)
+                }
             }
-            Err(err) => Err(err),
         }
     }
 
@@ -247,7 +276,12 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
                 listing_path.join(&next_comp)
             };
 
-            if let Some(virtual_path) = (is_ignored)(FileType::Dir, virtual_path) {
+            if let Some(virtual_path) = is_ignored.call_async(FileType::Dir, virtual_path).await
+                && !self
+                    .inner
+                    .async_is_denied(FileType::Dir, &virtual_path)
+                    .await
+            {
                 virtual_dirs.push(Self::virtual_dir_entry(&virtual_path));
             }
         }

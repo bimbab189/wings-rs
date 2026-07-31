@@ -1041,9 +1041,9 @@ impl PbsVirtualFilesystem {
     ) {
         for (name, meta) in node.files.iter() {
             let archive_path = archive_dir.join(name.as_str());
-            if (is_ignored)(meta.file_type, archive_path.clone()).is_none() {
+            let Some(archive_path) = (is_ignored)(meta.file_type, archive_path) else {
                 continue;
-            }
+            };
             out.push(SubtreeEntry {
                 relative: relative_dir.join(name.as_str()),
                 archive_path,
@@ -1057,9 +1057,9 @@ impl PbsVirtualFilesystem {
 
         for (name, child) in node.dirs.iter() {
             let archive_path = archive_dir.join(name.as_str());
-            if (is_ignored)(FileType::Dir, archive_path.clone()).is_none() {
+            let Some(archive_path) = (is_ignored)(FileType::Dir, archive_path) else {
                 continue;
-            }
+            };
             let relative = relative_dir.join(name.as_str());
             let mode = if child.mode != 0 { child.mode } else { 0o755 };
             out.push(SubtreeEntry {
@@ -1218,7 +1218,10 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             scratch.clear();
             scratch.push(&path);
             scratch.push(name.as_str());
-            match (is_ignored)(FileType::Dir, std::mem::take(&mut scratch)) {
+            match is_ignored
+                .call_async(FileType::Dir, std::mem::take(&mut scratch))
+                .await
+            {
                 Some(kept) => scratch = kept,
                 None => continue,
             }
@@ -1228,7 +1231,10 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             scratch.clear();
             scratch.push(&path);
             scratch.push(name.as_str());
-            match (is_ignored)(meta.file_type, std::mem::take(&mut scratch)) {
+            match is_ignored
+                .call_async(meta.file_type, std::mem::take(&mut scratch))
+                .await
+            {
                 Some(kept) => scratch = kept,
                 None => continue,
             }

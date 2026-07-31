@@ -2,7 +2,8 @@ use crate::{
     routes::MimeCacheValue,
     server::{
         filesystem::virtualfs::{
-            AsyncDirectoryStreamWalkFn, VirtualReadableFilesystem, VirtualWritableFilesystem,
+            AsyncDirectoryStreamWalkFn, IsIgnoredFn, VirtualReadableFilesystem,
+            VirtualWritableFilesystem,
         },
         resources::ResourceUsageWatchExt,
     },
@@ -36,6 +37,17 @@ pub mod operations;
 pub mod pull;
 pub mod usage;
 pub mod virtualfs;
+
+pub fn build_gitignore_matcher<S: AsRef<str>>(
+    lines: impl Iterator<Item = S>,
+) -> Result<ignore::gitignore::Gitignore, ignore::Error> {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new("");
+    for line in lines {
+        builder.add_line(None, line.as_ref()).ok();
+    }
+
+    builder.build()
+}
 
 #[inline]
 pub fn encode_mode(mode: u32) -> compact_str::CompactString {
@@ -118,11 +130,8 @@ impl Filesystem {
         let disk_usage = Arc::new(RwLock::new(usage::DiskUsage::default()));
         let disk_usage_cached_logical = Arc::new(AtomicU64::new(0));
         let disk_usage_cached_physical = Arc::new(AtomicU64::new(0));
-        let mut disk_ignored = ignore::gitignore::GitignoreBuilder::new("/");
-
-        for entry in deny_list {
-            disk_ignored.add_line(None, entry).ok();
-        }
+        let disk_ignored = build_gitignore_matcher(deny_list.iter())
+            .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty());
 
         let cap_filesystem = cap::CapFilesystem::new_uninitialized(&base_path);
         let server_notifier = inotify::InotifyServerNotifier::new(base_path.clone());
@@ -166,11 +175,7 @@ impl Filesystem {
             disk_usage,
             last_disk_check,
             disk_check_completed,
-            disk_ignored: arc_swap::ArcSwap::from_pointee(
-                disk_ignored
-                    .build()
-                    .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty()),
-            ),
+            disk_ignored: arc_swap::ArcSwap::from_pointee(disk_ignored),
 
             archive_fs_cache: moka::future::CacheBuilder::new(8)
                 .time_to_idle(std::time::Duration::from_mins(1))
@@ -197,20 +202,77 @@ impl Filesystem {
     }
 
     pub async fn update_ignored(&self, deny_list: &[impl AsRef<str>]) {
-        let mut disk_ignored = ignore::gitignore::GitignoreBuilder::new("");
-        for entry in deny_list {
-            disk_ignored.add_line(None, entry.as_ref()).ok();
-        }
-
-        if let Ok(disk_ignored) = disk_ignored.build() {
+        if let Ok(disk_ignored) = build_gitignore_matcher(deny_list.iter()) {
             self.disk_ignored.store(Arc::new(disk_ignored));
         }
     }
 
-    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+    fn deny_filter(server: &crate::server::Server) -> IsIgnoredFn {
+        let (sync_server, async_server) = (server.clone(), server.clone());
+
+        IsIgnoredFn::new(
+            move |file_type, path: PathBuf| {
+                if sync_server.filesystem.is_ignored(&path, file_type) {
+                    None
+                } else {
+                    Some(path)
+                }
+            },
+            move |file_type, path: PathBuf| {
+                let server = async_server.clone();
+
+                async move {
+                    if server.filesystem.async_is_ignored(&path, file_type).await {
+                        None
+                    } else {
+                        Some(path)
+                    }
+                }
+            },
+        )
+    }
+
+    pub async fn probe_file_type(&self, path: impl AsRef<Path>) -> cap::FileType {
+        self.async_symlink_metadata(path)
+            .await
+            .map(|metadata| metadata.file_type().into())
+            .unwrap_or(cap::FileType::File)
+    }
+
+    pub fn is_ignored(&self, path: &Path, file_type: cap::FileType) -> bool {
+        let path = if file_type.is_symlink() {
+            self.canonicalize(path)
+                .unwrap_or_else(|_| self.relative_path(path))
+        } else {
+            self.relative_path(path)
+        };
+
+        if path.as_os_str().is_empty() {
+            return false;
+        }
+
         self.disk_ignored
             .load()
-            .matched(self.relative_path(path), is_dir)
+            .matched(path, file_type.is_dir())
+            .is_ignore()
+    }
+
+    pub async fn async_is_ignored(&self, path: &Path, file_type: cap::FileType) -> bool {
+        let path = if file_type.is_symlink() {
+            self.async_canonicalize(path)
+                .await
+                .unwrap_or_else(|_| self.relative_path(path))
+        } else {
+            self.relative_path(path)
+        };
+
+        if path.as_os_str().is_empty() {
+            return false;
+        }
+
+        self.disk_ignored
+            .load()
+            .matched(path, file_type.is_dir())
             .is_ignore()
     }
 
@@ -218,10 +280,6 @@ impl Filesystem {
         (**self.disk_ignored.load()).clone()
     }
 
-    /// Derives the key a path is tracked under in the file history storage.
-    ///
-    /// Every writer and reader of file history must derive keys through this,
-    /// otherwise the same file reached through a symlink lands under two keys.
     pub async fn diff_key(&self, path: &Path) -> PathBuf {
         self.async_canonicalize(path)
             .await
@@ -387,7 +445,10 @@ impl Filesystem {
                 break 'archivefs;
             }
 
-            if self.is_ignored(&archive_path, false) {
+            if self
+                .async_is_ignored(&archive_path, cap::FileType::File)
+                .await
+            {
                 break 'archivefs;
             }
 
@@ -537,6 +598,7 @@ impl Filesystem {
         let mut fs = self.cap_filesystem.get_virtual(server.clone());
         fs.is_primary_server_fs = true;
         fs.is_writable = true;
+        let fs = fs.with_is_ignored(Self::deny_filter(server));
 
         (
             path,
@@ -607,6 +669,7 @@ impl Filesystem {
                         let mut fs = self.cap_filesystem.get_virtual(server.clone());
                         fs.is_primary_server_fs = true;
                         fs.is_writable = false;
+                        let fs = fs.with_is_ignored(Self::deny_filter(server));
 
                         return (inner_path, Arc::new(fs));
                     }
@@ -617,6 +680,7 @@ impl Filesystem {
         let mut fs = self.cap_filesystem.get_virtual(server.clone());
         fs.is_primary_server_fs = true;
         fs.is_writable = true;
+        let fs = fs.with_is_ignored(Self::deny_filter(server));
 
         (path, Arc::new(fs))
     }
@@ -746,7 +810,11 @@ impl Filesystem {
                     )
                     .await?;
                 destination_filesystem
-                    .async_set_permissions(&destination_path, metadata.permissions)
+                    .async_set_permissions(
+                        &destination_path,
+                        metadata.file_type,
+                        metadata.permissions,
+                    )
                     .await?;
             } else {
                 let file_read = filesystem.async_read_file(&path, None).await?;
@@ -762,7 +830,11 @@ impl Filesystem {
                     .async_create_file(&destination_path)
                     .await?;
                 destination_filesystem
-                    .async_set_permissions(&destination_path, metadata.permissions)
+                    .async_set_permissions(
+                        &destination_path,
+                        metadata.file_type,
+                        metadata.permissions,
+                    )
                     .await?;
 
                 tokio::io::copy(&mut reader, &mut writer).await?;
@@ -775,7 +847,7 @@ impl Filesystem {
                 .async_create_dir_all(&destination_path)
                 .await?;
             destination_filesystem
-                .async_set_permissions(&destination_path, metadata.permissions)
+                .async_set_permissions(&destination_path, metadata.file_type, metadata.permissions)
                 .await?;
 
             let ignored = if filesystem.is_primary_server_fs() {
@@ -850,7 +922,7 @@ impl Filesystem {
                                             )
                                             .await?;
                                         destination_filesystem
-                                            .async_set_permissions(&destination_path, metadata.permissions)
+                                            .async_set_permissions(&destination_path, metadata.file_type, metadata.permissions)
                                             .await?;
                                     } else {
                                         let mut reader = progress.async_counting_reader(stream);
@@ -859,7 +931,7 @@ impl Filesystem {
                                             .async_create_file(&destination_path)
                                             .await?;
                                         destination_filesystem
-                                            .async_set_permissions(&destination_path, metadata.permissions)
+                                            .async_set_permissions(&destination_path, metadata.file_type, metadata.permissions)
                                             .await?;
 
                                         tokio::io::copy(&mut reader, &mut writer).await?;
@@ -870,7 +942,7 @@ impl Filesystem {
                                 } else if metadata.file_type.is_dir() {
                                     destination_filesystem.async_create_dir_all(&destination_path).await?;
                                     destination_filesystem
-                                        .async_set_permissions(&destination_path, metadata.permissions)
+                                        .async_set_permissions(&destination_path, metadata.file_type, metadata.permissions)
                                         .await?;
 
                                     progress.increment_bytes(metadata.size);
@@ -1844,5 +1916,37 @@ impl Deref for Filesystem {
 
     fn deref(&self) -> &Self::Target {
         &self.cap_filesystem
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cap::FileType;
+
+    #[test]
+    fn root_is_never_ignored() {
+        tokio_test::block_on(async {
+            let state = crate::routes::AppState::mock();
+            let server = crate::server::Server::mock(uuid::Uuid::new_v4(), state);
+
+            server.filesystem.update_ignored(&["*"]).await;
+
+            for root in ["/", ".", ""] {
+                assert!(!server.filesystem.is_ignored(Path::new(root), FileType::Dir));
+                assert!(
+                    !server
+                        .filesystem
+                        .async_is_ignored(Path::new(root), FileType::Dir)
+                        .await
+                );
+            }
+
+            assert!(
+                server
+                    .filesystem
+                    .is_ignored(Path::new("server.log"), FileType::File)
+            );
+        });
     }
 }

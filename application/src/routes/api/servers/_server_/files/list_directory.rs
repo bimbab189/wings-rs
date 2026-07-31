@@ -48,9 +48,7 @@ mod get {
 
         let metadata = filesystem.async_metadata(&root).await;
         if let Ok(metadata) = metadata {
-            if !metadata.file_type.is_dir()
-                || (filesystem.is_primary_server_fs() && server.filesystem.is_ignored(&root, true))
-            {
+            if !metadata.file_type.is_dir() {
                 return ApiResponse::error("path not a directory")
                     .with_status(StatusCode::EXPECTATION_FAILED)
                     .ok();

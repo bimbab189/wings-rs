@@ -1,3 +1,4 @@
+use crate::server::filesystem::cap::FileType;
 use parking_lot::Mutex;
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -176,19 +177,56 @@ impl UserPermissionsMap {
 
     pub fn is_ignored(
         &self,
+        server: &crate::server::Server,
         user_uuid: uuid::Uuid,
         path: impl AsRef<std::path::Path>,
-        is_dir: bool,
+        file_type: FileType,
     ) -> bool {
-        let path = crate::server::filesystem::cap::CapFilesystem::resolve_path(path.as_ref());
+        let path = if file_type.is_symlink() {
+            server
+                .filesystem
+                .canonicalize(path.as_ref())
+                .unwrap_or_else(|_| server.filesystem.relative_path(path.as_ref()))
+        } else {
+            server.filesystem.relative_path(path.as_ref())
+        };
 
+        self.matches(user_uuid, path, file_type)
+    }
+
+    pub async fn async_is_ignored(
+        &self,
+        server: &crate::server::Server,
+        user_uuid: uuid::Uuid,
+        path: impl AsRef<std::path::Path>,
+        file_type: FileType,
+    ) -> bool {
+        let path = if file_type.is_symlink() {
+            server
+                .filesystem
+                .async_canonicalize(path.as_ref())
+                .await
+                .unwrap_or_else(|_| server.filesystem.relative_path(path.as_ref()))
+        } else {
+            server.filesystem.relative_path(path.as_ref())
+        };
+
+        self.matches(user_uuid, path, file_type)
+    }
+
+    fn matches(
+        &self,
+        user_uuid: uuid::Uuid,
+        path: std::path::PathBuf,
+        file_type: FileType,
+    ) -> bool {
         let mut map = self.map.lock();
         if let Some((_, ignored, last_access)) = map.get_mut(&user_uuid) {
             *last_access = std::time::Instant::now();
 
             ignored
                 .as_ref()
-                .map(|ig| ig.matched(path, is_dir).is_whitelist())
+                .map(|ig| ig.matched(path, file_type.is_dir()).is_whitelist())
                 .unwrap_or(false)
         } else {
             false
@@ -208,7 +246,7 @@ impl UserPermissionsMap {
         }
 
         let overrides = if let Some(ignored_files) = ignored_files {
-            let mut overrides = ignore::overrides::OverrideBuilder::new("/");
+            let mut overrides = ignore::overrides::OverrideBuilder::new("");
             for file in ignored_files {
                 overrides.add(file.as_ref()).ok();
             }
@@ -522,28 +560,37 @@ mod tests {
     #[test]
     fn map_is_ignored_matches_patterns() {
         tokio_test::block_on(async {
+            let state = crate::routes::AppState::mock();
+            let server = crate::server::Server::mock(uuid::Uuid::new_v4(), state);
             let permissions = UserPermissionsMap::default();
             let user = uuid::Uuid::new_v4();
             let ignored: &[&str] = &["*.log"];
             permissions.set_permissions(user, perms(&[Permission::FileRead]), Some(ignored));
-            assert!(permissions.is_ignored(user, "server.log", false));
-            assert!(permissions.is_ignored(user, "sub/server.log", false));
-            assert!(!permissions.is_ignored(user, "server.txt", false));
+            assert!(permissions.is_ignored(&server, user, "server.log", FileType::File));
+            assert!(permissions.is_ignored(&server, user, "sub/server.log", FileType::File));
+            assert!(!permissions.is_ignored(&server, user, "server.txt", FileType::File));
             // unknown user is never ignored
-            assert!(!permissions.is_ignored(uuid::Uuid::new_v4(), "server.log", false));
+            assert!(!permissions.is_ignored(
+                &server,
+                uuid::Uuid::new_v4(),
+                "server.log",
+                FileType::File
+            ));
         });
     }
 
     #[test]
     fn map_update_without_ignored_keeps_existing_overrides() {
         tokio_test::block_on(async {
+            let state = crate::routes::AppState::mock();
+            let server = crate::server::Server::mock(uuid::Uuid::new_v4(), state);
             let permissions = UserPermissionsMap::default();
             let user = uuid::Uuid::new_v4();
             let ignored: &[&str] = &["*.log"];
             permissions.set_permissions(user, perms(&[Permission::FileRead]), Some(ignored));
-            assert!(permissions.is_ignored(user, "x.log", false));
+            assert!(permissions.is_ignored(&server, user, "x.log", FileType::File));
             permissions.set_permissions(user, perms(&[Permission::FileDelete]), None::<&[&str]>);
-            assert!(permissions.is_ignored(user, "x.log", false));
+            assert!(permissions.is_ignored(&server, user, "x.log", FileType::File));
         });
     }
 

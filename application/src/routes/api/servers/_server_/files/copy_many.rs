@@ -169,14 +169,6 @@ mod post {
                                 Err(_) => continue,
                             };
 
-                            if filesystem.is_primary_server_fs()
-                                && server
-                                    .filesystem
-                                    .is_ignored(&from, metadata.file_type.is_dir())
-                            {
-                                continue;
-                            }
-
                             let to_parent = match to.parent() {
                                 Some(parent) => parent,
                                 None => continue,
@@ -194,7 +186,8 @@ mod post {
                             if destination_filesystem.is_primary_server_fs()
                                 && server
                                     .filesystem
-                                    .is_ignored(&to, metadata.file_type.is_dir())
+                                    .async_is_ignored(&to, metadata.file_type)
+                                    .await
                             {
                                 continue;
                             }

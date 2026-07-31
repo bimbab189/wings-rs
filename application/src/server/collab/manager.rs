@@ -1,7 +1,7 @@
 use super::{CollabConflict, CollabError, CollabParticipant, CollabSaved, CollabSyncMeta};
 use crate::server::{
     activity::{Activity, ActivityEvent},
-    filesystem::virtualfs::VirtualWritableFilesystem,
+    filesystem::{cap::FileType, virtualfs::VirtualWritableFilesystem},
     permissions::{Permission, Permissions},
     websocket::{
         ServerWebsocketHandler, TargetedWebsocketMessage, WebsocketEvent, WebsocketMessage,
@@ -407,8 +407,14 @@ impl CollabManager {
         }
 
         let path = root.join(file_name);
-        if server.filesystem.is_ignored(&path, false)
-            || server.user_permissions.is_ignored(user_uuid, &path, false)
+        if server
+            .filesystem
+            .async_is_ignored(&path, FileType::File)
+            .await
+            || server
+                .user_permissions
+                .async_is_ignored(server, user_uuid, &path, FileType::File)
+                .await
         {
             return Err(CollabError::User("file not found"));
         }
