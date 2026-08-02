@@ -2,7 +2,14 @@ use super::{config::PbsConfig, error::PbsError, naming, tls};
 use bytes::Bytes;
 use std::{
     future::poll_fn,
+    io,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
 };
 
 const WINDOW_SIZE: u32 = (1 << 31) - 2;
@@ -12,23 +19,116 @@ fn transport<E: std::fmt::Display>(err: E) -> PbsError {
     PbsError::Transport(err.to_string().into())
 }
 
-fn parse_host_port(base_url: &str) -> Result<(String, u16), PbsError> {
-    let without_scheme = base_url
-        .strip_prefix("https://")
-        .or_else(|| base_url.strip_prefix("http://"))
-        .ok_or_else(|| PbsError::Config("url must start with http:// or https://".into()))?;
+enum MaybeTlsStream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
 
-    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
-
-    match host_port.rsplit_once(':') {
-        Some((host, port)) => {
-            let port = port
-                .parse::<u16>()
-                .map_err(|_| PbsError::Config("invalid port in url".into()))?;
-            Ok((host.to_string(), port))
+impl AsyncRead for MaybeTlsStream {
+    #[inline]
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_read(cx, buf),
         }
-        None => Ok((host_port.to_string(), 8007)),
     }
+}
+
+impl AsyncWrite for MaybeTlsStream {
+    #[inline]
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_write(cx, buf),
+        }
+    }
+
+    #[inline]
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    #[inline]
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(stream) => stream.is_write_vectored(),
+            Self::Tls(stream) => stream.is_write_vectored(),
+        }
+    }
+
+    #[inline]
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_flush(cx),
+        }
+    }
+
+    #[inline]
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(&mut **stream).poll_shutdown(cx),
+        }
+    }
+}
+
+struct Endpoint {
+    authority: String,
+    host: String,
+    port: u16,
+    scheme: &'static str,
+}
+
+impl Endpoint {
+    fn is_tls(&self) -> bool {
+        self.scheme == "https"
+    }
+}
+
+fn parse_endpoint(base_url: &str) -> Result<Endpoint, PbsError> {
+    let url = reqwest::Url::parse(base_url)
+        .map_err(|_| PbsError::Config("url is not a valid url".into()))?;
+
+    let (scheme, port) = match url.scheme() {
+        "https" => ("https", url.port().unwrap_or(443)),
+        "http" => ("http", url.port().unwrap_or(80)),
+        _ => {
+            return Err(PbsError::Config(
+                "url must start with http:// or https://".into(),
+            ));
+        }
+    };
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| PbsError::Config("url is missing a host".into()))?;
+
+    Ok(Endpoint {
+        authority: format!("{host}:{port}"),
+        host: host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host)
+            .to_string(),
+        port,
+        scheme,
+    })
 }
 
 pub fn snapshot_query(config: &PbsConfig, backup_id: &str, backup_time: i64) -> String {
@@ -95,6 +195,7 @@ struct ConnectionTasks {
 pub struct H2Transport {
     send: h2::client::SendRequest<Bytes>,
     authority: String,
+    scheme: &'static str,
     tasks: Arc<ConnectionTasks>,
 }
 
@@ -105,25 +206,37 @@ impl H2Transport {
         endpoint: &str,
         session_query: &str,
     ) -> Result<Self, PbsError> {
-        let (host, port) = parse_host_port(config.base_url())?;
-        let authority = format!("{host}:{port}");
+        let target = parse_endpoint(config.base_url())?;
 
-        let tls_config =
-            tls::build_client_config(config.fingerprint.as_deref()).map_err(PbsError::Config)?;
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+        let tls = if target.is_tls() {
+            let tls_config = tls::build_client_config(config.fingerprint.as_deref())
+                .map_err(PbsError::Config)?;
+            let server_name = rustls::pki_types::ServerName::try_from(target.host.clone())
+                .map_err(|_| PbsError::Config("invalid hostname in url".into()))?;
 
-        let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+            Some((
+                tokio_rustls::TlsConnector::from(Arc::new(tls_config)),
+                server_name,
+            ))
+        } else {
+            None
+        };
+
+        let tcp = TcpStream::connect((target.host.as_str(), target.port))
             .await
             .map_err(transport)?;
-        let server_name = rustls::pki_types::ServerName::try_from(host.clone())
-            .map_err(|_| PbsError::Config("invalid hostname in url".into()))?;
-        let tls = connector
-            .connect(server_name, tcp)
-            .await
-            .map_err(transport)?;
+        let stream = match tls {
+            Some((connector, server_name)) => MaybeTlsStream::Tls(Box::new(
+                connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(transport)?,
+            )),
+            None => MaybeTlsStream::Plain(tcp),
+        };
 
         let (mut sender, connection) =
-            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls))
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
                 .await
                 .map_err(transport)?;
         let upgrade_task = tokio::spawn(async move {
@@ -133,7 +246,7 @@ impl H2Transport {
         let request = hyper::Request::builder()
             .method(hyper::Method::GET)
             .uri(format!("/api2/json/{endpoint}?{session_query}"))
-            .header(hyper::header::HOST, &authority)
+            .header(hyper::header::HOST, &target.authority)
             .header(hyper::header::AUTHORIZATION, config.authorization_header())
             .header(hyper::header::CONNECTION, "upgrade")
             .header(hyper::header::UPGRADE, protocol)
@@ -186,7 +299,8 @@ impl H2Transport {
 
         Ok(Self {
             send,
-            authority,
+            authority: target.authority,
+            scheme: target.scheme,
             tasks: Arc::new(ConnectionTasks {
                 handles: Mutex::new(vec![upgrade_task, driver_task]),
             }),
@@ -218,9 +332,9 @@ impl H2Transport {
         content_type: Option<&str>,
     ) -> Result<hyper::Request<()>, PbsError> {
         let uri = if query.is_empty() {
-            format!("https://{}/{}", self.authority, path)
+            format!("{}://{}/{}", self.scheme, self.authority, path)
         } else {
-            format!("https://{}/{}?{}", self.authority, path, query)
+            format!("{}://{}/{}?{}", self.scheme, self.authority, path, query)
         };
 
         let mut builder = hyper::Request::builder().method(method).uri(uri);
