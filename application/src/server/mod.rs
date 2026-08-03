@@ -465,6 +465,18 @@ impl Server {
                                     return;
                                 }
 
+                                server.activity.log_activity(activity::Activity {
+                                    event: activity::ActivityEvent::CrashDetected,
+                                    user: None,
+                                    ip: None,
+                                    metadata: Some(json!({
+                                        "exit_code": exit_code,
+                                        "oom_killed": oom_killed,
+                                    })),
+                                    schedule: None,
+                                    timestamp: chrono::Utc::now(),
+                                });
+
                                 server.schedules.execute_crash_trigger().await;
 
                                 server.log_daemon_with_prelude("---------- Detected server process in a crashed state! ----------");
