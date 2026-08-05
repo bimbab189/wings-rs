@@ -208,6 +208,9 @@ pub enum ScheduleAction {
         #[serde(default)]
         backup_group_uuid: Option<uuid::Uuid>,
         ignored_files: Vec<compact_str::CompactString>,
+
+        #[serde(default)]
+        output_into: Option<ScheduleVariable>,
     },
     RestoreBackup {
         ignore_failure: bool,
@@ -418,46 +421,39 @@ impl ScheduleAction {
                     }
 
                     while let Some(ch) = chars.next() {
-                        if ch == '{' {
-                            if chars.peek() == Some(&'{') {
-                                chars.next();
-                                push_within_limit(&mut result, '{')?;
-                            } else {
-                                let mut var_name = String::new();
-                                let mut found_closing = false;
+                        if ch != '{' || chars.peek() != Some(&'{') {
+                            push_within_limit(&mut result, ch)?;
+                            continue;
+                        }
 
-                                for inner_ch in chars.by_ref() {
-                                    if inner_ch == '}' {
-                                        found_closing = true;
-                                        break;
-                                    }
-                                    var_name.push(inner_ch);
-                                }
+                        chars.next();
+
+                        let mut var_name = String::new();
+                        let mut found_closing = false;
+
+                        while let Some(inner_ch) = chars.next() {
+                            if inner_ch == '}' && chars.peek() == Some(&'}') {
+                                chars.next();
+                                found_closing = true;
+                                break;
+                            }
+
+                            var_name.push(inner_ch);
+                        }
+
+                        match execution_context
+                            .get_variable_by_str(var_name.trim())
+                            .filter(|_| found_closing)
+                        {
+                            Some(value) => push_str_within_limit(&mut result, value.as_str())?,
+                            None => {
+                                push_str_within_limit(&mut result, "{{")?;
+                                push_str_within_limit(&mut result, &var_name)?;
 
                                 if found_closing {
-                                    if let Some(value) =
-                                        execution_context.get_variable_by_str(&var_name)
-                                    {
-                                        push_str_within_limit(&mut result, value.as_str())?;
-                                    } else {
-                                        push_within_limit(&mut result, '{')?;
-                                        push_str_within_limit(&mut result, &var_name)?;
-                                        push_within_limit(&mut result, '}')?;
-                                    }
-                                } else {
-                                    push_within_limit(&mut result, '{')?;
-                                    push_str_within_limit(&mut result, &var_name)?;
+                                    push_str_within_limit(&mut result, "}}")?;
                                 }
                             }
-                        } else if ch == '}' {
-                            if chars.peek() == Some(&'}') {
-                                chars.next();
-                                push_within_limit(&mut result, '}')?;
-                            } else {
-                                push_within_limit(&mut result, ch)?;
-                            }
-                        } else {
-                            push_within_limit(&mut result, ch)?;
                         }
                     }
 
@@ -752,6 +748,7 @@ impl ScheduleAction {
                 name,
                 backup_group_uuid,
                 ignored_files,
+                output_into,
                 ..
             } => {
                 let name = match name {
@@ -793,6 +790,10 @@ impl ScheduleAction {
 
                 if state.backup_manager.fast_contains(server, uuid).await {
                     return Err("backup already exists".into());
+                }
+
+                if let Some(output_into) = output_into {
+                    execution_context.store_variable(output_into, uuid.to_compact_string())?;
                 }
 
                 let thread = tokio::spawn({
