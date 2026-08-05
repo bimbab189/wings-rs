@@ -5463,6 +5463,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]
@@ -6111,6 +6112,7 @@ dependencies = [
  "tracing-subscriber",
  "unrar",
  "ureq",
+ "url",
  "utoipa",
  "utoipa-axum",
  "uuid",

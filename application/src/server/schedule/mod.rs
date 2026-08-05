@@ -7,6 +7,7 @@ use utoipa::ToSchema;
 
 pub mod actions;
 pub mod conditions;
+pub mod http;
 pub mod manager;
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -156,12 +157,31 @@ impl ScheduleExecutionContext {
         self.variables.get(variable)
     }
 
-    pub fn store_variable(
+    pub fn store_variable<'a>(
         &mut self,
-        variable: actions::ScheduleVariable,
+        variable: impl Into<Cow<'a, actions::ScheduleVariable>>,
         value: compact_str::CompactString,
-    ) -> Option<compact_str::CompactString> {
-        self.variables.insert(variable.variable, value)
+    ) -> Result<(), Cow<'static, str>> {
+        let variable = variable.into();
+
+        if value.len() > MAX_VARIABLE_SIZE {
+            return Err(format!(
+                "variable `{}` exceeds the maximum size of {} bytes.",
+                variable.variable, MAX_VARIABLE_SIZE
+            )
+            .into());
+        }
+
+        if !self.variables.contains_key(&variable.variable) && self.variables.len() >= MAX_VARIABLES
+        {
+            return Err(
+                format!("a schedule may not store more than {MAX_VARIABLES} variables.").into(),
+            );
+        }
+
+        self.variables.insert(variable.into_owned().variable, value);
+
+        Ok(())
     }
 }
 
@@ -172,6 +192,8 @@ struct ConditionFrame {
 }
 
 pub const MAX_IF_DEPTH: usize = 8;
+pub const MAX_VARIABLES: usize = 64;
+pub const MAX_VARIABLE_SIZE: usize = 16 * 1024;
 
 fn validate_action_structure(
     actions: &[super::configuration::ScheduleAction],
@@ -737,10 +759,18 @@ impl Schedule {
                                             if let Some(output_into) = &output_into {
                                                 let mut execution_context =
                                                     ScheduleExecutionContext::new(schedule_uuid);
-                                                execution_context.store_variable(
-                                                    output_into.clone(),
-                                                    line.to_compact_string(),
-                                                );
+                                                if let Err(err) = execution_context
+                                                    .store_variable(
+                                                        output_into,
+                                                        line.to_compact_string(),
+                                                    )
+                                                {
+                                                    tracing::warn!(
+                                                        server = %server.uuid,
+                                                        "failed to store console line trigger variable: {}",
+                                                        err
+                                                    );
+                                                }
                                                 nest_execution_context
                                                     .lock()
                                                     .await
@@ -756,10 +786,18 @@ impl Schedule {
                                             if let Some(output_into) = &output_into {
                                                 let mut execution_context =
                                                     ScheduleExecutionContext::new(schedule_uuid);
-                                                execution_context.store_variable(
-                                                    output_into.clone(),
-                                                    line.to_compact_string(),
-                                                );
+                                                if let Err(err) = execution_context
+                                                    .store_variable(
+                                                        output_into,
+                                                        line.to_compact_string(),
+                                                    )
+                                                {
+                                                    tracing::warn!(
+                                                        server = %server.uuid,
+                                                        "failed to store console line trigger variable: {}",
+                                                        err
+                                                    );
+                                                }
                                                 nest_execution_context
                                                     .lock()
                                                     .await

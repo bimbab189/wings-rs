@@ -21,6 +21,7 @@ serde_json = { workspace = true }
 utoipa = { version = "5.4.0", features = ["axum_extras", "preserve_order", "chrono", "indexmap", "uuid"] }
 utoipa-axum = "0.2.0"
 reqwest = { workspace = true }
+url = { workspace = true }
 tokio = { workspace = true }
 chrono = { version = "0.4.40", features = ["serde"] }
 colored = "3.0.0"

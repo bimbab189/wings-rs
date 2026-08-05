@@ -47,6 +47,9 @@ pub enum ActivityEvent {
     FileDelete,
     #[serde(rename = "server:file.rename")]
     FileRename,
+
+    #[serde(rename = "server:schedule.http-request")]
+    ScheduleHttpRequest,
 }
 
 impl ActivityEvent {

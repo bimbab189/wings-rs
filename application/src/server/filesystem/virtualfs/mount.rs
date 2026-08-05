@@ -26,12 +26,6 @@ pub struct VirtualMountFilesystem {
 }
 
 impl VirtualMountFilesystem {
-    /// Whether a gateway directory should be synthesized for this path.
-    ///
-    /// A denied path is never one. Without that check the synthesized entry
-    /// would launder the deny rejection from the inner filesystem into a
-    /// successful directory stat, since both a denial and a genuinely missing
-    /// path surface here as an opaque error.
     fn is_virtual_dir(&self, path: &Path) -> bool {
         self.is_gateway(path) && !self.inner.is_denied(FileType::Dir, path)
     }

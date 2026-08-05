@@ -48,6 +48,36 @@ fn api_remote_download_blocked_cidrs() -> Vec<cidr::IpCidr> {
         ])
     }
 }
+fn api_schedule_steps_http_request_enabled() -> bool {
+    true
+}
+fn api_schedule_steps_http_request_blocked_cidrs() -> Vec<cidr::IpCidr> {
+    unsafe {
+        Vec::from([
+            cidr::IpCidr::from_str("0.0.0.0/8").unwrap_unchecked(),
+            cidr::IpCidr::from_str("127.0.0.0/8").unwrap_unchecked(),
+            cidr::IpCidr::from_str("10.0.0.0/8").unwrap_unchecked(),
+            cidr::IpCidr::from_str("100.64.0.0/10").unwrap_unchecked(),
+            cidr::IpCidr::from_str("172.16.0.0/12").unwrap_unchecked(),
+            cidr::IpCidr::from_str("192.168.0.0/16").unwrap_unchecked(),
+            cidr::IpCidr::from_str("169.254.0.0/16").unwrap_unchecked(),
+            cidr::IpCidr::from_str("::1/128").unwrap_unchecked(),
+            cidr::IpCidr::from_str("fe80::/10").unwrap_unchecked(),
+            cidr::IpCidr::from_str("fc00::/7").unwrap_unchecked(),
+        ])
+    }
+}
+fn api_schedule_steps_http_request_requests() -> u32 {
+    5
+}
+fn api_schedule_steps_http_request_window_seconds() -> u64 {
+    60
+}
+/// Kept at or below [`crate::server::schedule::MAX_VARIABLE_SIZE`], since a
+/// captured body larger than a variable may hold would fail the step outright.
+fn api_schedule_steps_http_request_max_response_size() -> usize {
+    16 * 1024
+}
 fn api_directory_entry_limit() -> usize {
     10000
 }
@@ -640,6 +670,30 @@ nestify::nest! {
             #[serde(default)]
             #[schema(value_type = Vec<String>)]
             pub trusted_proxies: Vec<cidr::IpCidr>,
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub schedule: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct ApiSchedule {
+                #[serde(default)]
+                #[schema(inline)]
+                pub steps: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct ApiScheduleSteps {
+                    #[serde(default)]
+                    #[schema(inline)]
+                    pub http_request: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct ApiScheduleStepsHttpRequest {
+                        #[serde(default = "api_schedule_steps_http_request_enabled")]
+                        pub enabled: bool,
+                        #[serde(default = "api_schedule_steps_http_request_requests")]
+                        pub requests: u32,
+                        #[serde(default = "api_schedule_steps_http_request_window_seconds")]
+                        pub window_seconds: u64,
+                        #[serde(default = "api_schedule_steps_http_request_max_response_size")]
+                        pub max_response_size: usize,
+                        #[serde(default = "api_schedule_steps_http_request_blocked_cidrs")]
+                        #[schema(value_type = Vec<String>)]
+                        pub blocked_cidrs: Vec<cidr::IpCidr>,
+                    },
+                },
+            },
         },
         #[serde(default)]
         #[schema(inline)]
