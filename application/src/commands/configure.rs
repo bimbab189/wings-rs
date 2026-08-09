@@ -2,6 +2,7 @@ use base64::Engine;
 use clap::{Args, FromArgMatches};
 use colored::Colorize;
 use dialoguer::{Confirm, Input, theme::ColorfulTheme};
+use std::sync::Arc;
 
 #[derive(Args)]
 pub struct ConfigureArgs {
@@ -29,9 +30,20 @@ pub struct ConfigureArgs {
 
     #[arg(long = "node", help = "the node id to configure")]
     pub node: Option<usize>,
+}
 
-    #[arg(short = 'c', long = "config", help = "path to the config file")]
-    pub config: Option<String>,
+fn apply(
+    env: Option<&Arc<crate::config::Config>>,
+    patch: serde_json::Value,
+) -> Result<crate::config::InnerConfig, anyhow::Error> {
+    let mut config = match env {
+        Some(config) => serde_json::to_value(&**config.load())?,
+        None => serde_json::to_value(crate::config::InnerConfig::default())?,
+    };
+
+    json_patch::merge(&mut config, &patch);
+
+    Ok(serde_json::from_value(config)?)
 }
 
 pub struct ConfigureCommand;
@@ -46,15 +58,32 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
             Box::pin(async move {
                 let args = ConfigureArgs::from_arg_matches(&arg_matches)?;
 
-                let config_path = args
-                    .config
-                    .as_deref()
-                    .or_else(|| crate::config::Config::find())
-                    .unwrap_or(crate::config::Config::DEFAULT_PATH);
+                let config_path = match env.as_ref() {
+                    Some(config) => config.path.clone(),
+                    None => arg_matches
+                        .get_one::<String>("config")
+                        .cloned()
+                        .or_else(|| crate::config::Config::find().map(String::from))
+                        .unwrap_or_else(|| crate::config::Config::DEFAULT_PATH.to_string()),
+                };
 
-                if env.is_some() && !args.r#override {
+                let exists = std::path::Path::new(&config_path).exists();
+
+                if exists && env.is_none() {
+                    eprintln!(
+                        "{} {}",
+                        "the existing configuration could not be read, its values will not be kept:"
+                            .yellow(),
+                        config_path
+                    );
+                }
+
+                if exists && !args.r#override {
                     let confirm = Confirm::with_theme(&ColorfulTheme::default())
-                        .with_prompt("do you want to override the current configuration?")
+                        .with_prompt(format!(
+                            "do you want to {} the configuration at {config_path}?",
+                            if env.is_some() { "update" } else { "override" }
+                        ))
                         .default(false)
                         .interact()?;
 
@@ -77,7 +106,7 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
                         }
                     };
 
-                    let response = match serde_norway::from_slice(&decoded) {
+                    let response: serde_json::Value = match serde_norway::from_slice(&decoded) {
                         Ok(response) => response,
                         Err(_) => {
                             eprintln!("{}", "failed to decode join data payload!".red());
@@ -85,7 +114,15 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
                         }
                     };
 
-                    crate::config::Config::save_new(config_path, response)?;
+                    let response = match apply(env.as_ref(), response) {
+                        Ok(response) => response,
+                        Err(err) => {
+                            eprintln!("{} {:#?}", "failed to apply join data:".red(), err);
+                            return Ok(1);
+                        }
+                    };
+
+                    crate::config::Config::save_new(&config_path, response)?;
 
                     println!("{}", "successfully configured wings.".green());
 
@@ -146,7 +183,7 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
 
                     let response = match response {
                         Ok(res) => match res.text().await {
-                            Ok(text) => crate::remote::into_json(text),
+                            Ok(text) => crate::remote::into_json::<serde_json::Value>(text),
                             Err(err) => {
                                 eprintln!("{} {:#?}", "failed to read response body:".red(), err);
                                 return Ok(1);
@@ -166,7 +203,15 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
                         }
                     };
 
-                    crate::config::Config::save_new(config_path, response)?;
+                    let response = match apply(env.as_ref(), response) {
+                        Ok(response) => response,
+                        Err(err) => {
+                            eprintln!("{} {:#?}", "failed to apply configuration:".red(), err);
+                            return Ok(1);
+                        }
+                    };
+
+                    crate::config::Config::save_new(&config_path, response)?;
 
                     println!("{}", "successfully configured wings.".green());
 

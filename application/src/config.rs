@@ -1036,7 +1036,7 @@ nestify::nest! {
                 pub ispn: bool,
                 #[serde(default = "docker_network_driver")]
                 pub driver: String,
-                #[serde(default = "docker_network_mode")]
+                #[serde(default = "docker_network_mode", alias = "network_mode")]
                 pub mode: String,
                 #[serde(default)]
                 pub is_internal: bool,
@@ -1550,6 +1550,17 @@ impl Config {
                 std::thread::sleep(std::time::Duration::from_secs(10));
             }
             tracing::warn!("you are treading on thin ice. proceed at your own risk.");
+        }
+
+        if cfg.docker.network.mode == docker_network_mode()
+            && cfg.docker.network.name != docker_network_name()
+        {
+            tracing::warn!(
+                "docker.network.mode is set to the default \"{}\" while docker.network.name is \"{}\", containers will be attached to a network that does not exist. if this is not intentional, set docker.network.mode to \"{}\".",
+                cfg.docker.network.mode,
+                cfg.docker.network.name,
+                cfg.docker.network.name
+            );
         }
 
         #[cfg(unix)]
