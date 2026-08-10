@@ -73,8 +73,6 @@ fn api_schedule_steps_http_request_requests() -> u32 {
 fn api_schedule_steps_http_request_window_seconds() -> u64 {
     60
 }
-/// Kept at or below [`crate::server::schedule::MAX_VARIABLE_SIZE`], since a
-/// captured body larger than a variable may hold would fail the step outright.
 fn api_schedule_steps_http_request_max_response_size() -> usize {
     16 * 1024
 }
@@ -1236,6 +1234,15 @@ pub const FORBIDDEN_PATHS: &[&str] = &[
     "system.passwd",
     "docker.socket",
     "allowed_mounts",
+    "ignore_panel_config_updates",
+    "ignore_panel_wings_upgrades",
+    "api.host",
+    "api.port",
+    "api.ssl",
+    "api.trusted_proxies",
+    "api.disable_remote_download",
+    "api.remote_download_blocked_cidrs",
+    "api.schedule.steps.http_request",
 ];
 
 #[allow(dead_code)]

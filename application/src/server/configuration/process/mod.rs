@@ -90,7 +90,7 @@ impl ServerConfigurationFile {
         match *section {
             "server" => Self::lookup_server_variable(server, section_slice).await,
             "config" => Self::lookup_config_variable(&server.app_state.config, section_slice).await,
-            "env" => {
+            "env" | "environment" => {
                 let Some(env_var) = parts.get(1) else {
                     return Ok(compact_str::CompactString::default());
                 };
@@ -174,7 +174,7 @@ impl ServerConfigurationFile {
                             }
                         }
                     }
-                    "env" => {
+                    "env" | "environment" => {
                         let Some(env_var) = parts.get(2) else {
                             return Ok(compact_str::CompactString::default());
                         };
@@ -202,7 +202,7 @@ impl ServerConfigurationFile {
                     }
                 }
             }
-            "env" => {
+            "env" | "environment" => {
                 let Some(env_var) = parts.get(1) else {
                     return Ok(compact_str::CompactString::default());
                 };
