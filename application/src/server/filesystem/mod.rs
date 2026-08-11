@@ -35,6 +35,7 @@ pub mod inotify;
 pub mod limiter;
 pub mod operations;
 pub mod pull;
+pub mod sqlite;
 pub mod usage;
 pub mod virtualfs;
 
