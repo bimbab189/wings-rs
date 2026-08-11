@@ -140,10 +140,6 @@ impl super::ProcessConfigurationFileParser for IniFileParser {
     }
 }
 
-/// `ini_roundtrip` only treats a line as a comment when it starts with one, so an inline comment
-/// is still part of the parsed value. `if_value` compares against the value without it, matching
-/// [`rewrite_property`], which drops it when writing. A `;` or `#` only counts when it follows
-/// whitespace, so values like `#ff0000` survive intact.
 fn strip_inline_comment(value: &str) -> &str {
     let mut after_whitespace = false;
 
