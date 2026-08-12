@@ -1,3 +1,4 @@
+use rusqlite::fallible_iterator::FallibleIterator;
 use serde::Serialize;
 use std::time::Duration;
 use utoipa::ToSchema;
@@ -46,8 +47,6 @@ pub fn run_query(
     sql: &str,
     max_rows: usize,
 ) -> Result<Vec<QueryResultSet>, rusqlite::Error> {
-    use rusqlite::fallible_iterator::FallibleIterator;
-
     let mut results = Vec::new();
     let mut batch = rusqlite::Batch::new(connection, sql);
 

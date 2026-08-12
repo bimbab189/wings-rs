@@ -364,6 +364,7 @@ impl BackupManager {
                     crate::server::websocket::WebsocketMessage::builder(
                         crate::server::websocket::WebsocketEvent::ServerBackupRestoreCompleted,
                     )
+                    .arg("true")
                     .build(),
                 )?;
 
@@ -390,6 +391,7 @@ impl BackupManager {
                     crate::server::websocket::WebsocketMessage::builder(
                         crate::server::websocket::WebsocketEvent::ServerBackupRestoreCompleted,
                     )
+                    .arg("false")
                     .build(),
                 )?;
 
