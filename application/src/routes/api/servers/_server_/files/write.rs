@@ -132,8 +132,7 @@ mod post {
         if filesystem.is_primary_server_fs()
             && !server
                 .filesystem
-                .async_allocate_in_path(parent, content_size - old_content_size, false)
-                .await
+                .has_headroom(content_size - old_content_size)
         {
             return ApiResponse::error("failed to allocate space")
                 .with_status(StatusCode::EXPECTATION_FAILED)

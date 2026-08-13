@@ -179,7 +179,12 @@ impl AsyncCompressionReader {
                 Ok(_) => {}
                 Err(err) => {
                     let _ = inner_error_sender.send(err);
+                    return;
                 }
+            }
+
+            if let Err(err) = writer.shutdown() {
+                let _ = inner_error_sender.send(err);
             }
         });
 

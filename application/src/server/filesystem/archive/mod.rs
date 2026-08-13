@@ -453,6 +453,10 @@ impl Archive {
 
                 let metadata = self.server.filesystem.async_metadata(&self.path).await?;
 
+                if let Some(total) = &total {
+                    total.store(metadata.len(), Ordering::Relaxed);
+                }
+
                 let file = self.file.into_std().await;
                 let (guard, listener) = AbortGuard::new();
 
@@ -893,22 +897,22 @@ impl Archive {
                 }
 
                 tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
+                    #[cfg(target_os = "linux")]
+                    let archive_path = Path::new("/proc/self/fd")
+                        .join(std::os::fd::AsRawFd::as_raw_fd(&self.file).to_string());
                     #[cfg(not(target_os = "linux"))]
-                    drop(self.file);
+                    let archive_path = {
+                        drop(self.file);
+
+                        self.server
+                            .filesystem
+                            .base_path
+                            .join(self.server.filesystem.relative_path(&self.path))
+                    };
 
                     if let Some(total) = total {
                         let mut entry_total = 0;
-                        let archive = unrar::Archive::new_owned(
-                            #[cfg(target_os = "linux")]
-                            Path::new("/proc/self/fd")
-                                .join(std::os::fd::AsRawFd::as_raw_fd(&self.file).to_string()),
-                            #[cfg(not(target_os = "linux"))]
-                            self.server
-                                .filesystem
-                                .base_path
-                                .join(self.server.filesystem.relative_path(&self.path)),
-                        )
-                        .open_for_listing()?;
+                        let archive = unrar::Archive::new(&archive_path).open_for_listing()?;
                         for entry in archive.flatten() {
                             entry_total += entry.unpacked_size;
                         }
@@ -916,13 +920,7 @@ impl Archive {
                         total.store(entry_total, Ordering::Relaxed);
                     }
 
-                    let mut archive = unrar::Archive::new_owned(
-                        self.server
-                            .filesystem
-                            .base_path
-                            .join(self.server.filesystem.relative_path(&self.path)),
-                    )
-                    .open_for_processing()?;
+                    let mut archive = unrar::Archive::new(&archive_path).open_for_processing()?;
                     let mut directory_entries = chunked_vec::ChunkedVec::new();
                     let mut last_parent = None;
 
@@ -1473,8 +1471,9 @@ impl Archive {
                         }
 
                         let stat = entry.metadata().stat;
-                        let modified_time = std::time::UNIX_EPOCH
-                            + std::time::Duration::from_secs(stat.mtime.secs.max(0) as u64);
+                        let modified_time = std::time::UNIX_EPOCH.checked_add(
+                            std::time::Duration::from_secs(stat.mtime.secs.max(0) as u64),
+                        );
 
                         match entry.kind() {
                             pbs_client::pxar::EntryKind::Directory => {
@@ -1485,7 +1484,9 @@ impl Archive {
                                     FileType::Dir,
                                     permissions,
                                 )?;
-                                if directory_entries.len() < Self::MAX_DIRECTORY_MTIME_ENTRIES {
+                                if let Some(modified_time) = modified_time
+                                    && directory_entries.len() < Self::MAX_DIRECTORY_MTIME_ENTRIES
+                                {
                                     directory_entries.push((destination_path, modified_time));
                                 }
                             }
@@ -1516,12 +1517,14 @@ impl Archive {
                                     FileType::File,
                                     permissions,
                                 )?;
-                                destination_filesystem.set_times(
-                                    &destination_path,
-                                    FileType::File,
-                                    modified_time,
-                                    None,
-                                )?;
+                                if let Some(modified_time) = modified_time {
+                                    destination_filesystem.set_times(
+                                        &destination_path,
+                                        FileType::File,
+                                        modified_time,
+                                        None,
+                                    )?;
+                                }
 
                                 progress.increment_files();
                             }
@@ -1536,7 +1539,7 @@ impl Archive {
                                         "failed to create symlink from archive: {:#?}",
                                         err
                                     );
-                                } else {
+                                } else if let Some(modified_time) = modified_time {
                                     destination_filesystem.set_times(
                                         &destination_path,
                                         FileType::Symlink,

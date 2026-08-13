@@ -359,6 +359,19 @@ impl Filesystem {
         self.disk_limit() != 0 && self.limiter_usage().await >= self.disk_limit() as u64
     }
 
+    /// Checks whether `delta` additional bytes would still fit within the disk limit,
+    /// without reserving them. Writers that go through [`file::ServerFile`] account for
+    /// their own bytes, so callers that only want to fail early must not allocate here.
+    #[inline]
+    pub fn has_headroom(&self, delta: i64) -> bool {
+        let limit = self.disk_limit();
+        if limit <= 0 || delta <= 0 {
+            return true;
+        }
+
+        delta as u64 <= (limit as u64).saturating_sub(self.get_physical_cached_size())
+    }
+
     #[inline]
     pub fn base(&self) -> compact_str::CompactString {
         self.base_path.to_string_lossy().to_compact_string()
@@ -1948,6 +1961,32 @@ mod tests {
                     .filesystem
                     .is_ignored(Path::new("server.log"), FileType::File)
             );
+        });
+    }
+
+    #[test]
+    fn has_headroom_checks_the_limit_without_reserving() {
+        tokio_test::block_on(async {
+            let state = crate::routes::AppState::mock();
+            let server = crate::server::Server::mock(uuid::Uuid::new_v4(), state);
+
+            server.filesystem.update_disk_limit(0).await;
+            assert!(server.filesystem.has_headroom(i64::MAX));
+
+            server.filesystem.update_disk_limit(1024).await;
+            assert!(server.filesystem.has_headroom(1024));
+            assert!(!server.filesystem.has_headroom(1025));
+
+            assert_eq!(server.filesystem.get_physical_cached_size(), 0);
+
+            server
+                .filesystem
+                .async_allocate_in_path(Path::new(""), 512, true)
+                .await;
+
+            assert!(server.filesystem.has_headroom(512));
+            assert!(!server.filesystem.has_headroom(513));
+            assert!(server.filesystem.has_headroom(-4096));
         });
     }
 }

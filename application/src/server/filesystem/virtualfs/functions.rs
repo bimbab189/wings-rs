@@ -73,6 +73,16 @@ impl IsIgnoredFn {
         }
     }
 
+    pub fn excluding(self, path: PathBuf) -> Self {
+        self.merge(IsIgnoredFn::from(move |_, candidate: PathBuf| {
+            if candidate == path {
+                None
+            } else {
+                Some(candidate)
+            }
+        }))
+    }
+
     #[inline]
     fn from_sync(sync: Arc<IsIgnoredFnInner>) -> Self {
         Self {
@@ -124,6 +134,75 @@ impl From<Vec<ignore::gitignore::Gitignore>> for IsIgnoredFn {
 impl<T: Fn(FileType, PathBuf) -> Option<PathBuf> + Send + Sync + 'static> From<T> for IsIgnoredFn {
     fn from(f: T) -> Self {
         Self::from_sync(Arc::new(f))
+    }
+}
+
+#[cfg(test)]
+mod is_ignored_fn_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn excluding_rejects_only_the_exact_path() {
+        let filter = IsIgnoredFn::default().excluding(PathBuf::from("logs/archive.zip"));
+
+        assert!(filter(FileType::File, PathBuf::from("logs/archive.zip")).is_none());
+        assert!(filter(FileType::File, PathBuf::from("logs/./archive.zip")).is_none());
+
+        assert_eq!(
+            filter(FileType::File, PathBuf::from("logs/archive.zip.bak")),
+            Some(PathBuf::from("logs/archive.zip.bak"))
+        );
+        assert_eq!(
+            filter(FileType::File, PathBuf::from("archive.zip")),
+            Some(PathBuf::from("archive.zip"))
+        );
+        assert_eq!(
+            filter(FileType::Dir, PathBuf::from("logs")),
+            Some(PathBuf::from("logs"))
+        );
+    }
+
+    #[test]
+    fn excluding_keeps_the_underlying_filter() {
+        let gitignore = crate::server::filesystem::build_gitignore_matcher(["*.log"].iter())
+            .expect("building the matcher failed");
+        let filter = IsIgnoredFn::from(gitignore).excluding(PathBuf::from("archive.zip"));
+
+        assert!(filter(FileType::File, PathBuf::from("latest.log")).is_none());
+        assert!(filter(FileType::File, PathBuf::from("archive.zip")).is_none());
+        assert_eq!(
+            filter(FileType::File, PathBuf::from("server.properties")),
+            Some(PathBuf::from("server.properties"))
+        );
+    }
+
+    #[test]
+    fn excluding_applies_to_the_async_half_too() {
+        tokio_test::block_on(async {
+            let filter = IsIgnoredFn::default().excluding(PathBuf::from("logs/archive.zip"));
+
+            assert!(
+                filter
+                    .call_async(FileType::File, PathBuf::from("logs/archive.zip"))
+                    .await
+                    .is_none()
+            );
+            assert!(
+                filter
+                    .call_async(FileType::File, PathBuf::from("logs/other.zip"))
+                    .await
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn path_equality_normalizes_interior_current_dir_components() {
+        assert_eq!(
+            Path::new("logs/./archive.zip"),
+            Path::new("logs/archive.zip")
+        );
     }
 }
 

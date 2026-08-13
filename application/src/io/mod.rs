@@ -32,7 +32,7 @@ pub fn copy_shared(
     writer: &mut (impl ?Sized + Write),
 ) -> std::io::Result<()> {
     loop {
-        let bytes_read = reader.read(buffer)?;
+        let bytes_read = reader.read_uninterrupted(buffer)?;
 
         if crate::unlikely(bytes_read == 0) {
             break;

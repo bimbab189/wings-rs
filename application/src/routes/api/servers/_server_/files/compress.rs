@@ -5,7 +5,7 @@ mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
-        server::filesystem::{archive::ArchiveFormat, cap::FileType},
+        server::filesystem::{archive::ArchiveFormat, cap::FileType, virtualfs::IsIgnoredFn},
     };
     use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
@@ -109,6 +109,10 @@ mod post {
                 .ok();
         }
 
+        let excluded_destination = destination_filesystem
+            .is_primary_server_fs()
+            .then(|| destination_path.clone());
+
         let progress = Arc::new(AtomicU64::new(0));
         let total = Arc::new(AtomicU64::new(0));
         let files_processed = Arc::new(AtomicU64::new(0));
@@ -135,7 +139,12 @@ mod post {
                         let destination_filesystem = destination_filesystem.clone();
 
                         async move {
-                            let ignored = server.filesystem.get_ignored();
+                            let mut ignored: IsIgnoredFn =
+                                server.filesystem.get_ignored().into();
+                            if let Some(excluded_destination) = excluded_destination {
+                                ignored = ignored.excluding(excluded_destination);
+                            }
+
                             let writer = tokio::task::spawn_blocking(move || {
                                 destination_filesystem.create_seekable_file(&destination_path)
                             })
@@ -170,7 +179,7 @@ mod post {
                                     &root,
                                     data.files,
                                     crate::server::filesystem::archive::create::ArchiveProgress::new(progress, files_processed),
-                                    ignored.into(),
+                                    ignored,
                                     crate::server::filesystem::archive::create::CreateTarOptions {
                                         compression_type: data.format.compression_format(),
                                         compression_level: state.config.load()
@@ -189,7 +198,7 @@ mod post {
                                     &root,
                                     data.files,
                                     crate::server::filesystem::archive::create::ArchiveProgress::new(progress, files_processed),
-                                    ignored.into(),
+                                    ignored,
                                     crate::server::filesystem::archive::create::CreateZipOptions {
                                         compression_level: state.config.load()
                                             .system
@@ -206,7 +215,7 @@ mod post {
                                     &root,
                                     data.files,
                                     crate::server::filesystem::archive::create::ArchiveProgress::new(progress, files_processed),
-                                    ignored.into(),
+                                    ignored,
                                     crate::server::filesystem::archive::create::Create7zOptions {
                                         compression_level: state.config.load()
                                             .system

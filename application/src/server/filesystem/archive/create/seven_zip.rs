@@ -3,6 +3,7 @@ use crate::{
     io::{
         abort::{AbortGuard, AbortWriter},
         compression::CompressionLevel,
+        fixed_reader::FixedReader,
     },
     server::filesystem::{archive::Archive, virtualfs::IsIgnoredFn},
 };
@@ -102,19 +103,23 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
                         }
                     };
 
-                    let mtime = source_metadata
+                    let mtime = metadata
                         .modified()
                         .map_or(None, |mtime| NtTime::try_from(mtime.into_std()).ok());
-                    let ctime = source_metadata
+                    let ctime = metadata
                         .created()
                         .map_or(None, |ctime| NtTime::try_from(ctime.into_std()).ok());
 
                     if metadata.is_dir() {
-                        directory_entries.push((relative.to_path_buf(), mtime, ctime));
+                        if directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
+                            directory_entries.push((relative.to_path_buf(), mtime, ctime));
+                        }
                         progress.increment_bytes(metadata.len());
                     } else if metadata.is_file() {
                         let file = filesystem.open(&path)?;
                         let reader = progress.counting_reader(file);
+                        let reader =
+                            FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
 
                         let mut entry =
                             sevenz_rust2::ArchiveEntry::new_file(&relative.to_string_lossy());
@@ -135,6 +140,8 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
             } else if source_metadata.is_file() {
                 let file = filesystem.open(&source)?;
                 let reader = progress.counting_reader(file);
+                let reader =
+                    FixedReader::new_with_fixed_bytes(reader, source_metadata.len() as usize);
 
                 let mut entry = sevenz_rust2::ArchiveEntry::new_file(&relative.to_string_lossy());
                 if let Some(mtime) = mtime {
