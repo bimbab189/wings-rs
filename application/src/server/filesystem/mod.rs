@@ -1038,7 +1038,7 @@ impl Filesystem {
         }
 
         self.disk_usage_delta_cached
-            .fetch_add(delta.logical, Ordering::Relaxed);
+            .fetch_add(delta.physical, Ordering::Relaxed);
         self.resource_usage
             .publish_disk_usage(self.get_physical_cached_size());
 

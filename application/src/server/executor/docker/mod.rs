@@ -947,13 +947,12 @@ impl DockerProcessHandle {
                     }),
                 );
 
-                let (r1, r2, _) = tokio::join!(
+                let (r1, _) = tokio::join!(
                     stream.next(),
-                    stats_server.filesystem.limiter_usage(),
                     tokio::time::sleep(std::time::Duration::from_secs(1))
                 );
 
-                (r1, r2)
+                (r1, stats_server.filesystem.limiter_usage().await)
             };
 
             while let (Some(stats), disk_bytes) = get_stats().await {

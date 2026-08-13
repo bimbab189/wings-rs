@@ -329,6 +329,8 @@ impl Server {
 
         Box::pin(async move {
             let old_sender = server.clone().status_task.write().await.replace(tokio::spawn(async move {
+                let mut full_since: Option<std::time::Instant> = None;
+
                 loop {
                     let process_status = match status_rx.recv().await {
                         Some(process_status) => process_status,
@@ -341,24 +343,34 @@ impl Server {
                         && server.state.get_state() != state::ServerState::Offline
                         && !server.stopping.load(Ordering::SeqCst)
                     {
-                        server.log_daemon_with_prelude("Server is exceeding the assigned disk space limit, stopping process now.");
+                        if full_since.is_none_or(|since| {
+                            since.elapsed() < std::time::Duration::from_secs(5)
+                        }) {
+                            full_since.get_or_insert_with(std::time::Instant::now);
+                        } else {
+                            full_since = None;
 
-                        let server_clone = server.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = server_clone
-                                .stop_with_kill_timeout(
-                                    std::time::Duration::from_secs(30),
-                                    false,
-                                )
-                                .await
-                            {
-                                tracing::error!(
-                                    server = %server_clone.uuid,
-                                    "failed to stop server: {:#?}",
-                                    err
-                                );
-                            }
-                        });
+                            server.log_daemon_with_prelude("Server is exceeding the assigned disk space limit, stopping process now.");
+
+                            let server_clone = server.clone();
+                            tokio::spawn(async move {
+                                if let Err(err) = server_clone
+                                    .stop_with_kill_timeout(
+                                        std::time::Duration::from_secs(30),
+                                        false,
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(
+                                        server = %server_clone.uuid,
+                                        "failed to stop server: {:#?}",
+                                        err
+                                    );
+                                }
+                            });
+                        }
+                    } else {
+                        full_since = None;
                     }
 
                     match process_status {
