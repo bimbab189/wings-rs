@@ -254,6 +254,8 @@ nestify::nest! {
             #[serde(default, deserialize_with = "crate::deserialize::deserialize_defaultable")]
             pub overhead_memory: i64,
             pub swap: i64,
+            /// Only has an effect with a scheduler that implements weights, CFQ on
+            /// cgroup v1 and BFQ or iocost on v2. It is silently ignored otherwise.
             pub io_weight: Option<u16>,
             pub cpu_limit: i64,
             pub disk_space: u64,
@@ -538,36 +540,47 @@ impl ServerConfiguration {
             0
         };
 
+        let memory = match real_memory {
+            0 => None,
+            limit => Some(
+                config
+                    .load()
+                    .docker
+                    .overhead
+                    .get_memory(limit.into())
+                    .as_bytes() as i64,
+            ),
+        };
+
+        if self.build.oom_disabled && crate::server::executor::docker::cgroup::is_unified() {
+            tracing::warn!(
+                server = %self.uuid,
+                "oom_disabled is set, but the container engine discards it on cgroup v2 hosts"
+            );
+        }
+
         let mut resources = bollard::models::Resources {
-            memory: match real_memory {
-                0 => None,
-                limit => Some(
-                    config
-                        .load()
-                        .docker
-                        .overhead
-                        .get_memory(limit.into())
-                        .as_bytes() as i64,
-                ),
-            },
+            memory,
             memory_reservation: match real_memory {
                 0 => None,
                 limit => Some(limit * 1024 * 1024),
             },
-            memory_swap: match self.build.swap {
-                0 => Some(0),
-                -1 => Some(-1),
-                limit => match real_memory {
-                    0 => Some(limit * 1024 * 1024),
-                    memory_limit => Some(
-                        config
-                            .load()
-                            .docker
-                            .overhead
-                            .get_memory(memory_limit.into())
-                            .as_bytes() as i64
-                            + limit * 1024 * 1024,
-                    ),
+            memory_swap: match memory {
+                None => {
+                    if self.build.swap != 0 {
+                        tracing::warn!(
+                            server = %self.uuid,
+                            swap = self.build.swap,
+                            "ignoring the swap limit, it cannot be set without a memory limit"
+                        );
+                    }
+
+                    None
+                }
+                Some(memory) => match self.build.swap {
+                    0 => Some(memory),
+                    -1 => Some(-1),
+                    limit => Some(memory + limit * 1024 * 1024),
                 },
             },
             blkio_weight: self.build.io_weight,
@@ -586,9 +599,10 @@ impl ServerConfiguration {
         };
 
         if self.build.cpu_limit > 0 {
-            resources.cpu_quota = Some(self.build.cpu_limit * 1000);
-            resources.cpu_period = Some(100000);
-            resources.cpu_shares = Some(1024);
+            let period = config.load().docker.cpu_period_us();
+
+            resources.cpu_quota = Some(self.build.cpu_limit * period / 100);
+            resources.cpu_period = Some(period);
         } else {
             resources.cpu_quota = Some(-1);
         }
@@ -649,6 +663,57 @@ mod tests {
             source: source.as_ref().to_string_lossy().to_compact_string(),
             read_only: false,
         }
+    }
+
+    fn resources(memory_limit: i64, swap: i64) -> bollard::models::Resources {
+        let config = tokio_test::block_on(async { crate::config::Config::mock() });
+
+        let mut configuration = ServerConfiguration::mock(uuid::Uuid::new_v4());
+        configuration.build.memory_limit = memory_limit;
+        configuration.build.overhead_memory = 0;
+        configuration.build.swap = swap;
+
+        configuration.convert_container_resources(&config)
+    }
+
+    // ServerConfiguration::convert_container_resources
+
+    #[test]
+    fn convert_container_resources_disables_swap_by_matching_the_memory_limit() {
+        let resources = resources(2048, 0);
+
+        assert!(resources.memory.is_some());
+        assert_eq!(resources.memory_swap, resources.memory);
+    }
+
+    #[test]
+    fn convert_container_resources_passes_unlimited_swap_through() {
+        assert_eq!(resources(2048, -1).memory_swap, Some(-1));
+    }
+
+    #[test]
+    fn convert_container_resources_adds_a_positive_swap_limit_to_the_memory_limit() {
+        let resources = resources(2048, 512);
+
+        assert_eq!(
+            resources.memory_swap,
+            Some(resources.memory.unwrap() + 512 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn convert_container_resources_never_sets_swap_without_a_memory_limit() {
+        for swap in [0, -1, 512] {
+            let resources = resources(0, swap);
+
+            assert_eq!(resources.memory, None);
+            assert_eq!(resources.memory_swap, None);
+        }
+    }
+
+    #[test]
+    fn convert_container_resources_leaves_cpu_shares_at_the_host_default() {
+        assert_eq!(resources(2048, 0).cpu_shares, None);
     }
 
     // Mount::resolve_allowed_source

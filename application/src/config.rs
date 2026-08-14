@@ -476,8 +476,8 @@ fn docker_registry_image_fetch_cache_duration() -> u64 {
     5 * 60
 }
 
-fn docker_tmpfs_size() -> u64 {
-    100
+fn docker_tmpfs_size() -> MiB {
+    100u64.into()
 }
 fn docker_container_pid_limit() -> u64 {
     5120
@@ -487,6 +487,15 @@ fn docker_container_apply_seccomp() -> bool {
 }
 fn docker_numa_memory_binding() -> bool {
     true
+}
+fn docker_cpu_period() -> u64 {
+    100000
+}
+fn docker_cfs_burst_enabled() -> bool {
+    true
+}
+fn docker_cfs_burst_multiple() -> f64 {
+    1.0
 }
 
 fn docker_installer_limits_timeout() -> u64 {
@@ -1090,13 +1099,27 @@ nestify::nest! {
             },
 
             #[serde(default = "docker_tmpfs_size")]
-            pub tmpfs_size: u64,
+            pub tmpfs_size: MiB,
+            #[serde(default)]
+            pub shm_size: MiB,
             #[serde(default = "docker_container_pid_limit")]
             pub container_pid_limit: u64,
             #[serde(default = "docker_container_apply_seccomp")]
             pub container_apply_seccomp: bool,
             #[serde(default = "docker_numa_memory_binding")]
             pub numa_memory_binding: bool,
+
+            #[serde(default = "docker_cpu_period")]
+            pub cpu_period: u64,
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub cfs_burst: #[derive(Clone, Copy, ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerCfsBurst {
+                #[serde(default = "docker_cfs_burst_enabled")]
+                pub enabled: bool,
+                #[serde(default = "docker_cfs_burst_multiple")]
+                pub multiple: f64,
+            },
 
             #[serde(default)]
             #[schema(inline)]
@@ -1176,6 +1199,13 @@ nestify::nest! {
         pub ignore_panel_config_updates: bool,
         #[serde(default)]
         pub ignore_panel_wings_upgrades: bool,
+    }
+}
+
+impl Docker {
+    /// The configured CFS period in microseconds, clamped to what the kernel accepts.
+    pub fn cpu_period_us(&self) -> i64 {
+        self.cpu_period.clamp(1000, 1000000) as i64
     }
 }
 
