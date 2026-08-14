@@ -3,8 +3,9 @@ use compact_str::ToCompactString;
 use serde::{Deserialize, Serialize};
 use serde_default::DefaultFromSerde;
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 use utoipa::ToSchema;
 
@@ -19,6 +20,87 @@ fn is_plain_absolute_path(path: &Path) -> bool {
                 std::path::Component::CurDir | std::path::Component::ParentDir
             )
         })
+}
+
+fn parse_cpu_list(list: &str) -> Option<Vec<u64>> {
+    let mut cpus = Vec::new();
+
+    for part in list.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        match part.split_once('-') {
+            Some((start, end)) => {
+                let start: u64 = start.trim().parse().ok()?;
+                let end: u64 = end.trim().parse().ok()?;
+                if start > end {
+                    return None;
+                }
+
+                cpus.extend(start..=end);
+            }
+            None => cpus.push(part.parse().ok()?),
+        }
+    }
+
+    Some(cpus)
+}
+
+fn numa_memory_nodes(threads: &str) -> Option<String> {
+    static NUMA_NODE_CPUS: OnceLock<Vec<(u64, Vec<u64>)>> = OnceLock::new();
+
+    let nodes = NUMA_NODE_CPUS.get_or_init(|| {
+        let mut nodes = Vec::new();
+
+        let Ok(entries) = std::fs::read_dir("/sys/devices/system/node") else {
+            return nodes;
+        };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(id) = name
+                .to_string_lossy()
+                .strip_prefix("node")
+                .and_then(|id| id.parse().ok())
+            else {
+                continue;
+            };
+
+            let Ok(cpulist) = std::fs::read_to_string(entry.path().join("cpulist")) else {
+                continue;
+            };
+
+            if let Some(cpus) = parse_cpu_list(&cpulist) {
+                nodes.push((id, cpus));
+            }
+        }
+
+        nodes
+    });
+
+    if nodes.len() < 2 {
+        return None;
+    }
+
+    let cpus = parse_cpu_list(threads)?;
+    let mut node_ids = BTreeSet::new();
+    for cpu in cpus {
+        node_ids.insert(nodes.iter().find(|(_, cpus)| cpus.contains(&cpu))?.0);
+    }
+
+    if node_ids.is_empty() {
+        return None;
+    }
+
+    Some(
+        node_ids
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 #[derive(ToSchema, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -473,7 +555,7 @@ impl ServerConfiguration {
                 limit => Some(limit * 1024 * 1024),
             },
             memory_swap: match self.build.swap {
-                0 => None,
+                0 => Some(0),
                 -1 => Some(-1),
                 limit => match real_memory {
                     0 => Some(limit * 1024 * 1024),
@@ -495,6 +577,11 @@ impl ServerConfiguration {
                 limit => Some(limit as i64),
             },
             cpuset_cpus: self.build.threads.clone().map(|t| t.into()),
+            cpuset_mems: if config.load().docker.numa_memory_binding {
+                self.build.threads.as_deref().and_then(numa_memory_nodes)
+            } else {
+                None
+            },
             ..Default::default()
         };
 

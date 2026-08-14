@@ -485,6 +485,9 @@ fn docker_container_pid_limit() -> u64 {
 fn docker_container_apply_seccomp() -> bool {
     true
 }
+fn docker_numa_memory_binding() -> bool {
+    true
+}
 
 fn docker_installer_limits_timeout() -> u64 {
     30 * 60
@@ -1092,6 +1095,8 @@ nestify::nest! {
             pub container_pid_limit: u64,
             #[serde(default = "docker_container_apply_seccomp")]
             pub container_apply_seccomp: bool,
+            #[serde(default = "docker_numa_memory_binding")]
+            pub numa_memory_binding: bool,
 
             #[serde(default)]
             #[schema(inline)]
