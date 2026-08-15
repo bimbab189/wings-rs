@@ -47,7 +47,7 @@ pub(crate) mod post {
                 .ok();
         }
 
-        if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(&root, true).await {
+        if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(&root, true) {
             return ApiResponse::error("path not found")
                 .with_status(StatusCode::NOT_FOUND)
                 .ok();
@@ -55,16 +55,13 @@ pub(crate) mod post {
 
         let destination = root.join(&data.name);
 
-        if filesystem.is_primary_server_fs()
-            && server.filesystem.is_ignored(&destination, true).await
-        {
+        if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(&destination, true) {
             return ApiResponse::error("destination not found")
                 .with_status(StatusCode::EXPECTATION_FAILED)
                 .ok();
         }
 
         filesystem.async_create_dir_all(&destination).await?;
-        filesystem.async_chown(&destination).await?;
 
         ApiResponse::new_serialized(Response {}).ok()
     }

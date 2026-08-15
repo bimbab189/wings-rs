@@ -78,8 +78,7 @@ pub(crate) mod post {
                     || (filesystem.is_primary_server_fs()
                         && server
                             .filesystem
-                            .is_ignored(&path, metadata.file_type.is_dir())
-                            .await)
+                            .is_ignored(&path, metadata.file_type.is_dir()))
                 {
                     return ApiResponse::error("file not found")
                         .with_status(StatusCode::NOT_FOUND)
@@ -143,7 +142,7 @@ pub(crate) mod post {
             compact_str::format_compact!("{base_name}{suffix}{extension}")
         }
 
-        if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true).await {
+        if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true) {
             return ApiResponse::error("parent directory not found")
                 .with_status(StatusCode::EXPECTATION_FAILED)
                 .ok();
@@ -162,8 +161,14 @@ pub(crate) mod post {
             .filesystem
             .relative_path(&destination_path.join(&new_name));
 
-        let progress = Arc::new(AtomicU64::new(0));
-        let total = Arc::new(AtomicU64::new(metadata.size));
+        let total_size = match filesystem.async_directory_entry_buffer(&path, &[]).await {
+            Ok(entry) => entry.size,
+            Err(_) => metadata.size,
+        };
+
+        let bytes_processed = Arc::new(AtomicU64::new(0));
+        let bytes_total = Arc::new(AtomicU64::new(total_size));
+        let files_processed = Arc::new(AtomicU64::new(0));
 
         let (identifier, task) = server
             .filesystem
@@ -173,8 +178,9 @@ pub(crate) mod post {
                     path: path.clone(),
                     destination_path: file_name,
                     start_time: chrono::Utc::now(),
-                    progress: progress.clone(),
-                    total: total.clone(),
+                    bytes_processed: bytes_processed.clone(),
+                    bytes_total: bytes_total.clone(),
+                    files_processed: files_processed.clone(),
                 },
                 {
                     let server = server.clone();
@@ -185,7 +191,10 @@ pub(crate) mod post {
                         server
                             .filesystem
                             .copy_path(
-                                progress,
+                                crate::server::filesystem::archive::create::ArchiveProgress::new(
+                                    bytes_processed,
+                                    files_processed,
+                                ),
                                 &server,
                                 metadata,
                                 path,

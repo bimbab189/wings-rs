@@ -1,8 +1,7 @@
 use crate::{
     io::{
-        SafeDigest, compression::reader::CompressionReaderMt, counting_reader::CountingReader,
-        limited_reader::LimitedReader, limited_writer::LimitedWriter,
-        range_reader::AsyncRangeReader,
+        SafeDigestExt, compression::reader::CompressionReaderMt, limited_reader::LimitedReader,
+        limited_writer::LimitedWriter, range_reader::AsyncRangeReader,
     },
     remote::backups::RawServerBackup,
     response::ApiResponse,
@@ -23,7 +22,7 @@ use crate::{
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use parking_lot::RwLock;
-use sha1::Digest;
+use sha2::Digest;
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -36,9 +35,9 @@ use tokio::io::AsyncReadExt;
 
 pub struct WingsBackup {
     uuid: uuid::Uuid,
-    format: ArchiveFormat,
+    pub format: ArchiveFormat,
 
-    path: PathBuf,
+    pub path: PathBuf,
 }
 
 impl WingsBackup {
@@ -113,7 +112,7 @@ impl BackupCreateExt for WingsBackup {
     async fn create(
         server: &crate::server::Server,
         uuid: uuid::Uuid,
-        progress: Arc<AtomicU64>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
         ignore: ignore::gitignore::Gitignore,
         _ignore_raw: compact_str::CompactString,
@@ -122,156 +121,157 @@ impl BackupCreateExt for WingsBackup {
         let file = tokio::fs::File::create(&file_name).await?.into_std().await;
 
         let total_task = {
-            let server = server.clone();
+            let filesystem = server.filesystem.clone();
             let ignore = ignore.clone();
+            let total = Arc::clone(&total);
 
             async move {
-                let mut walker = server
-                    .filesystem
-                    .async_walk_dir(Path::new(""))
-                    .await?
-                    .with_is_ignored(ignore.into());
-                let mut total_files = 0;
-                while let Some(Ok((_, path))) = walker.next_entry().await {
-                    let metadata = match server.filesystem.async_symlink_metadata(&path).await {
-                        Ok(metadata) => metadata,
-                        Err(_) => continue,
-                    };
+                tokio::task::spawn_blocking(move || {
+                    let mut walker = filesystem
+                        .walk_dir(Path::new(""))?
+                        .with_is_ignored(ignore.into());
+                    while let Some(Ok((_, path))) = walker.next_entry() {
+                        let metadata = match filesystem.symlink_metadata(&path) {
+                            Ok(metadata) => metadata,
+                            Err(_) => continue,
+                        };
 
-                    total.fetch_add(metadata.len(), Ordering::Relaxed);
-                    if !metadata.is_dir() {
-                        total_files += 1;
+                        total.fetch_add(metadata.len(), Ordering::Relaxed);
                     }
-                }
 
-                Ok::<_, anyhow::Error>(total_files)
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await?
             }
         };
 
-        let archive_task = async move {
-            let sources = server.filesystem.async_read_dir_all(Path::new("")).await?;
-            let writer = LimitedWriter::new_with_bytes_per_second(
-                file,
-                server
+        let archive_task = {
+            let progress = progress.clone();
+            async move {
+                let sources = server.filesystem.async_read_dir_all(Path::new("")).await?;
+                let writer = LimitedWriter::new_with_bytes_per_second(
+                    file,
+                    server
+                        .app_state
+                        .config
+                        .load()
+                        .system
+                        .backups
+                        .write_limit
+                        .as_bytes(),
+                );
+
+                let file = match server
                     .app_state
                     .config
                     .load()
                     .system
                     .backups
-                    .write_limit
-                    .as_bytes(),
-            );
+                    .wings
+                    .archive_format
+                {
+                    ArchiveFormat::Tar
+                    | ArchiveFormat::TarGz
+                    | ArchiveFormat::TarXz
+                    | ArchiveFormat::TarLzip
+                    | ArchiveFormat::TarBz2
+                    | ArchiveFormat::TarLz4
+                    | ArchiveFormat::TarZstd => {
+                        crate::server::filesystem::archive::create::create_tar(
+                            server.filesystem.clone(),
+                            writer,
+                            Path::new(""),
+                            sources,
+                            progress.clone(),
+                            ignore.into(),
+                            crate::server::filesystem::archive::create::CreateTarOptions {
+                                compression_type: server
+                                    .app_state
+                                    .config
+                                    .load()
+                                    .system
+                                    .backups
+                                    .wings
+                                    .archive_format
+                                    .compression_format(),
+                                compression_level: server
+                                    .app_state
+                                    .config
+                                    .load()
+                                    .system
+                                    .backups
+                                    .compression_level,
+                                threads: server
+                                    .app_state
+                                    .config
+                                    .load()
+                                    .system
+                                    .backups
+                                    .wings
+                                    .create_threads,
+                            },
+                        )
+                        .await
+                    }
+                    ArchiveFormat::Zip => {
+                        crate::server::filesystem::archive::create::create_zip(
+                            server.filesystem.clone(),
+                            writer,
+                            Path::new(""),
+                            sources,
+                            progress.clone(),
+                            ignore.into(),
+                            crate::server::filesystem::archive::create::CreateZipOptions {
+                                compression_level: server
+                                    .app_state
+                                    .config
+                                    .load()
+                                    .system
+                                    .backups
+                                    .compression_level,
+                            },
+                        )
+                        .await
+                    }
+                    ArchiveFormat::SevenZip => {
+                        crate::server::filesystem::archive::create::create_7z(
+                            server.filesystem.clone(),
+                            writer,
+                            Path::new(""),
+                            sources,
+                            progress.clone(),
+                            ignore.into(),
+                            crate::server::filesystem::archive::create::Create7zOptions {
+                                compression_level: server
+                                    .app_state
+                                    .config
+                                    .load()
+                                    .system
+                                    .backups
+                                    .compression_level,
+                                threads: server
+                                    .app_state
+                                    .config
+                                    .load()
+                                    .system
+                                    .backups
+                                    .wings
+                                    .create_threads,
+                            },
+                        )
+                        .await
+                    }
+                }?;
 
-            let file = match server
-                .app_state
-                .config
-                .load()
-                .system
-                .backups
-                .wings
-                .archive_format
-            {
-                ArchiveFormat::Tar
-                | ArchiveFormat::TarGz
-                | ArchiveFormat::TarXz
-                | ArchiveFormat::TarLzip
-                | ArchiveFormat::TarBz2
-                | ArchiveFormat::TarLz4
-                | ArchiveFormat::TarZstd => {
-                    crate::server::filesystem::archive::create::create_tar(
-                        server.filesystem.clone(),
-                        writer,
-                        Path::new(""),
-                        sources,
-                        Some(progress),
-                        ignore.into(),
-                        crate::server::filesystem::archive::create::CreateTarOptions {
-                            compression_type: server
-                                .app_state
-                                .config
-                                .load()
-                                .system
-                                .backups
-                                .wings
-                                .archive_format
-                                .compression_format(),
-                            compression_level: server
-                                .app_state
-                                .config
-                                .load()
-                                .system
-                                .backups
-                                .compression_level,
-                            threads: server
-                                .app_state
-                                .config
-                                .load()
-                                .system
-                                .backups
-                                .wings
-                                .create_threads,
-                        },
-                    )
-                    .await
-                }
-                ArchiveFormat::Zip => {
-                    crate::server::filesystem::archive::create::create_zip(
-                        server.filesystem.clone(),
-                        writer,
-                        Path::new(""),
-                        sources,
-                        Some(progress),
-                        ignore.into(),
-                        crate::server::filesystem::archive::create::CreateZipOptions {
-                            compression_level: server
-                                .app_state
-                                .config
-                                .load()
-                                .system
-                                .backups
-                                .compression_level,
-                        },
-                    )
-                    .await
-                }
-                ArchiveFormat::SevenZip => {
-                    crate::server::filesystem::archive::create::create_7z(
-                        server.filesystem.clone(),
-                        writer,
-                        Path::new(""),
-                        sources,
-                        Some(progress),
-                        ignore.into(),
-                        crate::server::filesystem::archive::create::Create7zOptions {
-                            compression_level: server
-                                .app_state
-                                .config
-                                .load()
-                                .system
-                                .backups
-                                .compression_level,
-                            threads: server
-                                .app_state
-                                .config
-                                .load()
-                                .system
-                                .backups
-                                .wings
-                                .create_threads,
-                        },
-                    )
-                    .await
-                }
-            }?;
+                tokio::task::spawn_blocking(move || file.into_inner().sync_all()).await??;
 
-            file.into_inner().sync_all()?;
-
-            Ok(())
+                Ok(())
+            }
         };
 
-        let (total_files, _) = tokio::try_join!(total_task, archive_task)?;
+        tokio::try_join!(total_task, archive_task)?;
 
-        let mut checksum_writer = sha1::Sha1::new();
+        let mut checksum_writer = sha2::Sha256::new();
         let mut file = tokio::fs::File::open(&file_name).await?;
         let mut buffer = vec![0; crate::BUFFER_SIZE];
 
@@ -292,9 +292,11 @@ impl BackupCreateExt for WingsBackup {
 
         Ok(RawServerBackup {
             checksum: hex::encode(checksum_writer.finalize()),
-            checksum_type: "sha1".into(),
+            checksum_type: "sha256".into(),
             size,
-            files: total_files,
+            files: progress
+                .clone_files()
+                .map_or(0, |files| files.load(Ordering::Relaxed)),
             successful: true,
             browsable: matches!(
                 server
@@ -366,7 +368,7 @@ impl BackupExt for WingsBackup {
     async fn restore(
         &self,
         server: &crate::server::Server,
-        progress: Arc<AtomicU64>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
         _download_url: Option<compact_str::CompactString>,
     ) -> Result<(), anyhow::Error> {
@@ -397,7 +399,7 @@ impl BackupExt for WingsBackup {
                             .read_limit
                             .as_bytes(),
                     );
-                    let reader = CountingReader::new_with_bytes_read(reader, progress);
+                    let reader = progress.counting_reader(reader);
                     let reader = CompressionReaderMt::new(
                         reader,
                         compression_type,
@@ -426,7 +428,7 @@ impl BackupExt for WingsBackup {
 
                         match header.entry_type() {
                             tar::EntryType::Directory => {
-                                server.filesystem.create_dir_all(destination_path)?;
+                                server.filesystem.create_chowned_dir_all(destination_path)?;
                                 if let Ok(permissions) =
                                     header.mode().map(PortablePermissions::from_mode)
                                 {
@@ -447,27 +449,25 @@ impl BackupExt for WingsBackup {
                                 ));
 
                                 if let Some(parent) = destination_path.parent() {
-                                    server.filesystem.create_dir_all(parent)?;
+                                    server.filesystem.create_chowned_dir_all(parent)?;
                                 }
 
-                                let mut writer =
-                                    crate::server::filesystem::writer::FileSystemWriter::new(
-                                        server.clone(),
-                                        destination_path,
-                                        header.mode().map(PortablePermissions::from_mode).ok(),
-                                        header
-                                            .mtime()
-                                            .map(|t| {
-                                                cap_std::time::SystemTime::from_std(
-                                                    std::time::UNIX_EPOCH
-                                                        + std::time::Duration::from_secs(t),
-                                                )
-                                            })
-                                            .ok(),
-                                    )?;
+                                let mut writer = crate::server::filesystem::file::ServerFile::new(
+                                    server.clone(),
+                                    destination_path,
+                                    header.mode().map(PortablePermissions::from_mode).ok(),
+                                    header
+                                        .mtime()
+                                        .map(|t| {
+                                            std::time::UNIX_EPOCH
+                                                + std::time::Duration::from_secs(t)
+                                        })
+                                        .ok(),
+                                )?;
 
                                 crate::io::copy_shared(&mut read_buffer, &mut entry, &mut writer)?;
                                 writer.flush()?;
+                                progress.increment_files();
                             }
                             tar::EntryType::Symlink => {
                                 let link =
@@ -480,13 +480,17 @@ impl BackupExt for WingsBackup {
                                         "failed to create symlink from archive: {:#?}",
                                         err
                                     );
-                                } else if let Ok(modified_time) = header.mtime() {
-                                    server.filesystem.set_times(
-                                        destination_path,
-                                        std::time::UNIX_EPOCH
-                                            + std::time::Duration::from_secs(modified_time),
-                                        None,
-                                    )?;
+                                } else {
+                                    progress.increment_files();
+
+                                    if let Ok(modified_time) = header.mtime() {
+                                        server.filesystem.set_times(
+                                            destination_path,
+                                            std::time::UNIX_EPOCH
+                                                + std::time::Duration::from_secs(modified_time),
+                                            None,
+                                        )?;
+                                    }
                                 }
                             }
                             _ => {}
@@ -540,7 +544,7 @@ impl BackupExt for WingsBackup {
 
                         scope.spawn_broadcast(move |_, _| {
                             let mut archive = archive.clone();
-                            let progress = Arc::clone(&progress);
+                            let progress = progress.clone();
                             let entry_index = Arc::clone(&entry_index);
                             let error_clone2 = Arc::clone(&error_clone);
                             let server = server.clone();
@@ -570,7 +574,7 @@ impl BackupExt for WingsBackup {
                                     }
 
                                     if entry.is_dir() {
-                                        server.filesystem.create_dir_all(&path)?;
+                                        server.filesystem.create_chowned_dir_all(&path)?;
                                         server.filesystem.set_permissions(
                                             &path,
                                             PortablePermissions::from_mode(
@@ -581,19 +585,16 @@ impl BackupExt for WingsBackup {
                                         server.log_daemon(compact_str::format_compact!("(restoring): {}", path.display()));
 
                                         if let Some(parent) = path.parent() {
-                                            server.filesystem.create_dir_all(parent)?;
+                                            server.filesystem.create_chowned_dir_all(parent)?;
                                         }
 
-                                        let mut writer = crate::server::filesystem::writer::FileSystemWriter::new(
+                                        let mut writer = crate::server::filesystem::file::ServerFile::new(
                                             server.clone(),
                                             &path,
                                             entry.unix_mode().map(PortablePermissions::from_mode),
                                             crate::server::filesystem::archive::zip_entry_get_modified_time(&entry),
                                         )?;
-                                        let mut reader = CountingReader::new_with_bytes_read(
-                                            entry,
-                                            Arc::clone(&progress),
-                                        );
+                                        let mut reader = progress.counting_reader(entry);
 
                                         if let Err(err) = crate::io::copy_shared(&mut read_buffer, &mut reader, &mut writer) {
                                             if err.kind() == std::io::ErrorKind::InvalidData {
@@ -607,6 +608,7 @@ impl BackupExt for WingsBackup {
                                             }
                                         }
                                         writer.flush()?;
+                                        progress.increment_files();
                                     } else if entry.is_symlink() && (1..=2048).contains(&entry.size()) {
                                         let link = std::io::read_to_string(&mut entry).unwrap_or_default();
 
@@ -616,12 +618,16 @@ impl BackupExt for WingsBackup {
                                                 "failed to create symlink from backup: {:#?}",
                                                 err
                                             );
-                                        } else if let Some(modified_time) = zip_entry_get_modified_time(&entry) {
-                                            server.filesystem.set_times(
-                                                &path,
-                                                modified_time.into_std(),
-                                                None,
-                                            )?;
+                                        } else {
+                                            progress.increment_files();
+
+                                            if let Some(modified_time) = zip_entry_get_modified_time(&entry) {
+                                                server.filesystem.set_times(
+                                                    &path,
+                                                    modified_time,
+                                                    None,
+                                                )?;
+                                            }
                                         }
                                     }
                                 }
@@ -648,7 +654,7 @@ impl BackupExt for WingsBackup {
 
                             if server
                                 .filesystem
-                                .is_ignored_sync(&path, entry.is_dir())
+                                .is_ignored(&path, entry.is_dir())
                             {
                                 continue;
                             }
@@ -656,7 +662,7 @@ impl BackupExt for WingsBackup {
                             if let Some(modified_time) = zip_entry_get_modified_time(&entry) {
                                 server.filesystem.set_times(
                                     &path,
-                                    modified_time.into_std(),
+                                    modified_time,
                                     None,
                                 ).ok();
                             }
@@ -685,7 +691,16 @@ impl BackupExt for WingsBackup {
                     );
 
                     let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(server.app_state.config.load().system.backups.wings.restore_threads)
+                        .num_threads(
+                            server
+                                .app_state
+                                .config
+                                .load()
+                                .system
+                                .backups
+                                .wings
+                                .restore_threads,
+                        )
                         .build()?;
 
                     let error = Arc::new(RwLock::new(None));
@@ -723,49 +738,48 @@ impl BackupExt for WingsBackup {
 
                                     if server
                                         .filesystem
-                                        .is_ignored_sync(destination_path, entry.is_directory())
+                                        .is_ignored(destination_path, entry.is_directory())
                                     {
                                         return Ok(true);
                                     }
 
                                     if entry.is_directory() {
-                                        if let Err(err) =
-                                            server.filesystem.create_dir_all(destination_path)
+                                        if let Err(err) = server
+                                            .filesystem
+                                            .create_chowned_dir_all(destination_path)
                                         {
                                             return Err(sevenz_rust2::Error::Other(
                                                 err.to_string().into(),
                                             ));
                                         }
                                     } else {
-                                        server.log_daemon(compact_str::format_compact!("(restoring): {path}"));
+                                        server.log_daemon(compact_str::format_compact!(
+                                            "(restoring): {path}"
+                                        ));
 
                                         if let Some(parent) = destination_path.parent()
                                             && let Err(err) =
-                                                server.filesystem.create_dir_all(parent)
+                                                server.filesystem.create_chowned_dir_all(parent)
                                         {
                                             return Err(sevenz_rust2::Error::Other(
                                                 err.to_string().into(),
                                             ));
                                         }
 
-                                        let mut writer = crate::server::filesystem::writer::FileSystemWriter::new(
-                                            server.clone(),
-                                            destination_path,
-                                            None,
-                                            if entry.has_last_modified_date {
-                                                Some(cap_std::time::SystemTime::from_std(
-                                                    entry.last_modified_date.into(),
-                                                ))
-                                            } else {
-                                                None
-                                            },
-                                        )
-                                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                                        let mut writer =
+                                            crate::server::filesystem::file::ServerFile::new(
+                                                server.clone(),
+                                                destination_path,
+                                                None,
+                                                if entry.has_last_modified_date {
+                                                    Some(entry.last_modified_date.into())
+                                                } else {
+                                                    None
+                                                },
+                                            )
+                                            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-                                        let mut reader = CountingReader::new_with_bytes_read(
-                                            reader,
-                                            Arc::clone(&progress),
-                                        );
+                                        let mut reader = progress.counting_reader(reader);
 
                                         crate::io::copy_shared(
                                             &mut read_buffer,
@@ -773,6 +787,7 @@ impl BackupExt for WingsBackup {
                                             &mut writer,
                                         )?;
                                         writer.flush()?;
+                                        progress.increment_files();
                                     }
 
                                     Ok(true)
@@ -797,16 +812,19 @@ impl BackupExt for WingsBackup {
 
                                 if server
                                     .filesystem
-                                    .is_ignored_sync(destination_path, entry.is_directory())
+                                    .is_ignored(destination_path, entry.is_directory())
                                 {
                                     continue;
                                 }
 
-                                server.filesystem.set_times(
-                                    destination_path,
-                                    entry.last_modified_date.into(),
-                                    None,
-                                ).ok();
+                                server
+                                    .filesystem
+                                    .set_times(
+                                        destination_path,
+                                        entry.last_modified_date.into(),
+                                        None,
+                                    )
+                                    .ok();
                             }
                         }
 

@@ -7,7 +7,7 @@ use std::{
 
 mod auth;
 mod exec;
-mod ratelimiter;
+mod limiter;
 pub mod registry;
 mod sftp;
 pub(crate) mod shell;
@@ -15,36 +15,14 @@ pub(crate) mod shell;
 pub use registry::SshSessionRegistry;
 
 pub struct Server {
-    ratelimiter: Arc<ratelimiter::SshRatelimiter>,
+    ratelimiter: Arc<limiter::SshLimiter>,
     state: State,
 }
 
 impl Server {
     pub fn new(state: Arc<crate::routes::AppState>) -> Self {
         Self {
-            ratelimiter: Arc::new(ratelimiter::SshRatelimiter::new(
-                state
-                    .config
-                    .load()
-                    .system
-                    .sftp
-                    .limits
-                    .authentication_password_attempts,
-                state
-                    .config
-                    .load()
-                    .system
-                    .sftp
-                    .limits
-                    .authentication_pubkey_attempts,
-                state
-                    .config
-                    .load()
-                    .system
-                    .sftp
-                    .limits
-                    .authentication_cooldown,
-            )),
+            ratelimiter: Arc::new(limiter::SshLimiter::new(state.config.clone())),
             state,
         }
     }
@@ -55,7 +33,7 @@ impl russh::server::Server for Server {
 
     fn new_client(&mut self, client: Option<SocketAddr>) -> Self::Handler {
         auth::SshSession {
-            ratelimiter: Arc::clone(&self.ratelimiter),
+            limiter: Arc::clone(&self.ratelimiter),
             state: Arc::clone(&self.state),
             server: None,
 
@@ -64,6 +42,7 @@ impl russh::server::Server for Server {
                 |s| s.ip(),
             ),
             user_uuid: None,
+            open_channels: 0,
 
             clients: HashMap::new(),
             shell_clients: HashSet::new(),

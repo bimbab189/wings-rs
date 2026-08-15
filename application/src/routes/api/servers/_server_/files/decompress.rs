@@ -67,18 +67,14 @@ pub(crate) mod post {
 
         let source = root.join(data.file);
 
-        if server
-            .filesystem
-            .is_ignored(
-                &source,
-                server
-                    .filesystem
-                    .async_metadata(&source)
-                    .await
-                    .is_ok_and(|m| m.is_dir()),
-            )
-            .await
-        {
+        if server.filesystem.is_ignored(
+            &source,
+            server
+                .filesystem
+                .async_metadata(&source)
+                .await
+                .is_ok_and(|m| m.is_dir()),
+        ) {
             return ApiResponse::error("file not found")
                 .with_status(StatusCode::NOT_FOUND)
                 .ok();
@@ -109,8 +105,8 @@ pub(crate) mod post {
                     path: source,
                     destination_path: root.clone(),
                     start_time: chrono::Utc::now(),
-                    progress: progress.clone(),
-                    total: total.clone(),
+                    bytes_processed: progress.clone(),
+                    bytes_total: total.clone(),
                 },
                 {
                     let root = root.clone();
@@ -153,8 +149,6 @@ pub(crate) mod post {
                         .ok();
                 }
             }
-
-            server.filesystem.chown_path(&root).await?;
 
             ApiResponse::new_serialized(Response {}).ok()
         } else {

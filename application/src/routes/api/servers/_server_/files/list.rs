@@ -16,15 +16,15 @@ pub(crate) mod get {
     #[derive(ToSchema, Deserialize)]
     pub struct Params {
         #[serde(default, alias = "directory")]
-        pub root: compact_str::CompactString,
+        root: compact_str::CompactString,
         #[serde(default)]
-        pub ignored: Vec<compact_str::CompactString>,
+        ignored: Vec<compact_str::CompactString>,
 
-        pub per_page: Option<usize>,
-        pub page: Option<usize>,
+        per_page: Option<usize>,
+        page: Option<usize>,
 
         #[serde(default)]
-        pub sort: crate::models::DirectorySortingMode,
+        sort: crate::models::DirectorySortingMode,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -88,8 +88,8 @@ pub(crate) mod get {
         } else {
             let mut ignore_builder = ignore::gitignore::GitignoreBuilder::new("/");
 
-            for file in data.ignored {
-                ignore_builder.add_line(None, &file).ok();
+            for line in data.ignored {
+                ignore_builder.add_line(None, &line).ok();
             }
 
             ignore_builder.build().ok()
@@ -104,7 +104,10 @@ pub(crate) mod get {
         if let Ok(metadata) = metadata {
             if !metadata.file_type.is_dir()
                 || (filesystem.is_primary_server_fs()
-                    && server.filesystem.is_ignored(&root, true).await)
+                    && root != Path::new("/")
+                    && root != Path::new(".")
+                    && root != Path::new("")
+                    && (server.filesystem.is_ignored(&root, true)))
             {
                 return ApiResponse::error("path not a directory")
                     .with_status(StatusCode::EXPECTATION_FAILED)
@@ -119,9 +122,9 @@ pub(crate) mod get {
         let is_ignored = if filesystem.is_primary_server_fs()
             && let Some(ignore) = ignore
         {
-            vec![server.filesystem.get_ignored().await, ignore].into()
+            vec![server.filesystem.get_ignored(), ignore].into()
         } else if filesystem.is_primary_server_fs() {
-            server.filesystem.get_ignored().await.into()
+            server.filesystem.get_ignored().into()
         } else {
             Default::default()
         };

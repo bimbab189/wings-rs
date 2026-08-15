@@ -292,7 +292,7 @@ async fn exchange(
     let issuer = config.remote.trim_end_matches('/').to_string();
     let audience = config.web_ide.public_url.trim_end_matches('/').to_string();
     drop(config);
-    let valid = claims.base.validate(&state.config.jwt, None).await.is_ok()
+    let valid = claims.base.validate(&state.config.jwt, None).is_ok()
         && claims.kind == "webide_launch"
         && claims.base.subject.as_deref() == Some("webide-launch")
         && claims.base.issuer.trim_end_matches('/') == issuer
@@ -1723,7 +1723,7 @@ async fn console(
                                 metadata: Some(serde_json::json!({ "command_length": raw_command.len() })),
                                 schedule: None,
                                 timestamp: chrono::Utc::now(),
-                            }).await;
+                            });
                         }
                         Some(Ok(ClientMessage::Close(_))) | None => break,
                         _ => {}

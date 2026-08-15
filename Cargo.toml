@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["application", "unrar-rs"]
+members = ["application", "pbs-client", "unrar-rs"]
 default-members = ["application"]
 package.rust-version = "1.95.0"
 
@@ -12,15 +12,25 @@ axum-extra = { version = "0.12.1", features = ["query"] }
 bollard = "0.21.0"
 serde = { version = "1.0.138", features = ["derive"] }
 serde_json = { version = "1.0.139", features = ["preserve_order"] }
-utoipa = { version = "5.4.0", features = ["axum_extras", "preserve_order", "chrono", "indexmap", "uuid"] }
-utoipa-axum = "0.2.0"
-reqwest = { version = "0.13.0", features = ["hickory-dns", "json", "multipart", "stream"] }
+reqwest = { version = "0.13.0", features = ["hickory-dns", "json", "multipart", "query", "stream"] }
 tokio = { version = "1.43.0", features = ["fs", "net", "signal", "process"] }
 tokio-util = { version = "0.7.15", features = ["io-util"] }
 chrono = { version = "0.4.40", features = ["serde"] }
 uuid = { version = "1.16.0", features = ["serde", "v4"] }
+utoipa = { version = "5.4.0", features = ["axum_extras", "preserve_order", "chrono", "indexmap", "uuid"] }
+utoipa-axum = "0.2.0"
 rand = "0.10.0"
 regex = "1.12.2"
+rustls = { version = "0.23.27", features = ["aws-lc-rs"] }
+bytes = "1"
+sha2 = "0.11.0"
+crc32fast = "1.4.2"
+zstd = { version = "0.13.3", features = ["zstdmt"] }
+hex = "0.4.3"
+tar = "0.4.44"
+compact_str = { git = "https://github.com/ParkMyCar/compact_str.git", rev = "0969dcc71c2e06bb2200844d14c5ab7759211744", version = "0.9.0", features = ["serde"] }
+positioned-io = "0.3.5"
+futures = "0.3.31"
 
 [profile.dev.package."*"]
 opt-level = 2
@@ -31,7 +41,7 @@ debug = false
 
 [profile.release.package."*"]
 opt-level = "s"
-codegen-units = 2
+codegen-units = 1
 strip = true
 
 [profile.release]
@@ -39,4 +49,5 @@ opt-level = "s"
 lto = "fat"
 codegen-units = 1
 strip = true
-panic = "abort"
+# too much of a coward to enable
+# panic = "abort"

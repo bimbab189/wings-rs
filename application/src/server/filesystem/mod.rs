@@ -1,5 +1,4 @@
 use crate::{
-    io::counting_reader::AsyncCountingReader,
     routes::MimeCacheValue,
     server::filesystem::virtualfs::{
         DirectoryStreamWalkFn, VirtualReadableFilesystem, VirtualWritableFilesystem,
@@ -27,13 +26,13 @@ use tokio::{
 pub mod archive;
 pub mod cap;
 pub mod disk_checker;
+pub mod file;
 pub mod inotify;
 pub mod limiter;
 pub mod operations;
 pub mod pull;
 pub mod usage;
 pub mod virtualfs;
-pub mod writer;
 
 #[inline]
 pub fn encode_mode(mode: u32) -> compact_str::CompactString {
@@ -75,7 +74,7 @@ pub struct Filesystem {
 
     disk_checker_rescan: Arc<tokio::sync::Notify>,
     pub disk_checker_state_dirty: Arc<AtomicBool>,
-    disk_checker: tokio::task::JoinHandle<()>,
+    pub disk_checker: tokio::task::JoinHandle<()>,
     config: Arc<crate::config::Config>,
 
     pub base_path: PathBuf,
@@ -91,7 +90,7 @@ pub struct Filesystem {
     pub disk_usage: Arc<RwLock<usage::DiskUsage>>,
     pub last_disk_check: Arc<AtomicU64>,
     pub disk_check_completed: Arc<tokio::sync::Notify>,
-    disk_ignored: Arc<RwLock<ignore::gitignore::Gitignore>>,
+    disk_ignored: arc_swap::ArcSwap<ignore::gitignore::Gitignore>,
 
     pub archive_fs_cache: moka::future::Cache<PathBuf, Arc<dyn VirtualReadableFilesystem>>,
     pub pulls: RwLock<HashMap<uuid::Uuid, Arc<RwLock<pull::Download>>>>,
@@ -120,7 +119,7 @@ impl Filesystem {
             disk_ignored.add_line(None, entry).ok();
         }
 
-        let cap_filesystem = cap::CapFilesystem::new_uninitialized(base_path.clone());
+        let cap_filesystem = cap::CapFilesystem::new_uninitialized(&base_path);
         let server_notifier = inotify::InotifyServerNotifier::new(base_path.clone());
         let use_server_notifier = Arc::new(AtomicBool::new(false));
         let disk_checker_rescan = Arc::new(tokio::sync::Notify::new());
@@ -160,11 +159,11 @@ impl Filesystem {
             disk_usage,
             last_disk_check,
             disk_check_completed,
-            disk_ignored: Arc::new(RwLock::new(
+            disk_ignored: arc_swap::ArcSwap::from_pointee(
                 disk_ignored
                     .build()
                     .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty()),
-            )),
+            ),
 
             archive_fs_cache: moka::future::CacheBuilder::new(8)
                 .time_to_idle(std::time::Duration::from_mins(1))
@@ -185,8 +184,8 @@ impl Filesystem {
     }
 
     #[inline]
-    pub async fn rerun_disk_checker(&self) {
-        self.server_notifier.clear_modified_paths().await;
+    pub fn rerun_disk_checker(&self) {
+        self.server_notifier.clear_modified_paths();
         self.disk_checker_rescan.notify_one();
     }
 
@@ -197,27 +196,16 @@ impl Filesystem {
         }
 
         if let Ok(disk_ignored) = disk_ignored.build() {
-            *self.disk_ignored.write().await = disk_ignored;
+            self.disk_ignored.store(Arc::new(disk_ignored));
         }
     }
 
-    pub async fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        self.disk_ignored
-            .read()
-            .await
-            .matched(path, is_dir)
-            .is_ignore()
+    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        self.disk_ignored.load().matched(path, is_dir).is_ignore()
     }
 
-    pub async fn get_ignored(&self) -> ignore::gitignore::Gitignore {
-        self.disk_ignored.read().await.clone()
-    }
-
-    pub fn is_ignored_sync(&self, path: &Path, is_dir: bool) -> bool {
-        self.disk_ignored
-            .blocking_read()
-            .matched(path, is_dir)
-            .is_ignore()
+    pub fn get_ignored(&self) -> ignore::gitignore::Gitignore {
+        (**self.disk_ignored.load()).clone()
     }
 
     pub async fn pulls(
@@ -507,7 +495,7 @@ impl Filesystem {
         };
 
         if let Some((inner_path, source_path, read_only)) = mount_match {
-            match cap::CapFilesystem::new(source_path).await {
+            match cap::CapFilesystem::new(&source_path).await {
                 Ok(cap_fs) => {
                     let mut fs = cap_fs.get_virtual(server.clone());
                     fs.is_primary_server_fs = false;
@@ -585,7 +573,7 @@ impl Filesystem {
         };
 
         if let Some((inner_path, source_path, read_only)) = mount_match {
-            match cap::CapFilesystem::new(source_path).await {
+            match cap::CapFilesystem::new(&source_path).await {
                 Ok(cap_fs) => {
                     let mut fs = cap_fs.get_virtual(server.clone());
                     fs.is_primary_server_fs = false;
@@ -660,8 +648,9 @@ impl Filesystem {
             self.async_create_dir_all(parent).await?;
         }
 
-        let metadata = self.async_metadata(&old_path).await?;
-        let is_dir = metadata.is_dir();
+        let old_metadata = self.async_metadata(&old_path).await?;
+        let new_metadata = self.async_metadata(&new_path).await.ok();
+        let is_dir = old_metadata.is_dir();
 
         let old_parent = self
             .async_canonicalize(match old_path.parent() {
@@ -697,10 +686,19 @@ impl Filesystem {
                 );
             }
         } else {
-            let size = metadata.len() as i64;
+            let size = old_metadata.len() as i64;
 
-            self.async_allocate_in_path(&old_parent, -size, true).await;
-            self.async_allocate_in_path(&new_parent, size, true).await;
+            if let Some(new_metadata) = new_metadata {
+                let new_size = new_metadata.len() as i64;
+                let size_delta = new_size - size;
+
+                self.async_allocate_in_path(&old_parent, -size, true).await;
+                self.async_allocate_in_path(&new_parent, size_delta, true)
+                    .await;
+            } else {
+                self.async_allocate_in_path(&old_parent, -size, true).await;
+                self.async_allocate_in_path(&new_parent, size, true).await;
+            }
         }
 
         self.async_rename(old_path, &self.cap_filesystem, new_path)
@@ -712,7 +710,7 @@ impl Filesystem {
     #[allow(clippy::too_many_arguments)]
     pub async fn copy_path(
         &self,
-        progress: Arc<AtomicU64>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         server: &crate::server::Server,
         metadata: virtualfs::FileMetadata,
         path: PathBuf,
@@ -724,17 +722,19 @@ impl Filesystem {
             if filesystem.is_primary_server_fs() && destination_filesystem.is_primary_server_fs() {
                 server
                     .filesystem
-                    .async_quota_copy(&path, &destination_path, server, Some(&progress))
+                    .async_quota_copy(
+                        &path,
+                        &destination_path,
+                        server,
+                        progress.clone_bytes().as_ref(),
+                    )
                     .await?;
                 destination_filesystem
                     .async_set_permissions(&destination_path, metadata.permissions)
                     .await?;
             } else {
                 let file_read = filesystem.async_read_file(&path, None).await?;
-                let mut reader = AsyncCountingReader::new_with_bytes_read(
-                    file_read.reader,
-                    Arc::clone(&progress),
-                );
+                let mut reader = progress.async_counting_reader(file_read.reader);
 
                 if let Some(parent) = destination_path.parent()
                     && !parent.as_os_str().is_empty()
@@ -752,11 +752,22 @@ impl Filesystem {
                 tokio::io::copy(&mut reader, &mut writer).await?;
                 writer.shutdown().await?;
             }
+
+            progress.increment_files();
         } else {
-            let ignored = server.filesystem.get_ignored().await;
-            let mut walker = filesystem
-                .async_walk_dir_stream(&path, ignored.into())
+            destination_filesystem
+                .async_create_dir_all(&destination_path)
                 .await?;
+            destination_filesystem
+                .async_set_permissions(&destination_path, metadata.permissions)
+                .await?;
+
+            let ignored = if filesystem.is_primary_server_fs() {
+                server.filesystem.get_ignored().into()
+            } else {
+                Default::default()
+            };
+            let mut walker = filesystem.async_walk_dir_stream(&path, ignored).await?;
 
             walker
                 .run_multithreaded(
@@ -767,7 +778,7 @@ impl Filesystem {
                         let source_path = Arc::new(path);
                         let destination_path = Arc::new(destination_path);
                         let destination_filesystem = destination_filesystem.clone();
-                        let progress = Arc::clone(&progress);
+                        let progress = progress.clone();
 
                         move |_, path: PathBuf, stream| {
                             let server = server.clone();
@@ -775,18 +786,32 @@ impl Filesystem {
                             let source_path = Arc::clone(&source_path);
                             let destination_path = Arc::clone(&destination_path);
                             let destination_filesystem = destination_filesystem.clone();
-                            let progress = Arc::clone(&progress);
+                            let progress = progress.clone();
 
                             async move {
                                 let metadata =
                                     match filesystem.async_symlink_metadata(&path).await {
                                         Ok(metadata) => metadata,
-                                        Err(_) => return Ok(()),
+                                        Err(err) => {
+                                            tracing::debug!(
+                                                path = %path.display(),
+                                                "skipping copy entry, failed to stat: {:?}",
+                                                err,
+                                            );
+                                            return Ok(());
+                                        }
                                     };
 
                                 let relative_path = match path.strip_prefix(&*source_path) {
                                     Ok(p) => p,
-                                    Err(_) => return Ok(()),
+                                    Err(_) => {
+                                        tracing::debug!(
+                                            path = %path.display(),
+                                            source = %source_path.display(),
+                                            "skipping copy entry, not under source path",
+                                        );
+                                        return Ok(());
+                                    }
                                 };
                                 let destination_path = destination_path.join(relative_path);
 
@@ -805,17 +830,14 @@ impl Filesystem {
                                                 &path,
                                                 &destination_path,
                                                 &server,
-                                                Some(&progress),
+                                                progress.clone_bytes().as_ref(),
                                             )
                                             .await?;
                                         destination_filesystem
                                             .async_set_permissions(&destination_path, metadata.permissions)
                                             .await?;
                                     } else {
-                                        let mut reader = AsyncCountingReader::new_with_bytes_read(
-                                            stream,
-                                            Arc::clone(&progress),
-                                        );
+                                        let mut reader = progress.async_counting_reader(stream);
 
                                         let mut writer = destination_filesystem
                                             .async_create_file(&destination_path)
@@ -827,17 +849,22 @@ impl Filesystem {
                                         tokio::io::copy(&mut reader, &mut writer).await?;
                                         writer.shutdown().await?;
                                     }
+
+                                    progress.increment_files();
                                 } else if metadata.file_type.is_dir() {
                                     destination_filesystem.async_create_dir_all(&destination_path).await?;
                                     destination_filesystem
                                         .async_set_permissions(&destination_path, metadata.permissions)
                                         .await?;
 
-                                    progress.fetch_add(metadata.size, Ordering::Relaxed);
-                                } else if metadata.file_type.is_symlink() && let Ok(target) = filesystem.async_read_symlink(&path).await
-                                    && let Err(err) = destination_filesystem.async_create_symlink(&target, &destination_path).await {
+                                    progress.increment_bytes(metadata.size);
+                                } else if metadata.file_type.is_symlink() && let Ok(target) = filesystem.async_read_symlink(&path).await {
+                                    if let Err(err) = destination_filesystem.async_create_symlink(&target, &destination_path).await {
                                         tracing::debug!(path = %destination_path.display(), "failed to create symlink from copy: {:?}", err);
+                                    } else {
+                                        progress.increment_files();
                                     }
+                                }
 
                                 Ok(())
                             }
@@ -853,7 +880,7 @@ impl Filesystem {
     fn try_update_atomics(&self, delta: impl Into<usage::SpaceDelta>, ignorant: bool) -> bool {
         let delta: usage::SpaceDelta = delta.into();
 
-        if crate::unlikely(delta.logical == 0 && delta.physical == 0) {
+        if delta.logical == 0 && delta.physical == 0 {
             return true;
         }
 
@@ -1006,8 +1033,8 @@ impl Filesystem {
         true
     }
 
-    pub async fn truncate_root(&self) -> Result<(), anyhow::Error> {
-        self.disk_usage.write().await.clear();
+    pub async fn truncate_root(&self) -> Result<(), std::io::Error> {
+        self.disk_usage.write().await.truncate();
         self.disk_usage_cached_logical.store(0, Ordering::Relaxed);
         self.disk_usage_cached_physical.store(0, Ordering::Relaxed);
 
@@ -1023,7 +1050,7 @@ impl Filesystem {
         Ok(())
     }
 
-    pub async fn chown_path(&self, path: impl AsRef<Path>) -> Result<(), anyhow::Error> {
+    pub fn chown_path(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
         if self.config.load().system.user.rootless.enabled {
             return Ok(());
         }
@@ -1032,7 +1059,43 @@ impl Filesystem {
         {
             use std::os::fd::AsFd;
 
-            let metadata = self.async_metadata(path.as_ref()).await?;
+            let owner_uid = rustix::fs::Uid::from_raw_unchecked(self.config.load().system.user.uid);
+            let owner_gid = rustix::fs::Gid::from_raw_unchecked(self.config.load().system.user.gid);
+
+            if path.as_ref() == Path::new("")
+                || path.as_ref() == Path::new(".")
+                || path.as_ref() == Path::new("/")
+            {
+                std::os::unix::fs::chown(
+                    &self.base_path,
+                    Some(owner_uid.as_raw()),
+                    Some(owner_gid.as_raw()),
+                )?;
+            } else {
+                rustix::fs::chownat(
+                    self.cap_filesystem.get_inner()?.as_fd(),
+                    self.relative_path(path.as_ref()),
+                    Some(owner_uid),
+                    Some(owner_gid),
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                )?;
+            }
+
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    }
+    pub async fn async_chown_path(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+        if self.config.load().system.user.rootless.enabled {
+            return Ok(());
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
 
             let owner_uid = rustix::fs::Uid::from_raw_unchecked(self.config.load().system.user.uid);
             let owner_gid = rustix::fs::Gid::from_raw_unchecked(self.config.load().system.user.gid);
@@ -1043,12 +1106,12 @@ impl Filesystem {
                 let base_path = self.base_path.clone();
 
                 move || {
-                    if crate::unlikely(path == Path::new("") || path == Path::new("/")) {
-                        Ok::<_, anyhow::Error>(std::os::unix::fs::chown(
+                    if path == Path::new("") || path == Path::new(".") || path == Path::new("/") {
+                        std::os::unix::fs::chown(
                             &base_path,
                             Some(owner_uid.as_raw()),
                             Some(owner_gid.as_raw()),
-                        )?)
+                        )
                     } else {
                         Ok(rustix::fs::chownat(
                             cap_filesystem.get_inner()?.as_fd(),
@@ -1060,44 +1123,219 @@ impl Filesystem {
                     }
                 }
             })
-            .await??;
-
-            if metadata.is_dir() {
-                let cap_filesystem = self.cap_filesystem.clone();
-
-                self.async_walk_dir(path)
-                    .await?
-                    .run_multithreaded(
-                        self.config.load().system.check_permissions_on_boot_threads,
-                        Arc::new(move |_, path: PathBuf| {
-                            let cap_filesystem = cap_filesystem.clone();
-
-                            async move {
-                                tokio::task::spawn_blocking(move || {
-                                    rustix::fs::chownat(
-                                        cap_filesystem.get_inner()?.as_fd(),
-                                        path,
-                                        Some(owner_uid),
-                                        Some(owner_gid),
-                                        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-                                    )
-                                    .ok();
-
-                                    Ok(())
-                                })
-                                .await?
-                            }
-                        }),
-                    )
-                    .await
-            } else {
-                Ok(())
-            }
+            .await
+            .map_err(std::io::Error::other)?
         }
         #[cfg(not(unix))]
         {
             Ok(())
         }
+    }
+
+    pub async fn async_chown_path_recursive(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<(), anyhow::Error> {
+        if self.config.load().system.user.rootless.enabled {
+            return Ok(());
+        }
+
+        #[cfg(unix)]
+        {
+            use rayon::prelude::*;
+            use std::os::fd::AsFd;
+
+            const CHANNEL_CAPACITY: usize = 1 << 16;
+            const CHUNK: usize = 8192;
+
+            let metadata = self.async_metadata(path.as_ref()).await?;
+            let owner_uid = rustix::fs::Uid::from_raw_unchecked(self.config.load().system.user.uid);
+            let owner_gid = rustix::fs::Gid::from_raw_unchecked(self.config.load().system.user.gid);
+            let root_rel = self.relative_path(path.as_ref());
+
+            tokio::task::spawn_blocking({
+                let cap_filesystem = self.cap_filesystem.clone();
+                let base_path = self.base_path.clone();
+                let root_rel = root_rel.clone();
+
+                move || -> Result<(), anyhow::Error> {
+                    if root_rel.as_os_str().is_empty()
+                        || root_rel == Path::new(".")
+                        || root_rel == Path::new("/")
+                    {
+                        std::os::unix::fs::chown(
+                            &base_path,
+                            Some(owner_uid.as_raw()),
+                            Some(owner_gid.as_raw()),
+                        )?;
+                    } else {
+                        rustix::fs::chownat(
+                            cap_filesystem.get_inner()?.as_fd(),
+                            &root_rel,
+                            Some(owner_uid),
+                            Some(owner_gid),
+                            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                        )?;
+                    }
+
+                    Ok(())
+                }
+            })
+            .await??;
+
+            if !metadata.is_dir() {
+                return Ok(());
+            }
+
+            let threads = self.config.load().system.check_permissions_on_boot_threads;
+            let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+
+            let worker = tokio::task::spawn_blocking({
+                let cap_filesystem = self.cap_filesystem.clone();
+
+                move || -> Result<(), anyhow::Error> {
+                    let mut rx = rx;
+
+                    let inner = cap_filesystem.get_inner()?;
+                    let fd = inner.as_fd();
+
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()?;
+                    let mut chunk = Vec::with_capacity(CHUNK);
+
+                    loop {
+                        while chunk.len() < CHUNK {
+                            match rx.blocking_recv() {
+                                Some(path) => chunk.push(path),
+                                None => break,
+                            }
+                        }
+                        if chunk.is_empty() {
+                            break;
+                        }
+
+                        pool.install(|| {
+                            chunk.par_iter().for_each(|path| {
+                                let Ok(stat) = rustix::fs::statx(
+                                    fd,
+                                    path,
+                                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                                    rustix::fs::StatxFlags::UID | rustix::fs::StatxFlags::GID,
+                                ) else {
+                                    return;
+                                };
+
+                                if stat.stx_uid == owner_uid.as_raw()
+                                    && stat.stx_gid == owner_gid.as_raw()
+                                {
+                                    return;
+                                }
+
+                                rustix::fs::chownat(
+                                    fd,
+                                    path,
+                                    Some(owner_uid),
+                                    Some(owner_gid),
+                                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                                )
+                                .ok();
+                            });
+                        });
+
+                        chunk.clear();
+                    }
+
+                    Ok(())
+                }
+            });
+
+            let lister = async move {
+                let mut entries = self.async_walk_dir("").await?;
+
+                while let Some(Ok((_, entry_path))) = entries.next_entry().await {
+                    if tx.send(entry_path).await.is_err() {
+                        return Ok(());
+                    }
+                }
+
+                Ok::<_, anyhow::Error>(())
+            };
+
+            let (list_res, work_res) = tokio::join!(lister, worker);
+            list_res?;
+            work_res??;
+
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(())
+        }
+    }
+
+    pub fn create_chowned_dir_all(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+        let path = self.relative_path(path.as_ref());
+        if path.as_os_str().is_empty() {
+            return Ok(());
+        }
+
+        match self.create_dir(&path) {
+            Ok(_) => {
+                self.chown_path(&path)?;
+                return Ok(());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
+            Err(_) => {}
+        }
+
+        let mut progress = PathBuf::new();
+        for component in path.components() {
+            progress.push(component);
+
+            match self.create_dir(&progress) {
+                Ok(_) => self.chown_path(&progress)?,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn async_create_chowned_dir_all(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<(), std::io::Error> {
+        let path = self.relative_path(path.as_ref());
+        if path.as_os_str().is_empty() {
+            return Ok(());
+        }
+
+        match self.async_create_dir(&path).await {
+            Ok(_) => {
+                self.async_chown_path(&path).await?;
+                return Ok(());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
+            Err(_) => {}
+        }
+
+        let mut progress = PathBuf::new();
+        for component in path.components() {
+            progress.push(component);
+
+            match self.async_create_dir(&progress).await {
+                Ok(_) => self.async_chown_path(&progress).await?,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn setup(&self) {
@@ -1124,7 +1362,7 @@ impl Filesystem {
             );
         }
 
-        if self.cap_filesystem.is_uninitialized().await {
+        if self.cap_filesystem.is_uninitialized() {
             let base_path = self.base_path.clone();
             match tokio::task::spawn_blocking(move || {
                 cap_std::fs::Dir::open_ambient_dir(&base_path, cap_std::ambient_authority())
@@ -1132,21 +1370,32 @@ impl Filesystem {
             .await
             {
                 Ok(Ok(dir)) => {
-                    *self.cap_filesystem.inner.write().await = Some(Arc::new(dir));
+                    self.cap_filesystem.inner.store(Some(Arc::new(dir)));
                     if self.app_state.config.load().system.disk_check_use_inotify {
-                        if let Err(err) = self
-                            .app_state
-                            .inotify_manager
-                            .register_server_with_notifier(self.server_notifier.clone(), self.uuid)
-                            .await
-                        {
-                            tracing::error!(
-                                "error while trying to attach server inotify listener, falling back to regular scans: {}",
-                                err
-                            );
-                        } else {
-                            self.use_server_notifier.store(true, Ordering::Relaxed);
-                        }
+                        tokio::spawn({
+                            let state = self.app_state.clone();
+                            let server_notifier = self.server_notifier.clone();
+                            let server_use_server_notifier = self.use_server_notifier.clone();
+                            let server_uuid = self.uuid;
+
+                            async move {
+                                if let Err(err) = state
+                                    .inotify_manager
+                                    .register_server_with_notifier(
+                                        server_notifier.clone(),
+                                        server_uuid,
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(
+                                        "error while trying to attach server inotify listener, falling back to regular scans: {}",
+                                        err
+                                    );
+                                } else {
+                                    server_use_server_notifier.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        });
                     }
                 }
                 Ok(Err(err)) => {
@@ -1176,7 +1425,7 @@ impl Filesystem {
             );
         }
 
-        if self.cap_filesystem.is_uninitialized().await {
+        if self.cap_filesystem.is_uninitialized() {
             let base_path = self.base_path.clone();
             match tokio::task::spawn_blocking(move || {
                 cap_std::fs::Dir::open_ambient_dir(&base_path, cap_std::ambient_authority())
@@ -1184,21 +1433,32 @@ impl Filesystem {
             .await
             {
                 Ok(Ok(dir)) => {
-                    *self.cap_filesystem.inner.write().await = Some(Arc::new(dir));
+                    self.cap_filesystem.inner.store(Some(Arc::new(dir)));
                     if self.app_state.config.load().system.disk_check_use_inotify {
-                        if let Err(err) = self
-                            .app_state
-                            .inotify_manager
-                            .register_server_with_notifier(self.server_notifier.clone(), self.uuid)
-                            .await
-                        {
-                            tracing::error!(
-                                "error while trying to attach server inotify listener, falling back to regular scans: {}",
-                                err
-                            );
-                        } else {
-                            self.use_server_notifier.store(true, Ordering::Relaxed);
-                        }
+                        tokio::spawn({
+                            let state = self.app_state.clone();
+                            let server_notifier = self.server_notifier.clone();
+                            let server_use_server_notifier = self.use_server_notifier.clone();
+                            let server_uuid = self.uuid;
+
+                            async move {
+                                if let Err(err) = state
+                                    .inotify_manager
+                                    .register_server_with_notifier(
+                                        server_notifier.clone(),
+                                        server_uuid,
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(
+                                        "error while trying to attach server inotify listener, falling back to regular scans: {}",
+                                        err
+                                    );
+                                } else {
+                                    server_use_server_notifier.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        });
                     }
                 }
                 Ok(Err(err)) => {
@@ -1425,6 +1685,13 @@ impl Filesystem {
         let detected_mime =
             if let Some(detected_mime) = self.app_state.mime_cache.get(&mime_key).await {
                 detected_mime
+            } else if (metadata.is_file() && metadata.len() == 0)
+                || (symlink_destination.is_some()
+                    && symlink_destination_metadata
+                        .as_ref()
+                        .is_some_and(|m| m.is_file() && m.len() == 0))
+            {
+                crate::routes::MimeCacheValue::text()
             } else {
                 let mut buffer = [0; 64];
                 let buffer = if metadata.is_file()

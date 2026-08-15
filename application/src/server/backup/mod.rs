@@ -10,6 +10,7 @@ use std::sync::{Arc, atomic::AtomicU64};
 
 pub mod adapters;
 pub mod manager;
+pub mod transfer;
 
 pub enum Backup {
     Wings(adapters::wings::WingsBackup),
@@ -18,6 +19,8 @@ pub enum Backup {
     Btrfs(adapters::btrfs::BtrfsBackup),
     Zfs(adapters::zfs::ZfsBackup),
     Restic(adapters::restic::ResticBackup),
+    ProxmoxBackupServer(adapters::pbs::PbsBackup),
+    Kopia(adapters::kopia::KopiaBackup),
 }
 
 impl Backup {
@@ -29,6 +32,8 @@ impl Backup {
             Backup::Btrfs(backup) => backup.uuid(),
             Backup::Zfs(backup) => backup.uuid(),
             Backup::Restic(backup) => backup.uuid(),
+            Backup::ProxmoxBackupServer(backup) => backup.uuid(),
+            Backup::Kopia(backup) => backup.uuid(),
         }
     }
 
@@ -41,6 +46,8 @@ impl Backup {
             Backup::Btrfs(_) => adapters::BackupAdapter::Btrfs,
             Backup::Zfs(_) => adapters::BackupAdapter::Zfs,
             Backup::Restic(_) => adapters::BackupAdapter::Restic,
+            Backup::ProxmoxBackupServer(_) => adapters::BackupAdapter::ProxmoxBackupServer,
+            Backup::Kopia(_) => adapters::BackupAdapter::Kopia,
         }
     }
 
@@ -57,13 +64,17 @@ impl Backup {
             Backup::Btrfs(backup) => backup.download(state, archive_format, range).await,
             Backup::Zfs(backup) => backup.download(state, archive_format, range).await,
             Backup::Restic(backup) => backup.download(state, archive_format, range).await,
+            Backup::ProxmoxBackupServer(backup) => {
+                backup.download(state, archive_format, range).await
+            }
+            Backup::Kopia(backup) => backup.download(state, archive_format, range).await,
         }
     }
 
     pub async fn restore(
         &self,
         server: &crate::server::Server,
-        progress: Arc<AtomicU64>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
         download_url: Option<compact_str::CompactString>,
     ) -> Result<(), anyhow::Error> {
@@ -74,6 +85,10 @@ impl Backup {
             Backup::Btrfs(backup) => backup.restore(server, progress, total, download_url).await,
             Backup::Zfs(backup) => backup.restore(server, progress, total, download_url).await,
             Backup::Restic(backup) => backup.restore(server, progress, total, download_url).await,
+            Backup::ProxmoxBackupServer(backup) => {
+                backup.restore(server, progress, total, download_url).await
+            }
+            Backup::Kopia(backup) => backup.restore(server, progress, total, download_url).await,
         }
     }
 
@@ -85,6 +100,8 @@ impl Backup {
             Backup::Btrfs(backup) => backup.delete(state).await,
             Backup::Zfs(backup) => backup.delete(state).await,
             Backup::Restic(backup) => backup.delete(state).await,
+            Backup::ProxmoxBackupServer(backup) => backup.delete(state).await,
+            Backup::Kopia(backup) => backup.delete(state).await,
         }
     }
 
@@ -99,6 +116,8 @@ impl Backup {
             Backup::Btrfs(backup) => backup.browse(server).await,
             Backup::Zfs(backup) => backup.browse(server).await,
             Backup::Restic(backup) => backup.browse(server).await,
+            Backup::ProxmoxBackupServer(backup) => backup.browse(server).await,
+            Backup::Kopia(backup) => backup.browse(server).await,
         }
     }
 }
@@ -117,7 +136,7 @@ pub trait BackupCreateExt {
     async fn create(
         server: &crate::server::Server,
         uuid: uuid::Uuid,
-        progress: Arc<AtomicU64>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
         ignore: ignore::gitignore::Gitignore,
         ignore_raw: compact_str::CompactString,
@@ -138,7 +157,7 @@ pub trait BackupExt {
     async fn restore(
         &self,
         server: &crate::server::Server,
-        progress: Arc<AtomicU64>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
         download_url: Option<compact_str::CompactString>,
     ) -> Result<(), anyhow::Error>;

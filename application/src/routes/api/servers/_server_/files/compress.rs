@@ -99,7 +99,7 @@ pub(crate) mod post {
         let destination_path = destination_root.join(file_name);
 
         if destination_filesystem.is_primary_server_fs()
-            && server.filesystem.is_ignored(&destination_path, false).await
+            && server.filesystem.is_ignored(&destination_path, false)
         {
             return ApiResponse::error("file not found")
                 .with_status(StatusCode::EXPECTATION_FAILED)
@@ -108,6 +108,7 @@ pub(crate) mod post {
 
         let progress = Arc::new(AtomicU64::new(0));
         let total = Arc::new(AtomicU64::new(0));
+        let files_processed = Arc::new(AtomicU64::new(0));
 
         let (identifier, task) =
             server
@@ -119,8 +120,9 @@ pub(crate) mod post {
                         files: data.files.iter().map(PathBuf::from).collect(),
                         destination_path: PathBuf::from(&data.root).join(archive_name),
                         start_time: chrono::Utc::now(),
-                        progress: progress.clone(),
-                        total: total.clone(),
+                        bytes_processed: progress.clone(),
+                        bytes_total: total.clone(),
+                        files_processed: files_processed.clone(),
                     },
                     {
                         let root = root.clone();
@@ -130,7 +132,7 @@ pub(crate) mod post {
                         let destination_filesystem = destination_filesystem.clone();
 
                         async move {
-                            let ignored = server.filesystem.get_ignored().await;
+                            let ignored = server.filesystem.get_ignored();
                             let writer = tokio::task::spawn_blocking(move || {
                                 destination_filesystem.create_seekable_file(&destination_path)
                             })
@@ -164,7 +166,7 @@ pub(crate) mod post {
                                     writer,
                                     &root,
                                     data.files,
-                                    Some(progress),
+                                    crate::server::filesystem::archive::create::ArchiveProgress::new(progress, files_processed),
                                     ignored.into(),
                                     crate::server::filesystem::archive::create::CreateTarOptions {
                                         compression_type: data.format.compression_format(),
@@ -183,7 +185,7 @@ pub(crate) mod post {
                                     writer,
                                     &root,
                                     data.files,
-                                    Some(progress),
+                                    crate::server::filesystem::archive::create::ArchiveProgress::new(progress, files_processed),
                                     ignored.into(),
                                     crate::server::filesystem::archive::create::CreateZipOptions {
                                         compression_level: state.config.load()
@@ -200,7 +202,7 @@ pub(crate) mod post {
                                     writer,
                                     &root,
                                     data.files,
-                                    Some(progress),
+                                    crate::server::filesystem::archive::create::ArchiveProgress::new(progress, files_processed),
                                     ignored.into(),
                                     crate::server::filesystem::archive::create::Create7zOptions {
                                         compression_level: state.config.load()

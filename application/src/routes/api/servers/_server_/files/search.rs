@@ -3,13 +3,14 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 pub(crate) mod post {
     use crate::{
-        io::{SafeSlice, SafeSliceMut},
+        io::{SafeSliceExt, SafeSliceMutExt},
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
         server::filesystem::{cap::FileType, virtualfs::DirectoryWalkFn},
     };
     use axum::http::StatusCode;
     use ignore::{gitignore::GitignoreBuilder, overrides::OverrideBuilder};
+    use parking_lot::Mutex;
     use serde::{Deserialize, Serialize};
     use std::{
         path::{Path, PathBuf},
@@ -18,10 +19,7 @@ pub(crate) mod post {
             atomic::{AtomicUsize, Ordering},
         },
     };
-    use tokio::{
-        io::{AsyncBufReadExt, AsyncReadExt, BufReader},
-        sync::Mutex,
-    };
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use utoipa::ToSchema;
 
     async fn search_in_stream(
@@ -210,7 +208,7 @@ pub(crate) mod post {
                 }
 
                 let ignored = if filesystem.is_primary_server_fs() {
-                    server.filesystem.get_ignored().await.into()
+                    server.filesystem.get_ignored().into()
                 } else {
                     Default::default()
                 };
@@ -248,7 +246,7 @@ pub(crate) mod post {
                                             Err(_) => return Ok(()),
                                         };
 
-                                        results.lock().await.push(entry);
+                                        results.lock().push(entry);
                                         results_count.fetch_add(1, Ordering::Relaxed);
                                         return Ok(());
                                     }
@@ -292,7 +290,7 @@ pub(crate) mod post {
                                                 Err(_) => return Ok(()),
                                             };
 
-                                            results.lock().await.push(entry);
+                                            results.lock().push(entry);
                                             results_count.fetch_add(1, Ordering::Relaxed);
                                         }
                                     }
@@ -335,11 +333,7 @@ pub(crate) mod post {
                 let path_includes = Arc::new(override_builder.build()?);
 
                 let ignored = if filesystem.is_primary_server_fs() {
-                    vec![
-                        server.filesystem.get_ignored().await,
-                        ignore_builder.build()?,
-                    ]
-                    .into()
+                    vec![server.filesystem.get_ignored(), ignore_builder.build()?].into()
                 } else {
                     ignore_builder.build()?.into()
                 };
@@ -463,7 +457,7 @@ pub(crate) mod post {
                                         Err(_) => return Ok(()),
                                     };
 
-                                    results.lock().await.push(entry);
+                                    results.lock().push(entry);
                                     results_count.fetch_add(1, Ordering::Relaxed);
 
                                     Ok(())
@@ -476,7 +470,7 @@ pub(crate) mod post {
         }
 
         ApiResponse::new_serialized(Response {
-            results: &results.lock().await,
+            results: &results.lock(),
         })
         .ok()
     }

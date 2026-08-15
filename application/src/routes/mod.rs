@@ -50,6 +50,15 @@ impl MimeCacheValue {
             valid_inner_utf8: false,
         }
     }
+
+    #[inline]
+    pub fn text() -> Self {
+        MimeCacheValue {
+            mime: "text/plain",
+            valid_utf8: true,
+            valid_inner_utf8: false,
+        }
+    }
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]
@@ -140,6 +149,39 @@ pub struct AppState {
     pub mime_cache: moka::future::Cache<MimeCacheKey, MimeCacheValue>,
     pub ssh_sessions: crate::ssh::SshSessionRegistry,
     pub web_ide: crate::server::web_ide::WebIdeManager,
+}
+
+impl AppState {
+    #[cfg(test)]
+    pub fn mock() -> State {
+        Arc::new(Self {
+            start_time: Instant::now(),
+            container_type: AppContainerType::None,
+            version: "0.0.0".to_string(),
+            config: Arc::new(crate::config::Config::mock()),
+            docker: Arc::new(
+                bollard::Docker::connect_with_local_defaults()
+                    .expect("Creating mock Docker client failed"),
+            ),
+            executor: Arc::new(crate::server::executor::noop::NoopExecutor),
+            stats_manager: Arc::new(crate::stats::StatsManager::default()),
+            server_manager: Arc::new(crate::server::manager::ServerManager::new(&[])),
+            backup_manager: Arc::new(crate::server::backup::manager::BackupManager::default()),
+            inotify_manager: Arc::new(
+                crate::server::filesystem::inotify::InotifyManager::new()
+                    .expect("Creating inotify manager failed"),
+            ),
+            mime_cache: moka::future::Cache::builder().build(),
+            ssh_sessions: crate::ssh::SshSessionRegistry::new(),
+            web_ide: crate::server::web_ide::WebIdeManager::new(
+                Arc::new(crate::config::Config::mock()),
+                Arc::new(
+                    bollard::Docker::connect_with_local_defaults()
+                        .expect("Creating mock Docker client failed"),
+                ),
+            ),
+        })
+    }
 }
 
 #[derive(ToSchema, Serialize, Deserialize)]

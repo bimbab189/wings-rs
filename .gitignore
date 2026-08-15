@@ -11,3 +11,4 @@ webide/extension/node_modules/
 webide/extension/dist/
 webide/**/node_modules/
 webide/**/dist/
+.idea/

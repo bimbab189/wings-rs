@@ -425,7 +425,7 @@ async fn fix_permissions(
         tokio::fs::create_dir_all(&path).await?;
     }
 
-    server.filesystem.chown_path(&path).await?;
+    server.filesystem.chown_path(&path)?;
 
     Ok(operation_result(
         "fix-permissions",
@@ -529,7 +529,7 @@ async fn repair_wordpress(
     let root = document_root_path(server, payload)?;
     tokio::fs::create_dir_all(root.join("wp-content/cache")).await?;
     tokio::fs::create_dir_all(root.join("wp-content/uploads")).await?;
-    server.filesystem.chown_path(&root).await?;
+    server.filesystem.chown_path(&root)?;
 
     Ok(operation_result(
         "repair-wordpress",
@@ -678,7 +678,7 @@ async fn git_deploy(
             .await?
     };
 
-    server.filesystem.chown_path(&root).await?;
+    server.filesystem.chown_path(&root)?;
 
     Ok(operation_result(
         "deploy",
@@ -1405,7 +1405,7 @@ async fn install_app(
         }
     };
 
-    server.filesystem.chown_path(&root).await?;
+    server.filesystem.chown_path(&root)?;
 
     Ok(operation_result(
         "install-app",
@@ -1469,7 +1469,7 @@ async fn install_wordpress(
     .await??;
 
     let working_dir = container_path_for_host_path(server, &host_root)?;
-    server.filesystem.chown_path(&host_root).await?;
+    server.filesystem.chown_path(&host_root)?;
     let db_host = match database.port {
         Some(port) if port != 3306 => format!("{}:{}", database.host, port),
         _ => database.host.clone(),
@@ -1593,8 +1593,8 @@ createRoot(document.getElementById('root')).render(
 
     let app_working_dir = container_path_for_host_path(server, &app_dir)?;
     let root_working_dir = container_path_for_host_path(server, root)?;
-    server.filesystem.chown_path(&app_dir).await?;
-    server.filesystem.chown_path(root).await?;
+    server.filesystem.chown_path(&app_dir)?;
+    server.filesystem.chown_path(root)?;
     run_checked_setup_command(
         server,
         "npm install --no-audit --no-fund".to_string(),
@@ -1634,7 +1634,7 @@ async fn install_laravel(
     }
     let apps_parent = app_dir.parent().unwrap_or(&server.filesystem.base_path);
     tokio::fs::create_dir_all(apps_parent).await?;
-    server.filesystem.chown_path(apps_parent).await?;
+    server.filesystem.chown_path(apps_parent)?;
 
     if tokio::fs::metadata(&app_dir).await.is_err() {
         run_checked_setup_command(
@@ -1671,7 +1671,7 @@ FILESYSTEM_DISK=local
         ),
     )
     .await?;
-    server.filesystem.chown_path(&app_dir).await?;
+    server.filesystem.chown_path(&app_dir)?;
     run_checked_setup_command(
         server,
         "php artisan key:generate --force".to_string(),

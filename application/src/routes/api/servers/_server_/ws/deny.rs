@@ -31,7 +31,7 @@ pub(crate) mod post {
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
         for jti in data.jtis {
-            state.config.jwt.deny(jti).await;
+            state.config.jwt.deny(jti);
         }
 
         ApiResponse::new_serialized(Response {}).ok()

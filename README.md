@@ -8,7 +8,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/calagopus/wings)](https://github.com/calagopus/wings/stargazers)
 [![Discord](https://img.shields.io/discord/1429911351777824892?label=discord&logo=discord&color=5865F2)](https://discord.gg/uSM8tvTxBV)
 
-A rewrite of [Pterodactyl Wings](https://github.com/pterodactyl/wings) in the Rust programming language. This rewrite aims to be 100% API compatible while implementing new features and better performance.
+A rewrite of [Pterodactyl Wings](https://github.com/pterodactyl/wings) in the Rust programming language. This rewrite aims to be 100% API compatible while implementing new features, better performance and more stability.
 
 [Todo](https://notes.rjns.dev/workspace/cb7ccae8-0508-4f90-9161-d1e69b0ca8f0/uAVAL7iHSQpDk1SiSUPL1)
 
@@ -68,7 +68,7 @@ system:
   # none, btrfs_subvolume, zfs_dataset, xfs_quota, (experimental) fuse_quota
   disk_limiter_mode: none
   # use inotify to selectively rescan disk usage instead of forcing full rescans
-  system_disk_check_use_inotify: true
+  disk_check_use_inotify: true
 
   # use multiple threads to run chown on server startup
   check_permissions_on_boot_threads: 4
@@ -93,6 +93,14 @@ system:
       # how long in seconds to cooldown after reaching max authentication attempts (if 0, no cooldown is applied)
       # the cooldown is a sliding window, so if you make 3 failed attempts in 1 minute, you will have to wait 60 seconds from the last attempt
       authentication_cooldown: 60
+      # how many concurrent connections a single user can have
+      max_connections_per_user: 10
+      # how many concurrent channels a single connection can have
+      max_channels_per_connection: 10
+      # how many concurrent open handles a single channel can have
+      max_handles_per_channel: 32
+      # how many concurrent open handles a single server can have
+      max_handles_total: 1024
 
     shell:
       # whether to enable the wings remote shell (allows server management over ssh)
@@ -191,6 +199,12 @@ docker:
     # whether to disable binding to a specific ip
     disable_interface_binding: false
 
+  registry_image_fetch_cache:
+    # whether to enable caching of docker registry image fetches (pulls)
+    enabled: true
+    # how long in seconds to cache docker registry image fetches (pulls)
+    duration: 300
+
   installer_limits:
     # how long in seconds to wait until an install container is considered failed, 0 means no limit
     timeout: 1800
@@ -255,6 +269,7 @@ ignore_panel_wings_upgrades: false
 - add support for the [fsync@openssh.com](https://github.com/openssh/openssh-portable/blob/5f98660c51e673f521e0216c7ed20205c4af10ed/PROTOCOL#L494) SFTP extension
 - add support for the [lsetstat@openssh.com](https://github.com/openssh/openssh-portable/blob/5f98660c51e673f521e0216c7ed20205c4af10ed/PROTOCOL#L508) SFTP extension
 - add support for the [users-groups-by-id@openssh.com](https://github.com/openssh/openssh-portable/blob/5f98660c51e673f521e0216c7ed20205c4af10ed/PROTOCOL#L643) SFTP extension
+- add support for the [posix-rename@openssh.com](https://github.com/openssh/openssh-portable/blob/5f98660c51e673f521e0216c7ed20205c4af10ed/PROTOCOL#L420) SFTP extension
 - properly support egg `file_denylist`
 
 ### Backups
@@ -269,6 +284,7 @@ ignore_panel_wings_upgrades: false
 ### CLI
 
 - add `service-install` command to automatically setup a service for wings
+- add `migrate-disk-limiter` command to migrate to btrfs/zfs disk limiter without needing to do a transfer for each server
 
 ## Star History
 

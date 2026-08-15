@@ -7,12 +7,11 @@ use crate::{
     models::{DirectoryEntry, DirectorySortingMode},
     routes::MimeCacheValue,
     server::filesystem::{archive::StreamableArchiveFormat, cap::FileType, encode_mode},
-    utils::PortablePermissions,
+    utils::{CmpExt, PortablePermissions},
 };
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicU64},
 };
 
 pub struct MountInfo {
@@ -89,11 +88,8 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
     ) -> Result<FileMetadata, anyhow::Error> {
         match self.inner.metadata(path) {
             Ok(m) => Ok(m),
-            Err(e) if self.is_virtual_dir(path.as_ref()) => {
-                let _ = e;
-                Ok(Self::virtual_dir_metadata())
-            }
-            Err(e) => Err(e),
+            Err(_) if self.is_virtual_dir(path.as_ref()) => Ok(Self::virtual_dir_metadata()),
+            Err(err) => Err(err),
         }
     }
 
@@ -104,7 +100,7 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
         match self.inner.async_metadata(path).await {
             Ok(m) => Ok(m),
             Err(_) if self.is_virtual_dir(path.as_ref()) => Ok(Self::virtual_dir_metadata()),
-            Err(e) => Err(e),
+            Err(err) => Err(err),
         }
     }
 
@@ -115,7 +111,7 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
         match self.inner.symlink_metadata(path) {
             Ok(m) => Ok(m),
             Err(_) if self.is_virtual_dir(path.as_ref()) => Ok(Self::virtual_dir_metadata()),
-            Err(e) => Err(e),
+            Err(err) => Err(err),
         }
     }
 
@@ -126,7 +122,7 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
         match self.inner.async_symlink_metadata(path).await {
             Ok(m) => Ok(m),
             Err(_) if self.is_virtual_dir(path.as_ref()) => Ok(Self::virtual_dir_metadata()),
-            Err(e) => Err(e),
+            Err(err) => Err(err),
         }
     }
 
@@ -139,7 +135,7 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
             Err(_) if self.is_virtual_dir(path.as_ref()) => {
                 Ok(Self::virtual_dir_entry(path.as_ref()))
             }
-            Err(e) => Err(e),
+            Err(err) => Err(err),
         }
     }
 
@@ -153,7 +149,7 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
             Err(_) if self.is_virtual_dir(path.as_ref()) => {
                 Ok(Self::virtual_dir_entry(path.as_ref()))
             }
-            Err(e) => Err(e),
+            Err(err) => Err(err),
         }
     }
 
@@ -211,7 +207,7 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
                 listing_path.join(&next_comp)
             };
 
-            if (is_ignored)(FileType::Dir, virtual_path.clone()).is_some() {
+            if let Some(virtual_path) = (is_ignored)(FileType::Dir, virtual_path) {
                 virtual_dirs.push(Self::virtual_dir_entry(&virtual_path));
             }
         }
@@ -219,7 +215,7 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
         let (mut inner_dirs, inner_non_dirs): (Vec<_>, Vec<_>) =
             inner_listing.into_iter().partition(|e| e.directory);
 
-        virtual_dirs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        virtual_dirs.sort_unstable_by(|a, b| a.name.cmp_ascii_case_insensitive(&b.name));
         if matches!(sort, DirectorySortingMode::NameDesc) {
             virtual_dirs.reverse();
         }
@@ -296,7 +292,7 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
         path: &(dyn AsRef<Path> + Send + Sync),
         archive_format: StreamableArchiveFormat,
         compression_level: CompressionLevel,
-        bytes_archived: Option<Arc<AtomicU64>>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
     ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
         self.inner
@@ -304,7 +300,7 @@ impl VirtualReadableFilesystem for VirtualMountFilesystem {
                 path,
                 archive_format,
                 compression_level,
-                bytes_archived,
+                progress,
                 is_ignored,
             )
             .await

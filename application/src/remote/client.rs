@@ -104,6 +104,13 @@ impl Client {
             return false;
         }
 
+        if let Some(api_err) = err.downcast_ref::<super::ApiError>()
+            && api_err.status.is_client_error()
+            && attempt > 3
+        {
+            return false;
+        }
+
         true
     }
 
@@ -245,12 +252,12 @@ impl Client {
         &self,
         uuid: uuid::Uuid,
         successful: bool,
-        backups: Vec<uuid::Uuid>,
+        received_backups: &crate::server::backup::transfer::ReceivedBackups,
     ) -> Result<(), anyhow::Error> {
         tracing::info!("setting server transfer status");
 
         self.retry(
-            || super::servers::set_server_transfer(self, uuid, successful, &backups),
+            || super::servers::set_server_transfer(self, uuid, successful, received_backups),
             Self::skip_client_errors,
         )
         .await
@@ -361,11 +368,27 @@ impl Client {
     ) -> Result<super::backups::ResticBackupConfiguration, anyhow::Error> {
         tracing::info!("getting restic backup configuration");
 
-        self.retry(
-            || super::backups::backup_restic_configuration(self, uuid),
-            Self::skip_client_errors,
-        )
-        .await
+        super::backups::backup_restic_configuration(self, uuid).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn backup_pbs_configuration(
+        &self,
+        uuid: uuid::Uuid,
+    ) -> Result<super::backups::PbsBackupConfiguration, anyhow::Error> {
+        tracing::info!("getting proxmox backup server backup configuration");
+
+        super::backups::backup_pbs_configuration(self, uuid).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn backup_kopia_configuration(
+        &self,
+        uuid: uuid::Uuid,
+    ) -> Result<super::backups::KopiaBackupConfiguration, anyhow::Error> {
+        tracing::info!("getting kopia backup configuration");
+
+        super::backups::backup_kopia_configuration(self, uuid).await
     }
 
     #[tracing::instrument(skip(self))]

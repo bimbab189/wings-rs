@@ -1,9 +1,9 @@
+use super::ArchiveProgress;
 use crate::{
     io::{
-        SafeSlice,
+        SafeSliceExt,
         abort::{AbortGuard, AbortWriter},
         compression::{CompressionLevel, CompressionType, writer::CompressionWriter},
-        counting_reader::CountingReader,
         fixed_reader::FixedReader,
     },
     server::filesystem::virtualfs::IsIgnoredFn,
@@ -13,12 +13,8 @@ use compact_str::ToCompactString;
 use itaf::encoder::{EncoderOptions, ItafEncoder, Metadata};
 use std::{
     borrow::Cow,
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
 };
 
 pub struct CreateItafOptions {
@@ -45,7 +41,7 @@ pub async fn create_itaf<W: Write + Send + 'static>(
     destination: W,
     base: &Path,
     sources: Vec<impl AsRef<Path> + Send + 'static>,
-    bytes_archived: Option<Arc<AtomicU64>>,
+    progress: ArchiveProgress,
     is_ignored: IsIgnoredFn,
     options: CreateItafOptions,
 ) -> Result<W, anyhow::Error> {
@@ -74,7 +70,10 @@ pub async fn create_itaf<W: Write + Send + 'static>(
 
             let source_metadata = match filesystem.symlink_metadata(&source) {
                 Ok(metadata) => metadata,
-                Err(_) => continue,
+                Err(err) => {
+                    tracing::debug!(path = %source.display(), "skipping source while creating itaf archive, failed to read metadata: {err:#}");
+                    continue;
+                }
             };
 
             let Some(source) = (is_ignored)(source_metadata.file_type().into(), source) else {
@@ -96,7 +95,15 @@ pub async fn create_itaf<W: Write + Send + 'static>(
                     .map(|c| c.to_compact_string())
                     .collect::<Vec<_>>();
 
-                while let Some(Ok((_, path))) = walker.next_entry() {
+                while let Some(entry) = walker.next_entry() {
+                    let (_, path) = match entry {
+                        Ok(entry) => entry,
+                        Err(err) => {
+                            tracing::debug!("failed to read directory entry while creating itaf archive: {err:#}");
+                            break;
+                        }
+                    };
+
                     let rel = match path.strip_prefix(&base) {
                         Ok(r) => r,
                         Err(_) => continue,
@@ -104,7 +111,10 @@ pub async fn create_itaf<W: Write + Send + 'static>(
 
                     let metadata = match filesystem.symlink_metadata(&path) {
                         Ok(m) => m,
-                        Err(_) => continue,
+                        Err(err) => {
+                            tracing::debug!(path = %path.display(), "skipping entry while creating itaf archive, failed to read metadata: {err:#}");
+                            continue;
+                        }
                     };
 
                     let entry_components = path_components(rel);
@@ -123,23 +133,16 @@ pub async fn create_itaf<W: Write + Send + 'static>(
                         archive.enter_dir(&entry_name, &entry_meta)?;
                         dir_stack.push(entry_name.to_compact_string());
 
-                        if let Some(bytes_archived) = &bytes_archived {
-                            bytes_archived.fetch_add(metadata.len(), Ordering::SeqCst);
-                        }
+                        progress.increment_bytes(metadata.len());
                     } else if metadata.is_file() {
                         let file = filesystem.open(&path)?;
-                        let reader: Box<dyn Read> = match &bytes_archived {
-                            Some(bytes_archived) => Box::new(CountingReader::new_with_bytes_read(
-                                file,
-                                Arc::clone(bytes_archived),
-                            )),
-                            None => Box::new(file),
-                        };
+                        let reader = progress.counting_reader(file);
                         let reader =
                             FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
 
                         archive
                             .add_file(&entry_name, &entry_meta, metadata.len(), &mut { reader })?;
+                        progress.increment_files();
                     } else if let Ok(link_target) = filesystem.read_link_contents(&path) {
                         let target = link_target.to_string_lossy();
 
@@ -150,6 +153,8 @@ pub async fn create_itaf<W: Write + Send + 'static>(
                                 metadata.is_dir(),
                                 &entry_meta,
                             )?;
+                            progress.increment_bytes(metadata.len());
+                            progress.increment_files();
                         }
                     }
                 }
@@ -160,9 +165,7 @@ pub async fn create_itaf<W: Write + Send + 'static>(
                     dir_stack.pop();
                 }
 
-                if let Some(bytes_archived) = &bytes_archived {
-                    bytes_archived.fetch_add(source_metadata.len(), Ordering::SeqCst);
-                }
+                progress.increment_bytes(source_metadata.len());
             } else if source_metadata.is_file() {
                 let components = path_components(relative);
                 let name = match components.last() {
@@ -174,17 +177,12 @@ pub async fn create_itaf<W: Write + Send + 'static>(
                 enter_path_components(&mut archive, enclosing, &meta)?;
 
                 let file = filesystem.open(&source)?;
-                let reader: Box<dyn Read> = match &bytes_archived {
-                    Some(bytes_archived) => Box::new(CountingReader::new_with_bytes_read(
-                        file,
-                        Arc::clone(bytes_archived),
-                    )),
-                    None => Box::new(file),
-                };
+                let reader = progress.counting_reader(file);
                 let reader =
                     FixedReader::new_with_fixed_bytes(reader, source_metadata.len() as usize);
 
                 archive.add_file(&name, &meta, source_metadata.len(), &mut { reader })?;
+                progress.increment_files();
 
                 exit_path_components(&mut archive, enclosing.len())?;
             } else if let Ok(link_target) = filesystem.read_link_contents(&source) {
@@ -204,9 +202,8 @@ pub async fn create_itaf<W: Write + Send + 'static>(
 
                 exit_path_components(&mut archive, enclosing.len())?;
 
-                if let Some(bytes_archived) = &bytes_archived {
-                    bytes_archived.fetch_add(source_metadata.len(), Ordering::SeqCst);
-                }
+                progress.increment_bytes(source_metadata.len());
+                progress.increment_files();
             }
         }
 
@@ -223,7 +220,7 @@ pub async fn create_itaf_distributed<W: Write + Send + 'static>(
     destination: W,
     base: &Path,
     sources: async_channel::Receiver<PathBuf>,
-    bytes_archived: Option<Arc<AtomicU64>>,
+    progress: ArchiveProgress,
     options: CreateItafOptions,
 ) -> Result<W, anyhow::Error> {
     let base = filesystem.relative_path(base);
@@ -253,7 +250,10 @@ pub async fn create_itaf_distributed<W: Write + Send + 'static>(
 
             let metadata = match filesystem.symlink_metadata(&full) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(err) => {
+                    tracing::debug!(path = %full.display(), "skipping source while creating itaf archive, failed to read metadata: {err:#}");
+                    continue;
+                }
             };
 
             let meta = itaf_metadata(&metadata);
@@ -279,9 +279,7 @@ pub async fn create_itaf_distributed<W: Write + Send + 'static>(
                 archive.enter_dir(name, &meta)?;
                 dir_stack.push(name.to_compact_string());
 
-                if let Some(bytes_archived) = &bytes_archived {
-                    bytes_archived.fetch_add(metadata.len(), Ordering::SeqCst);
-                }
+                progress.increment_bytes(metadata.len());
             } else if metadata.is_file() {
                 let dir_components = components.get_slice(..components.len() - 1)?;
                 sync_dir_stack_with_meta(
@@ -297,16 +295,11 @@ pub async fn create_itaf_distributed<W: Write + Send + 'static>(
                 };
 
                 let file = filesystem.open(&full)?;
-                let reader: Box<dyn Read> = match &bytes_archived {
-                    Some(bytes_archived) => Box::new(CountingReader::new_with_bytes_read(
-                        file,
-                        Arc::clone(bytes_archived),
-                    )),
-                    None => Box::new(file),
-                };
+                let reader = progress.counting_reader(file);
                 let reader = FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
 
                 archive.add_file(name, &meta, metadata.len(), &mut { reader })?;
+                progress.increment_files();
             } else if let Ok(link_target) = filesystem.read_link_contents(&full) {
                 let dir_components = components.get_slice(..components.len() - 1)?;
                 sync_dir_stack_with_meta(
@@ -325,9 +318,8 @@ pub async fn create_itaf_distributed<W: Write + Send + 'static>(
                     archive.add_symlink(name, &target, metadata.is_dir(), &meta)?;
                 }
 
-                if let Some(bytes_archived) = &bytes_archived {
-                    bytes_archived.fetch_add(metadata.len(), Ordering::SeqCst);
-                }
+                progress.increment_bytes(metadata.len());
+                progress.increment_files();
             }
         }
 
@@ -427,12 +419,15 @@ fn sync_dir_stack_with_meta<W: Write>(
 
         let meta = match filesystem.symlink_metadata(&dir_path) {
             Ok(m) => itaf_metadata(&m),
-            Err(_) => Metadata {
-                uid: 0,
-                gid: 0,
-                mode: 0o755,
-                modified: std::time::SystemTime::now(),
-            },
+            Err(err) => {
+                tracing::debug!(path = %dir_path.display(), "falling back to default directory metadata while creating itaf archive, failed to read metadata: {err:#}");
+                Metadata {
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o755,
+                    modified: std::time::SystemTime::now(),
+                }
+            }
         };
 
         archive.enter_dir(component, &meta)?;

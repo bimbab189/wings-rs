@@ -156,6 +156,15 @@ impl Server {
         }))
     }
 
+    #[cfg(test)]
+    pub fn mock(uuid: uuid::Uuid, app_state: crate::routes::State) -> Self {
+        Self::new(
+            configuration::ServerConfiguration::mock(uuid),
+            configuration::process::ProcessConfiguration::mock(),
+            app_state,
+        )
+    }
+
     pub async fn initialize_schedules(&self) {
         self.schedules.update_schedules(self.clone()).await;
     }
@@ -281,7 +290,7 @@ impl Server {
                     let message = websocket::WebsocketMessage::builder(
                         websocket::WebsocketEvent::ServerStats,
                     )
-                    .json_arg(usage)
+                    .structured_arg(usage)
                     .build();
 
                     if let Err(err) = server.websocket.send(message) {
@@ -609,6 +618,7 @@ impl Server {
         &self,
         configuration: configuration::ServerConfiguration,
         process_configuration: configuration::process::ProcessConfiguration,
+        skip_pending_restart_check: bool,
     ) {
         if configuration.suspended {
             self.app_state
@@ -625,7 +635,8 @@ impl Server {
             let mut configuration_lock = self.configuration.write().await;
             let old_configuration = std::mem::replace(&mut *configuration_lock, configuration);
 
-            if !self.state.get_pending_restart()
+            if !skip_pending_restart_check
+                && !self.state.get_pending_restart()
                 && (old_configuration.invocation != configuration_lock.invocation
                     || old_configuration.entrypoint != configuration_lock.entrypoint
                     || old_configuration.environment != configuration_lock.environment
@@ -651,12 +662,13 @@ impl Server {
         }
     }
 
-    pub async fn sync_configuration(&self) {
+    pub async fn sync_configuration(&self, skip_pending_restart_check: bool) {
         match self.app_state.config.client.server(self.uuid).await {
             Ok(configuration) => {
                 self.update_configuration(
                     configuration.settings,
                     configuration.process_configuration,
+                    skip_pending_restart_check,
                 )
                 .await;
             }
@@ -974,12 +986,6 @@ impl Server {
             "starting server"
         );
 
-        self.configuration
-            .read()
-            .await
-            .ensure_vmounts(&self.app_state.config)
-            .await?;
-
         let server = self.clone();
         tokio::spawn(async move {
             match server
@@ -992,7 +998,7 @@ impl Server {
 
                         server.destroy_container().await;
 
-                        server.sync_configuration().await;
+                        server.sync_configuration(true).await;
 
                         if !server.filesystem.disk_checker_state_dirty.load(std::sync::atomic::Ordering::Relaxed) {
                             let now = std::time::SystemTime::now()
@@ -1010,7 +1016,7 @@ impl Server {
                                 server.log_daemon_with_prelude(
                                     "Recalculating disk usage before startup, this may take a moment...",
                                 );
-                                server.filesystem.rerun_disk_checker().await;
+                                server.filesystem.rerun_disk_checker();
                                 let _ = tokio::time::timeout(
                                     std::time::Duration::from_secs(
                                         server.app_state.config.load().system.disk_check_interval.min(30),
@@ -1049,7 +1055,7 @@ impl Server {
                                 "Ensuring file permissions are set correctly, this could take a few seconds...",
                             );
 
-                            server.filesystem.chown_path(&server.filesystem.base_path).await?;
+                            server.filesystem.async_chown_path_recursive(&server.filesystem.base_path).await?;
                         }
 
                         server.setup_container().await?;
@@ -1384,7 +1390,7 @@ impl Server {
         crate::server::installation::ServerInstaller::delete_install_logs(self).await;
 
         self.diff.close().await;
-        self.filesystem.close().await;
+        self.filesystem.close();
 
         tokio::spawn({
             let server = self.clone();

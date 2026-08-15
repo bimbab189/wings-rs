@@ -1,5 +1,7 @@
+use crate::io::{SafeSliceExt, line_buffer::LineBuffer};
 use bollard::errors::Error::DockerResponseServerError;
 use futures::StreamExt;
+use parking_lot::RwLock;
 use rand::distr::SampleString;
 use std::{
     collections::HashMap,
@@ -8,12 +10,7 @@ use std::{
     sync::{Arc, Weak},
     task::{Context, Poll},
 };
-use tokio::{
-    io::{AsyncWriteExt, ReadBuf},
-    sync::RwLock,
-};
-
-use crate::io::SafeSlice;
+use tokio::io::{AsyncWriteExt, ReadBuf};
 
 #[inline]
 pub fn string_to_option(s: &str) -> Option<String> {
@@ -376,6 +373,20 @@ impl DockerExecutor {
         Self { docker, app_config }
     }
 
+    async fn image_exists(&self, image_name: &str) -> bool {
+        self.docker
+            .list_images(Some(bollard::query_parameters::ListImagesOptions {
+                all: true,
+                filters: Some(HashMap::from([(
+                    "reference".to_string(),
+                    vec![image_name.to_string()],
+                )])),
+                ..Default::default()
+            }))
+            .await
+            .is_ok_and(|images| !images.is_empty())
+    }
+
     async fn pull_image(
         &self,
         image: &str,
@@ -383,6 +394,77 @@ impl DockerExecutor {
         quiet: bool,
     ) -> Result<(), anyhow::Error> {
         if image.ends_with('~') {
+            return Ok(());
+        }
+
+        let (image_name, tag) = image.split_once(':').unwrap_or((image, "latest"));
+
+        let pull_cache = {
+            type InnerMap = HashMap<
+                compact_str::CompactString,
+                Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+            >;
+            static IMAGE_PULL_CACHE: std::sync::OnceLock<Arc<parking_lot::Mutex<InnerMap>>> =
+                std::sync::OnceLock::new();
+
+            IMAGE_PULL_CACHE.get_or_init(|| {
+                let cache = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+
+                tokio::spawn({
+                    let cache = Arc::clone(&cache);
+                    let config = Arc::clone(&self.app_config);
+
+                    async move {
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+                            let mut cache = cache.lock();
+                            let now = std::time::Instant::now();
+                            let duration = config.load().docker.registry_image_fetch_cache.duration;
+                            cache.retain(
+                                |_,
+                                 timestamp: &mut Arc<
+                                    tokio::sync::Mutex<Option<std::time::Instant>>,
+                                >| {
+                                    timestamp.try_lock().is_ok_and(|t| {
+                                        now.duration_since(t.unwrap_or(std::time::Instant::now()))
+                                            .as_secs()
+                                            < duration
+                                    })
+                                },
+                            );
+                        }
+                    }
+                });
+
+                cache
+            })
+        };
+
+        let cache_config = self.app_config.load().docker.registry_image_fetch_cache;
+
+        let mut last_pull = if cache_config.enabled {
+            let entry = {
+                let mut cache = pull_cache.lock();
+                Arc::clone(cache.entry(image.into()).or_default())
+            };
+
+            Some(entry.lock_owned().await)
+        } else {
+            None
+        };
+
+        if let Some(guard) = &last_pull
+            && let Some(pulled_at) = **guard
+            && pulled_at.elapsed().as_secs() < cache_config.duration
+            && self.image_exists(image_name).await
+        {
+            tracing::debug!(
+                server = %server.uuid,
+                image = %image_name,
+                "image pull skipped, cached as recently pulled"
+            );
+
             return Ok(());
         }
 
@@ -405,8 +487,6 @@ impl DockerExecutor {
             }
         }
 
-        let (image_name, tag) = image.split_once(':').unwrap_or((image, "latest"));
-
         let mut stream = self.docker.create_image(
             Some(bollard::query_parameters::CreateImageOptions {
                 from_image: Some(image_name.to_string()),
@@ -420,7 +500,6 @@ impl DockerExecutor {
         while let Some(status) = stream.next().await {
             match status {
                 Ok(info) => {
-                    println!("{:?}", info);
                     if let Some(id) = &info.id {
                         match info.status.as_deref().map(str::to_lowercase).as_deref() {
                             Some("downloading") => {
@@ -432,10 +511,10 @@ impl DockerExecutor {
                                                 super::super::websocket::WebsocketEvent::ServerImagePullProgress,
                                             )
                                             .arg(id.clone())
-                                            .json_arg(crate::models::PullProgress {
+                                            .structured_arg(crate::models::PullProgress {
                                                 status: crate::models::PullProgressStatus::Pulling,
-                                                progress: detail.current.unwrap_or_default(),
-                                                total: detail.total.unwrap_or_default(),
+                                                bytes_processed: detail.current.unwrap_or_default(),
+                                                bytes_total: detail.total.unwrap_or_default(),
                                             })
                                             .build(),
                                         )
@@ -451,10 +530,10 @@ impl DockerExecutor {
                                                 super::super::websocket::WebsocketEvent::ServerImagePullProgress,
                                             )
                                             .arg(id.clone())
-                                            .json_arg(crate::models::PullProgress {
+                                            .structured_arg(crate::models::PullProgress {
                                                 status: crate::models::PullProgressStatus::Extracting,
-                                                progress: detail.current.unwrap_or_default(),
-                                                total: detail.total.unwrap_or_default(),
+                                                bytes_processed: detail.current.unwrap_or_default(),
+                                                bytes_total: detail.total.unwrap_or_default(),
                                             })
                                             .build(),
                                         )
@@ -510,20 +589,7 @@ impl DockerExecutor {
                         server.log_daemon_error(&format!("failed to pull image: {err}"));
                     }
 
-                    let exists = self
-                        .docker
-                        .list_images(Some(bollard::query_parameters::ListImagesOptions {
-                            all: true,
-                            filters: Some(HashMap::from([(
-                                "reference".to_string(),
-                                vec![image_name.to_string()],
-                            )])),
-                            ..Default::default()
-                        }))
-                        .await
-                        .is_ok_and(|images| !images.is_empty());
-
-                    if !exists {
+                    if !self.image_exists(image_name).await {
                         return Err(err.into());
                     }
 
@@ -534,6 +600,10 @@ impl DockerExecutor {
                     );
                 }
             }
+        }
+
+        if let Some(guard) = &mut last_pull {
+            **guard = Some(std::time::Instant::now());
         }
 
         if !quiet {
@@ -651,8 +721,7 @@ impl DockerProcessHandle {
             let app_config = Arc::clone(&app_config);
 
             async move {
-                let mut buffer = Vec::with_capacity(1024);
-                let mut line_start = 0;
+                let mut line_buffer = LineBuffer::new();
 
                 let mut ratelimit_counter = 0;
                 let mut ratelimit_start = std::time::Instant::now();
@@ -692,99 +761,27 @@ impl DockerProcessHandle {
                     true
                 };
 
-                while let Some(Ok(data)) = attach.output.next().await {
-                    buffer.extend_from_slice(&data.into_bytes());
-
-                    let mut search_start = line_start;
-
-                    loop {
-                        if let Some(pos) = buffer
-                            .get(search_start..)
-                            .and_then(|slice| slice.iter().position(|&b| b == b'\n'))
-                        {
-                            let newline_pos = search_start + pos;
-
-                            if newline_pos - line_start <= 512 {
-                                let Some(line_slice) = buffer.get(line_start..newline_pos) else {
-                                    break;
-                                };
-                                let line = compact_str::CompactString::from_utf8_lossy(line_slice)
-                                    .trim()
-                                    .into();
-
-                                let line = Arc::new(line);
-
-                                if allow_ratelimit() {
-                                    stdout_ratelimited_tx.send(Arc::clone(&line)).ok();
-                                }
-                                stdout_tx.send(line).ok();
-
-                                line_start = newline_pos + 1;
-                                search_start = line_start;
-                            } else {
-                                let Some(line_slice) = buffer.get(line_start..line_start + 512)
-                                else {
-                                    break;
-                                };
-                                let line = compact_str::CompactString::from_utf8_lossy(line_slice)
-                                    .trim()
-                                    .into();
-
-                                let line = Arc::new(line);
-
-                                if allow_ratelimit() {
-                                    stdout_ratelimited_tx.send(Arc::clone(&line)).ok();
-                                }
-                                stdout_tx.send(line).ok();
-
-                                line_start += 512;
-                                search_start = line_start;
-                            }
-                        } else {
-                            let current_line_length = buffer.len() - line_start;
-                            if current_line_length > 512 {
-                                let Some(line_slice) = buffer.get(line_start..line_start + 512)
-                                else {
-                                    break;
-                                };
-                                let line = compact_str::CompactString::from_utf8_lossy(line_slice)
-                                    .trim()
-                                    .into();
-
-                                let line = Arc::new(line);
-
-                                if allow_ratelimit() {
-                                    stdout_ratelimited_tx.send(Arc::clone(&line)).ok();
-                                }
-                                stdout_tx.send(line).ok();
-
-                                line_start += 512;
-                                search_start = line_start;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-
-                    if line_start > 1024 && line_start > buffer.len() / 2 {
-                        buffer.drain(0..line_start);
-                        line_start = 0;
-                    }
-                }
-
-                if let Some(line_slice) = buffer.get(line_start..)
-                    && !line_slice.is_empty()
-                {
-                    let line = compact_str::CompactString::from_utf8_lossy(line_slice)
-                        .trim()
-                        .into();
-
-                    let line = Arc::new(line);
+                let mut emit = |slice: &[u8]| {
+                    let line = Arc::new(compact_str::CompactString::from_utf8_lossy(slice));
 
                     if allow_ratelimit() {
                         stdout_ratelimited_tx.send(Arc::clone(&line)).ok();
                     }
                     stdout_tx.send(line).ok();
+                };
+
+                while let Some(Ok(data)) = attach.output.next().await {
+                    line_buffer.extend(&data.into_bytes());
+
+                    while let Some(line) = line_buffer.next_line() {
+                        emit(line);
+                    }
+
+                    line_buffer.compact();
+                }
+
+                if let Some(line) = line_buffer.flush() {
+                    emit(line);
                 }
 
                 tracing::debug!(server = %server.uuid, "stdout task ended");
@@ -797,8 +794,8 @@ impl DockerProcessHandle {
         let stats_server = server.clone();
 
         let stats_task = tokio::spawn(async move {
-            let mut prev_cpu_total: u64 = 0;
-            let mut prev_instant: Option<std::time::Instant> = None;
+            let mut prev_cpu_total = 0;
+            let mut prev_instant = None;
 
             let get_stats = async || {
                 let mut stream = stats_docker.stats(
@@ -831,7 +828,7 @@ impl DockerProcessHandle {
                     }
                 };
 
-                let mut usage = stats_usage.write().await;
+                let mut usage = stats_usage.write();
 
                 if let Some(memory_stats) = &stats.memory_stats {
                     let mut memory_bytes = memory_stats.usage.unwrap_or(0);
@@ -859,7 +856,9 @@ impl DockerProcessHandle {
                     && let Some(net) = networks.values().next()
                 {
                     usage.network.rx_bytes = net.rx_bytes.unwrap_or(0);
+                    usage.network.rx_packets = net.rx_packets.unwrap_or(0);
                     usage.network.tx_bytes = net.tx_bytes.unwrap_or(0);
+                    usage.network.tx_packets = net.tx_packets.unwrap_or(0);
                 }
 
                 if let Some(cpu_stats) = &stats.cpu_stats
@@ -920,7 +919,16 @@ impl DockerProcessHandle {
                                 .signed_duration_since(started_at.with_timezone(&chrono::Utc))
                                 .num_milliseconds()
                                 .max(0) as u64;
-                            state_usage.write().await.uptime = uptime;
+                            state_usage.write().uptime = uptime;
+                            if let Some(host_config) = inspect.host_config
+                                && let Some(cpu_quota) = host_config.cpu_quota
+                                && cpu_quota > 0
+                            {
+                                state_usage.write().cpu_limit_absolute = (cpu_quota / 1000) as u32;
+                            } else {
+                                state_usage.write().cpu_limit_absolute =
+                                    rayon::current_num_threads() as u32 * 100;
+                            }
                         }
                         super::ProcessStatus::Running
                     }
@@ -928,7 +936,7 @@ impl DockerProcessHandle {
                         super::ProcessStatus::Paused
                     }
                     _ => {
-                        state_usage.write().await.uptime = 0;
+                        state_usage.write().uptime = 0;
                         super::ProcessStatus::Stopped {
                             exit_code: state.exit_code.unwrap_or(-1) as i32,
                             oom_killed: state.oom_killed.unwrap_or(false),
@@ -936,7 +944,7 @@ impl DockerProcessHandle {
                     }
                 };
 
-                let usage = *state_usage.read().await;
+                let usage = *state_usage.read();
 
                 if status_tx.send((process_status, usage)).await.is_err() {
                     break;
@@ -958,6 +966,13 @@ impl DockerProcessHandle {
             stdin_task,
         })
     }
+
+    #[inline]
+    fn get_server(&self) -> Result<Arc<super::super::InnerServer>, anyhow::Error> {
+        self.server
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("server has been dropped"))
+    }
 }
 
 impl Drop for DockerProcessHandle {
@@ -977,7 +992,7 @@ impl super::ProcessHandle for DockerProcessHandle {
     async fn resource_usage(
         &self,
     ) -> Result<super::super::resources::ResourceUsage, anyhow::Error> {
-        Ok(*self.resource_usage.read().await)
+        Ok(*self.resource_usage.read())
     }
 
     async fn logs(
@@ -1031,10 +1046,7 @@ impl super::ProcessHandle for DockerProcessHandle {
     }
 
     async fn sync_configuration(&self) -> Result<(), anyhow::Error> {
-        let server = self
-            .server
-            .upgrade()
-            .ok_or_else(|| anyhow::anyhow!("server has been dropped"))?;
+        let server = self.get_server()?;
 
         let update_config = server
             .configuration
@@ -1056,10 +1068,7 @@ impl super::ProcessHandle for DockerProcessHandle {
     }
 
     async fn stop(&self) -> Result<(), anyhow::Error> {
-        let server = self
-            .server
-            .upgrade()
-            .ok_or_else(|| anyhow::anyhow!("server has been dropped"))?;
+        let server = self.get_server()?;
 
         let process_config = server.process_configuration.read().await;
         let stop_type = process_config.stop.r#type.clone();
@@ -1198,6 +1207,12 @@ impl super::ServerExecutor for DockerExecutor {
             .read()
             .await
             .container_config(&self.app_config, &self.docker, &server.filesystem)
+            .await?;
+        server
+            .configuration
+            .read()
+            .await
+            .ensure_vmounts(&self.app_config)
             .await?;
 
         let container = self

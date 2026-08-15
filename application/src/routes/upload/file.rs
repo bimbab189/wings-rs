@@ -115,14 +115,13 @@ pub(crate) mod post {
                 if let Err(err) = payload
                     .base
                     .validate(&state.config.jwt, Some("file-upload"))
-                    .await
                 {
                     return ApiResponse::error(&format!("invalid token: {err}"))
                         .with_status(StatusCode::UNAUTHORIZED)
                         .ok();
                 }
 
-                if !state.config.jwt.limited_jwt_id(&payload.unique_id).await {
+                if !state.config.jwt.limited_jwt_id(&payload.unique_id) {
                     return ApiResponse::error("token has already been used")
                         .with_status(StatusCode::UNAUTHORIZED)
                         .ok();
@@ -162,9 +161,7 @@ pub(crate) mod post {
                     .await;
                 let path = root.join(file_name);
 
-                if filesystem.is_primary_server_fs()
-                    && server.filesystem.is_ignored(&path, false).await
-                {
+                if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(&path, false) {
                     return ApiResponse::error("file not found")
                         .with_status(StatusCode::NOT_FOUND)
                         .ok();
@@ -252,14 +249,13 @@ pub(crate) mod post {
                 if let Err(err) = payload
                     .base
                     .validate(&state.config.jwt, Some("file-upload"))
-                    .await
                 {
                     return ApiResponse::error(&format!("invalid token: {err}"))
                         .with_status(StatusCode::UNAUTHORIZED)
                         .ok();
                 }
 
-                if !state.config.jwt.limited_jwt_id(&payload.unique_id).await {
+                if !state.config.jwt.limited_jwt_id(&payload.unique_id) {
                     return ApiResponse::error("token has already been used")
                         .with_status(StatusCode::UNAUTHORIZED)
                         .ok();
@@ -322,7 +318,7 @@ pub(crate) mod post {
                     if ignored
                         .as_ref()
                         .is_some_and(|o| o.matched(parent, false).is_ignore())
-                        || server.filesystem.is_ignored(parent, false).await
+                        || server.filesystem.is_ignored(parent, false)
                     {
                         return ApiResponse::error("file not found")
                             .with_status(StatusCode::NOT_FOUND)
@@ -348,7 +344,7 @@ pub(crate) mod post {
                         && (ignored
                             .as_ref()
                             .is_some_and(|o| o.matched(&path, false).is_ignore())
-                            || server.filesystem.is_ignored(&path, false).await)
+                            || server.filesystem.is_ignored(&path, false))
                     {
                         return ApiResponse::error("file not found")
                             .with_status(StatusCode::NOT_FOUND)
@@ -360,20 +356,17 @@ pub(crate) mod post {
                     let mut written_size = 0;
                     let mut writer = filesystem.async_create_file(&path).await?;
 
-                    server
-                        .activity
-                        .log_activity(Activity {
-                            event: ActivityEvent::FileUploaded,
-                            user: Some(payload.user_uuid),
-                            ip: user_ip,
-                            metadata: Some(json!({
-                                "files": [filename],
-                                "directory": server.filesystem.relative_path(&directory),
-                            })),
-                            schedule: None,
-                            timestamp: chrono::Utc::now(),
-                        })
-                        .await;
+                    server.activity.log_activity(Activity {
+                        event: ActivityEvent::FileUploaded,
+                        user: Some(payload.user_uuid),
+                        ip: user_ip,
+                        metadata: Some(json!({
+                            "files": [filename],
+                            "directory": server.filesystem.relative_path(&directory),
+                        })),
+                        schedule: None,
+                        timestamp: chrono::Utc::now(),
+                    });
 
                     while let Some(chunk) = field.chunk().await? {
                         let config = state.config.load();
@@ -412,7 +405,7 @@ pub(crate) mod post {
                                 },
                                 server_uuid: payload.server_uuid,
                                 user_ip,
-                                unique_id: payload.unique_id.clone(),
+                                unique_id: uuid::Uuid::new_v4().to_compact_string(),
                                 file_path: path.clone(),
                                 written_size,
                             })?);

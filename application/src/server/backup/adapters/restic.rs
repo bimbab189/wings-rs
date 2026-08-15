@@ -1,8 +1,7 @@
 use crate::{
     io::{
-        SafeSlice, SafeWrite,
+        SafeSliceExt, SafeWriteExt, UninterruptedReadExt,
         compression::{CompressionLevel, writer::CompressionWriter},
-        counting_reader::CountingReader,
     },
     models::DirectoryEntry,
     remote::backups::{RawServerBackup, ResticBackupConfiguration},
@@ -21,7 +20,7 @@ use crate::{
             },
         },
     },
-    utils::{PortablePermissions, StdoutTakeExt, TokioStdoutTakeExt},
+    utils::{CmpExt, PortablePermissions, StdoutTakeExt, TokioStdoutTakeExt},
 };
 use chrono::{Datelike, Timelike};
 use compact_str::{CompactString, ToCompactString};
@@ -30,14 +29,18 @@ use serde::Deserialize;
 use serde_default::DefaultFromSerde;
 use std::{
     collections::HashMap,
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::{io::AsyncBufReadExt, process::Command, sync::RwLock};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt},
+    process::Command,
+    sync::RwLock,
+};
 
 type ResticBackupCache =
     RwLock<HashMap<uuid::Uuid, (ResticSnapshot, Arc<ResticBackupConfiguration>)>>;
@@ -100,6 +103,7 @@ impl ResticTreeNode {
         for entry in entries {
             root.insert(entry);
         }
+        root.sort_files();
         root.aggregate_sizes();
         root
     }
@@ -139,13 +143,18 @@ impl ResticTreeNode {
                     size: entry.size.unwrap_or(0),
                     mtime: entry.mtime,
                 };
-                let leaf_name = leaf.to_compact_string();
-                match parent.files.binary_search_by(|(n, _)| n.as_str().cmp(leaf)) {
-                    // SAFETY: `idx` is guaranteed to be a valid index into `parent.files` due to the logic above.
-                    Ok(idx) => unsafe { parent.files.get_unchecked_mut(idx) }.1 = meta,
-                    Err(idx) => parent.files.insert(idx, (leaf_name, meta)),
-                }
+
+                parent.files.push((leaf.to_compact_string(), meta));
             }
+        }
+    }
+
+    fn sort_files(&mut self) {
+        self.files.reverse();
+        self.files.sort_by(|(a, _), (b, _)| a.cmp(b));
+        self.files.dedup_by(|(a, _), (b, _)| a == b);
+        for (_, child) in self.dirs.iter_mut() {
+            child.sort_files();
         }
     }
 
@@ -526,7 +535,7 @@ impl BackupCreateExt for ResticBackup {
     async fn create(
         server: &crate::server::Server,
         uuid: uuid::Uuid,
-        progress: Arc<AtomicU64>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
         _ignore: ignore::gitignore::Gitignore,
         ignore_raw: compact_str::CompactString,
@@ -659,8 +668,11 @@ impl BackupCreateExt for ResticBackup {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
 
-                    progress.store(bytes_done, Ordering::SeqCst);
-                    total.store(total_bytes, Ordering::SeqCst);
+                    progress.store_bytes(bytes_done);
+                    total.store(total_bytes, Ordering::Relaxed);
+
+                    let files_done = json.get("files_done").and_then(|v| v.as_u64()).unwrap_or(0);
+                    progress.store_files(files_done);
                 } else if json.get("message_type").and_then(|v| v.as_str()) == Some("summary") {
                     total_bytes_processed = json
                         .get("total_bytes_processed")
@@ -670,6 +682,9 @@ impl BackupCreateExt for ResticBackup {
                         .get("total_files_processed")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
+
+                    progress.store_files(total_files_processed);
+
                     snapshot_id = json
                         .get("snapshot_id")
                         .and_then(|v| v.as_str())
@@ -1007,11 +1022,11 @@ impl BackupExt for ResticBackup {
     async fn restore(
         &self,
         server: &crate::server::Server,
-        progress: Arc<AtomicU64>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
         _download_url: Option<compact_str::CompactString>,
     ) -> Result<(), anyhow::Error> {
-        total.store(self.total_bytes_processed, Ordering::SeqCst);
+        total.store(self.total_bytes_processed, Ordering::Relaxed);
 
         let child = Command::new("restic")
             .envs(&self.configuration.environment)
@@ -1057,13 +1072,14 @@ impl BackupExt for ResticBackup {
                     continue;
                 }
 
-                progress.fetch_add(size, Ordering::SeqCst);
+                progress.store_bytes(size);
+                progress.increment_files();
 
                 server.log_daemon(compact_str::format_compact!("(restoring): {}", item));
             }
         }
 
-        server.filesystem.rerun_disk_checker().await;
+        server.filesystem.rerun_disk_checker();
 
         Ok(())
     }
@@ -1108,7 +1124,7 @@ impl BackupExt for ResticBackup {
         &self,
         server: &crate::server::Server,
     ) -> Result<Arc<dyn VirtualReadableFilesystem>, anyhow::Error> {
-        let child = Command::new("restic")
+        let mut child = Command::new("restic")
             .envs(&self.configuration.environment)
             .arg("--json")
             .arg("--repo")
@@ -1123,29 +1139,45 @@ impl BackupExt for ResticBackup {
             .arg("/")
             .arg("--recursive")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()?;
 
-        let mut line_reader = tokio::io::BufReader::new(child.into_stdout()?).lines();
-        let mut entries: Vec<ResticDirectoryEntry> = Vec::new();
+        let mut entries = Vec::new();
 
-        while let Ok(Some(line)) = line_reader.next_line().await {
-            if line.is_empty() {
-                continue;
-            }
+        if let Some(stdout) = child.stdout.take() {
+            let mut line_reader = tokio::io::BufReader::new(stdout).lines();
 
-            if let Ok(mut entry) = serde_json::from_str::<ResticDirectoryEntry>(&line) {
-                entry.path = entry
-                    .path
-                    .strip_prefix(Path::new("/"))
-                    .unwrap_or(&entry.path)
-                    .to_owned();
+            while let Ok(Some(line)) = line_reader.next_line().await {
+                if line.is_empty() {
+                    continue;
+                }
 
-                entries.push(entry);
+                if let Ok(mut entry) = serde_json::from_str::<ResticDirectoryEntry>(&line) {
+                    entry.path = entry
+                        .path
+                        .strip_prefix(Path::new("/"))
+                        .unwrap_or(&entry.path)
+                        .to_owned();
+
+                    entries.push(entry);
+                }
             }
         }
 
-        let tree = ResticTreeNode::build(entries);
+        let status = child.wait().await?;
+        if !status.success()
+            && let Some(mut stderr) = child.stderr.take()
+        {
+            let mut stderr_out = String::new();
+            stderr.read_to_string(&mut stderr_out).await?;
+
+            tracing::error!(
+                "failed to list Kopia snapshot for browsing: {}",
+                stderr_out.trim()
+            );
+        }
+
+        let tree = tokio::task::block_in_place(|| ResticTreeNode::build(entries));
 
         Ok(Arc::new(VirtualResticBackup {
             server: server.clone(),
@@ -1208,6 +1240,8 @@ impl VirtualResticBackup {
     ) -> DirectoryEntry {
         let detected_mime = if meta.file_type.is_symlink() {
             MimeCacheValue::symlink()
+        } else if meta.file_type.is_file() && meta.size == 0 {
+            MimeCacheValue::text()
         } else {
             crate::utils::detect_mime_type(path, buffer)
         };
@@ -1266,7 +1300,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             return Ok(FileMetadata {
                 file_type: FileType::Dir,
                 permissions: PortablePermissions::from_mode(mode),
-                size: node.size,
+                size: 0,
                 modified,
                 created: None,
             });
@@ -1384,20 +1418,20 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         let mut file_children: Vec<Child<'_>> = Vec::new();
 
         for (name, child_node) in node.dirs.iter() {
-            let child_path = path.join(name.as_str());
-            if (is_ignored)(FileType::Dir, child_path.clone()).is_none() {
-                continue;
-            }
+            let child_path = match (is_ignored)(FileType::Dir, path.join(name.as_str())) {
+                Some(kept) => kept,
+                None => continue,
+            };
             dir_children.push(Child::Dir {
                 path: child_path,
                 node: child_node,
             });
         }
         for (name, meta) in node.files.iter() {
-            let child_path = path.join(name.as_str());
-            if (is_ignored)(meta.file_type, child_path.clone()).is_none() {
-                continue;
-            }
+            let child_path = match (is_ignored)(meta.file_type, path.join(name.as_str())) {
+                Some(kept) => kept,
+                None => continue,
+            };
             file_children.push(Child::File {
                 path: child_path,
                 meta,
@@ -1415,8 +1449,8 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             };
 
             match sort {
-                NameAsc => a_path.cmp(b_path),
-                NameDesc => b_path.cmp(a_path),
+                NameAsc => a_path.cmp_ascii_case_insensitive(b_path),
+                NameDesc => b_path.cmp_ascii_case_insensitive(a_path),
                 SizeAsc | PhysicalSizeAsc => a_size.cmp(&b_size),
                 SizeDesc | PhysicalSizeDesc => b_size.cmp(&a_size),
                 ModifiedAsc | CreatedAsc => a_mtime.cmp(&b_mtime),
@@ -1768,7 +1802,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         path: &(dyn AsRef<Path> + Send + Sync),
         archive_format: StreamableArchiveFormat,
         compression_level: CompressionLevel,
-        bytes_archived: Option<Arc<AtomicU64>>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
     ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
         let entry = self.async_metadata(&path).await?;
@@ -1870,17 +1904,16 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                             }
                             tar::EntryType::Regular => {
                                 zip.start_file(relative.to_string_lossy(), options)?;
+                                progress.increment_files();
 
                                 loop {
-                                    let bytes_read = entry.read(&mut read_buffer)?;
+                                    let bytes_read = entry.read_uninterrupted(&mut read_buffer)?;
                                     if crate::unlikely(bytes_read == 0) {
                                         break;
                                     }
 
                                     zip.safe_write_all(&read_buffer, bytes_read)?;
-                                    if let Some(counter) = &bytes_archived {
-                                        counter.fetch_add(bytes_read as u64, Ordering::SeqCst);
-                                    }
+                                    progress.increment_bytes(bytes_read as u64);
                                 }
                             }
                             _ => continue,
@@ -1926,15 +1959,14 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                         }
 
                         if file_type.is_file() {
-                            if let Some(counter) = &bytes_archived {
-                                let counting_reader =
-                                    CountingReader::new_with_bytes_read(entry, counter.clone());
-                                tar.append_data(&mut header, relative, counting_reader)?;
-                            } else {
-                                tar.append_data(&mut header, relative, entry)?;
-                            }
+                            let reader = progress.counting_reader(entry);
+                            tar.append_data(&mut header, relative, reader)?;
+                            progress.increment_files();
                         } else {
                             tar.append_data(&mut header, relative, std::io::empty())?;
+                            if file_type.is_symlink() {
+                                progress.increment_files();
+                            }
                         }
                     }
 
@@ -2044,13 +2076,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                             }
                             FileType::File => {
                                 let size = header.size().unwrap_or(0);
-                                let reader: Box<dyn Read> = match &bytes_archived {
-                                    Some(counter) => Box::new(CountingReader::new_with_bytes_read(
-                                        entry,
-                                        counter.clone(),
-                                    )),
-                                    None => Box::new(entry),
-                                };
+                                let reader = progress.counting_reader(entry);
                                 let mut reader =
                                     crate::io::fixed_reader::FixedReader::new_with_fixed_bytes(
                                         reader,
@@ -2058,6 +2084,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                     );
 
                                 itaf_enc.add_file(name, &meta, size, &mut reader)?;
+                                progress.increment_files();
                             }
                             FileType::Symlink => {
                                 let link =
@@ -2065,6 +2092,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                 let target = link.to_string_lossy();
                                 if itaf::spec::validate_name(name).is_ok() {
                                     itaf_enc.add_symlink(name, &target, false, &meta)?;
+                                    progress.increment_files();
                                 }
                             }
                             _ => {}
@@ -2100,7 +2128,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         file_paths: Vec<PathBuf>,
         archive_format: StreamableArchiveFormat,
         compression_level: CompressionLevel,
-        bytes_archived: Option<Arc<AtomicU64>>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
     ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
         let entry = self.async_metadata(&path).await?;
@@ -2244,20 +2272,17 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                         }
                                         tar::EntryType::Regular => {
                                             zip.start_file(relative.to_string_lossy(), options)?;
+                                            progress.increment_files();
 
                                             loop {
-                                                let bytes_read = entry.read(&mut read_buffer)?;
+                                                let bytes_read =
+                                                    entry.read_uninterrupted(&mut read_buffer)?;
                                                 if crate::unlikely(bytes_read == 0) {
                                                     break;
                                                 }
 
                                                 zip.safe_write_all(&read_buffer, bytes_read)?;
-                                                if let Some(counter) = &bytes_archived {
-                                                    counter.fetch_add(
-                                                        bytes_read as u64,
-                                                        Ordering::SeqCst,
-                                                    );
-                                                }
+                                                progress.increment_bytes(bytes_read as u64);
                                             }
                                         }
                                         _ => continue,
@@ -2289,19 +2314,19 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                         )?);
 
                                 zip.start_file(entry_path.to_string_lossy(), options)?;
+                                progress.increment_files();
 
                                 let mut restic_file = child.take_stdout()?;
 
                                 loop {
-                                    let bytes_read = restic_file.read(&mut read_buffer)?;
+                                    let bytes_read =
+                                        restic_file.read_uninterrupted(&mut read_buffer)?;
                                     if crate::unlikely(bytes_read == 0) {
                                         break;
                                     }
 
                                     zip.safe_write_all(&read_buffer, bytes_read)?;
-                                    if let Some(counter) = &bytes_archived {
-                                        counter.fetch_add(bytes_read as u64, Ordering::SeqCst);
-                                    }
+                                    progress.increment_bytes(bytes_read as u64);
                                 }
                             }
                         }
@@ -2349,22 +2374,14 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                     }
 
                                     if file_type.is_file() {
-                                        if let Some(counter) = &bytes_archived {
-                                            let counting_reader =
-                                                CountingReader::new_with_bytes_read(
-                                                    entry,
-                                                    counter.clone(),
-                                                );
-                                            tar.append_data(
-                                                &mut header,
-                                                relative,
-                                                counting_reader,
-                                            )?;
-                                        } else {
-                                            tar.append_data(&mut header, relative, entry)?;
-                                        }
+                                        let reader = progress.counting_reader(entry);
+                                        tar.append_data(&mut header, relative, reader)?;
+                                        progress.increment_files();
                                     } else {
                                         tar.append_data(&mut header, relative, std::io::empty())?;
+                                        if file_type.is_symlink() {
+                                            progress.increment_files();
+                                        }
                                     }
                                 }
                             }
@@ -2384,19 +2401,9 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                 header.set_entry_type(tar::EntryType::Regular);
                                 header.set_cksum();
 
-                                if let Some(counter) = &bytes_archived {
-                                    let counting_reader = CountingReader::new_with_bytes_read(
-                                        child.take_stdout()?,
-                                        counter.clone(),
-                                    );
-                                    tar.append_data(&mut header, &entry_path, counting_reader)?;
-                                } else {
-                                    tar.append_data(
-                                        &mut header,
-                                        &entry_path,
-                                        child.take_stdout()?,
-                                    )?;
-                                }
+                                let reader = progress.counting_reader(child.take_stdout()?);
+                                tar.append_data(&mut header, &entry_path, reader)?;
+                                progress.increment_files();
                             }
                         }
                     }
@@ -2580,15 +2587,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                         }
                                         FileType::File => {
                                             let size = header.size().unwrap_or(0);
-                                            let reader: Box<dyn Read> = match &bytes_archived {
-                                                Some(counter) => {
-                                                    Box::new(CountingReader::new_with_bytes_read(
-                                                        entry,
-                                                        counter.clone(),
-                                                    ))
-                                                }
-                                                None => Box::new(entry),
-                                            };
+                                            let reader = progress.counting_reader(entry);
                                             let mut reader = crate::io::fixed_reader::FixedReader::new_with_fixed_bytes(
                                                 reader,
                                                 size as usize,
@@ -2600,6 +2599,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                                 size,
                                                 &mut reader,
                                             )?;
+                                            progress.increment_files();
                                         }
                                         FileType::Symlink => {
                                             let link = entry
@@ -2611,6 +2611,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                                 itaf_enc.add_symlink(
                                                     inner_name, &target, false, &meta,
                                                 )?;
+                                                progress.increment_files();
                                             }
                                         }
                                         _ => {}
@@ -2669,13 +2670,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                 };
 
                                 let mut child = spawn_restic(false, &entry_path)?;
-                                let reader: Box<dyn Read> = match &bytes_archived {
-                                    Some(counter) => Box::new(CountingReader::new_with_bytes_read(
-                                        child.take_stdout()?,
-                                        counter.clone(),
-                                    )),
-                                    None => Box::new(child.take_stdout()?),
-                                };
+                                let reader = progress.counting_reader(child.take_stdout()?);
                                 let mut reader =
                                     crate::io::fixed_reader::FixedReader::new_with_fixed_bytes(
                                         reader,
@@ -2683,6 +2678,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                     );
 
                                 itaf_enc.add_file(file_name, &meta, size, &mut reader)?;
+                                progress.increment_files();
                             }
                         }
                     }

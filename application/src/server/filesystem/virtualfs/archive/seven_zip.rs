@@ -1,8 +1,7 @@
 use crate::{
     io::{
-        SafeAsyncWrite, SafeSlice, SafeWrite,
+        SafeAsyncWriteExt, SafeSliceExt, SafeWriteExt, UninterruptedReadExt,
         compression::{CompressionLevel, writer::CompressionWriter},
-        counting_reader::CountingReader,
     },
     models::{DirectoryEntry, DirectorySortingMode},
     routes::MimeCacheValue,
@@ -17,7 +16,7 @@ use crate::{
             VirtualReadableFilesystem,
         },
     },
-    utils::PortablePermissions,
+    utils::{CmpExt, PortablePermissions},
 };
 use chrono::{Datelike, Timelike};
 use compact_str::ToCompactString;
@@ -26,10 +25,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -50,8 +46,8 @@ impl CmpSortExt for sevenz_rust2::ArchiveEntry {
         use crate::models::DirectorySortingMode::*;
 
         match sort {
-            NameAsc => self.name().cmp(other.name()),
-            NameDesc => other.name().cmp(self.name()),
+            NameAsc => self.name().cmp_ascii_case_insensitive(other.name()),
+            NameDesc => other.name().cmp_ascii_case_insensitive(self.name()),
             SizeAsc => self.size.cmp(&other.size),
             SizeDesc => other.size.cmp(&self.size),
             PhysicalSizeAsc => self.compressed_size.cmp(&other.compressed_size),
@@ -203,9 +199,11 @@ impl VirtualSevenZipArchive {
 
             mime_cache.insert(entry_index, detected_mime);
             detected_mime
+        } else if entry.size() == 0 {
+            MimeCacheValue::text()
         } else {
             let mut buffer = [0; 64];
-            let buffer = if reader.read(&mut buffer).is_err() {
+            let buffer = if reader.read_uninterrupted(&mut buffer).is_err() {
                 None
             } else {
                 Some(&buffer[..])
@@ -510,9 +508,8 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
 
                 if let Some(node) = sizes.get_path(&path) {
                     for (child_name, _child_node) in node.get_entries() {
-                        let child_path = path.join(child_name.as_str());
-
-                        let Some(filtered_path) = (is_ignored)(FileType::Dir, child_path.clone())
+                        let Some(filtered_path) =
+                            (is_ignored)(FileType::Dir, path.join(child_name.as_str()))
                         else {
                             continue;
                         };
@@ -521,7 +518,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                             .files
                             .iter()
                             .enumerate()
-                            .find(|(_, e)| Path::new(e.name()) == child_path);
+                            .find(|(_, e)| Path::new(e.name()) == filtered_path);
 
                         directory_entries.push(DirItem::Dir {
                             path: filtered_path,
@@ -850,7 +847,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
 
                         let mut buffer = vec![0; crate::BUFFER_SIZE];
                         loop {
-                            match entry_reader.read(&mut buffer) {
+                            match entry_reader.read_uninterrupted(&mut buffer) {
                                 Ok(0) => break,
                                 Ok(bytes_read) => {
                                     if runtime
@@ -938,7 +935,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
 
                     let mut buffer = vec![0; crate::BUFFER_SIZE];
                     loop {
-                        match reader.read(&mut buffer) {
+                        match reader.read_uninterrupted(&mut buffer) {
                             Ok(0) => break,
                             Ok(bytes_read) => {
                                 if writer.safe_write_all(&buffer, bytes_read).is_err() {
@@ -1007,7 +1004,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
 
                     let mut buffer = vec![0; crate::BUFFER_SIZE];
                     loop {
-                        match reader.read(&mut buffer) {
+                        match reader.read_uninterrupted(&mut buffer) {
                             Ok(0) => break,
                             Ok(bytes_read) => {
                                 if runtime
@@ -1057,7 +1054,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         path: &(dyn AsRef<Path> + Send + Sync),
         archive_format: StreamableArchiveFormat,
         compression_level: CompressionLevel,
-        bytes_archived: Option<Arc<AtomicU64>>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
     ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
         let archive = self.archive.clone();
@@ -1121,6 +1118,8 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                         } else {
                             zip.start_file(name.to_string_lossy(), zip_options)?;
 
+                            progress.increment_files();
+
                             if let Some(Some(block_index)) =
                                 archive.stream_map.file_block_index.get(i)
                             {
@@ -1144,9 +1143,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
 
                                         crate::io::copy_shared(&mut read_buffer, reader, &mut zip)?;
 
-                                        if let Some(bytes_archived) = &bytes_archived {
-                                            bytes_archived.fetch_add(entry_size, Ordering::SeqCst);
-                                        }
+                                        progress.increment_bytes(entry_size);
 
                                         Ok(false)
                                     })
@@ -1217,6 +1214,8 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                             entry_header.set_entry_type(tar::EntryType::Regular);
                             entry_header.set_size(entry.size);
 
+                            progress.increment_files();
+
                             if let Some(Some(block_index)) =
                                 archive.stream_map.file_block_index.get(i)
                             {
@@ -1236,15 +1235,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                                             return Ok(true);
                                         }
 
-                                        let reader: Box<dyn Read> = match &bytes_archived {
-                                            Some(bytes_archived) => {
-                                                Box::new(CountingReader::new_with_bytes_read(
-                                                    reader,
-                                                    Arc::clone(bytes_archived),
-                                                ))
-                                            }
-                                            None => Box::new(reader),
-                                        };
+                                        let reader = progress.counting_reader(reader);
 
                                         tar.append_data(&mut entry_header, name, reader)?;
 
@@ -1364,6 +1355,8 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                         };
                         let size = entry.size;
 
+                        progress.increment_files();
+
                         if let Some(Some(block_index)) =
                             archive.stream_map.file_block_index.get(entry_index)
                         {
@@ -1383,13 +1376,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                                         return Ok(true);
                                     }
 
-                                    let src: Box<dyn Read> = match &bytes_archived {
-                                        Some(ba) => Box::new(CountingReader::new_with_bytes_read(
-                                            block_reader,
-                                            Arc::clone(ba),
-                                        )),
-                                        None => Box::new(block_reader),
-                                    };
+                                    let src = progress.counting_reader(block_reader);
                                     let mut src =
                                         crate::io::fixed_reader::FixedReader::new_with_fixed_bytes(
                                             src,

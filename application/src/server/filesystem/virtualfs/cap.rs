@@ -10,14 +10,12 @@ use crate::{
         archive::StreamableArchiveFormat,
         virtualfs::{AsyncReadableWritableSeekableFileStream, ReadableWritableSeekableFileStream},
     },
-    utils::PortablePermissions,
+    utils::{CmpExt, PortablePermissions},
 };
-use std::{
-    path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicU64},
-};
+use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
+#[derive(Clone)]
 pub struct VirtualCapFilesystem {
     pub inner: crate::server::filesystem::cap::CapFilesystem,
     pub server: crate::server::Server,
@@ -174,111 +172,111 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         is_ignored: IsIgnoredFn,
         sort: crate::models::DirectorySortingMode,
     ) -> Result<DirectoryListing, anyhow::Error> {
-        use crate::models::DirectorySortingMode::*;
-
-        let path = path.as_ref();
-        let is_ignored = if let Some(existing_is_ignored) = &self.is_ignored {
-            existing_is_ignored.clone().merge(is_ignored)
-        } else {
-            is_ignored
+        let path = path.as_ref().to_path_buf();
+        let is_ignored = match &self.is_ignored {
+            Some(existing) => existing.clone().merge(is_ignored),
+            None => is_ignored,
         };
-        let mut directory_reader = self.inner.async_read_dir(path).await?;
-        let mut directory_entries = Vec::new();
-        let mut other_entries = Vec::new();
-        while let Some(Ok((file_type, entry))) = directory_reader.next_entry().await {
-            let path = path.join(&entry);
-            if is_ignored(file_type, path).is_none() {
-                continue;
-            }
-            if file_type.is_dir() {
-                directory_entries.push(entry);
-            } else {
-                other_entries.push(entry);
-            }
-        }
+        let this = self.clone();
+        let runtime = tokio::runtime::Handle::current();
 
-        let name_sort = matches!(sort, NameAsc | NameDesc);
+        tokio::task::spawn_blocking(move || {
+            use crate::models::DirectorySortingMode::*;
 
-        if name_sort {
-            directory_entries.sort_unstable();
-            other_entries.sort_unstable();
+            let mut directory_entries = Vec::new();
+            let mut other_entries = Vec::new();
+            let mut scratch = PathBuf::new();
+
+            let mut dir = this.inner.read_dir(&path)?;
+            while let Some(item) = dir.next_entry() {
+                let Ok((file_type, entry)) = item else { break };
+
+                scratch.clear();
+                scratch.push(&path);
+                scratch.push(&entry);
+
+                match is_ignored(file_type, std::mem::take(&mut scratch)) {
+                    Some(kept) => scratch = kept,
+                    None => continue,
+                }
+
+                if file_type.is_dir() {
+                    directory_entries.push(entry);
+                } else {
+                    other_entries.push(entry);
+                }
+            }
 
             let total_entries = directory_entries.len() + other_entries.len();
-            let mut entries = Vec::new();
 
-            if matches!(sort, NameDesc) {
-                directory_entries.reverse();
-                other_entries.reverse();
-            }
+            if matches!(sort, NameAsc | NameDesc) {
+                directory_entries.sort_unstable_by(|a, b| a.cmp_ascii_case_insensitive(b));
+                other_entries.sort_unstable_by(|a, b| a.cmp_ascii_case_insensitive(b));
 
-            if let Some(per_page) = per_page {
+                if matches!(sort, NameDesc) {
+                    directory_entries.reverse();
+                    other_entries.reverse();
+                }
+
+                let start = per_page.map_or(0, |per_page| (page - 1) * per_page);
+                let limit = per_page.unwrap_or(usize::MAX);
+
+                let mut entries = Vec::new();
                 for entry in directory_entries
                     .into_iter()
                     .chain(other_entries)
-                    .skip((page - 1) * per_page)
-                    .take(per_page)
+                    .skip(start)
+                    .take(limit)
                 {
-                    let path = path.join(&entry);
-                    let entry = match self.async_directory_entry(&path).await {
-                        Ok(entry) => entry,
-                        Err(_) => continue,
-                    };
-                    entries.push(entry);
+                    if let Ok(entry) =
+                        runtime.block_on(this.async_directory_entry(&path.join(&entry)))
+                    {
+                        entries.push(entry);
+                    }
                 }
+
+                Ok(DirectoryListing {
+                    total_entries,
+                    entries,
+                })
             } else {
+                let mut entries = Vec::new();
                 for entry in directory_entries.into_iter().chain(other_entries) {
-                    let path = path.join(&entry);
-                    let entry = match self.async_directory_entry(&path).await {
-                        Ok(entry) => entry,
-                        Err(_) => continue,
-                    };
-                    entries.push(entry);
+                    if let Ok(entry) =
+                        runtime.block_on(this.async_directory_entry(&path.join(&entry)))
+                    {
+                        entries.push(entry);
+                    }
                 }
+
+                entries.sort_by(|a, b| match (a.directory, b.directory) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => match sort {
+                        SizeAsc => a.size.cmp(&b.size),
+                        SizeDesc => b.size.cmp(&a.size),
+                        PhysicalSizeAsc => a.size_physical.cmp(&b.size_physical),
+                        PhysicalSizeDesc => b.size_physical.cmp(&a.size_physical),
+                        ModifiedAsc => a.modified.cmp(&b.modified),
+                        ModifiedDesc => b.modified.cmp(&a.modified),
+                        CreatedAsc => a.created.cmp(&b.created),
+                        CreatedDesc => b.created.cmp(&a.created),
+                        NameAsc | NameDesc => std::cmp::Ordering::Equal,
+                    },
+                });
+
+                if let Some(per_page) = per_page {
+                    let start = (page - 1) * per_page;
+                    entries = entries.into_iter().skip(start).take(per_page).collect();
+                }
+
+                Ok(DirectoryListing {
+                    total_entries,
+                    entries,
+                })
             }
-
-            Ok(DirectoryListing {
-                total_entries,
-                entries,
-            })
-        } else {
-            let total_entries = directory_entries.len() + other_entries.len();
-            let mut entries = Vec::new();
-
-            for entry in directory_entries.into_iter().chain(other_entries) {
-                let path = path.join(&entry);
-                let entry = match self.async_directory_entry(&path).await {
-                    Ok(entry) => entry,
-                    Err(_) => continue,
-                };
-                entries.push(entry);
-            }
-
-            entries.sort_by(|a, b| match (a.directory, b.directory) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => match sort {
-                    SizeAsc => a.size.cmp(&b.size),
-                    SizeDesc => b.size.cmp(&a.size),
-                    PhysicalSizeAsc => a.size_physical.cmp(&b.size_physical),
-                    PhysicalSizeDesc => b.size_physical.cmp(&a.size_physical),
-                    ModifiedAsc => a.modified.cmp(&b.modified),
-                    ModifiedDesc => b.modified.cmp(&a.modified),
-                    CreatedAsc => a.created.cmp(&b.created),
-                    CreatedDesc => b.created.cmp(&a.created),
-                    NameAsc | NameDesc => std::cmp::Ordering::Equal,
-                },
-            });
-
-            if let Some(per_page) = per_page {
-                let start = (page - 1) * per_page;
-                entries = entries.into_iter().skip(start).take(per_page).collect();
-            }
-
-            Ok(DirectoryListing {
-                total_entries,
-                entries,
-            })
-        }
+        })
+        .await?
     }
 
     async fn async_walk_dir<'a>(
@@ -301,7 +299,10 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         #[async_trait::async_trait]
         impl DirectoryWalk for IgnoreAsyncWalkDir {
             async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
-                self.inner.next_entry().await
+                self.inner
+                    .next_entry()
+                    .await
+                    .map(|res| res.map_err(|err| err.into()))
             }
         }
 
@@ -336,7 +337,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
 
                 let (file_type, path) = match entry {
                     Ok((file_type, path)) => (file_type, path),
-                    Err(err) => return Some(Err(err)),
+                    Err(err) => return Some(Err(err.into())),
                 };
 
                 let reader: AsyncReadableFileStream = if file_type.is_file() {
@@ -403,7 +404,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         path: &(dyn AsRef<Path> + Send + Sync),
         archive_format: StreamableArchiveFormat,
         compression_level: CompressionLevel,
-        bytes_archived: Option<Arc<AtomicU64>>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
     ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
         let names = self.inner.async_read_dir_all(path).await?;
@@ -435,7 +436,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                             writer,
                             &path,
                             names,
-                            bytes_archived,
+                            progress,
                             is_ignored,
                             crate::server::filesystem::archive::create::CreateZipOptions {
                                 compression_level,
@@ -460,7 +461,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                             writer,
                             &path,
                             names,
-                            bytes_archived,
+                            progress,
                             is_ignored,
                             crate::server::filesystem::archive::create::CreateTarOptions {
                                 compression_type: archive_format.compression_format(),
@@ -487,7 +488,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                             writer,
                             &path,
                             names,
-                            bytes_archived,
+                            progress,
                             is_ignored,
                             crate::server::filesystem::archive::create::CreateItafOptions {
                                 compression_type: archive_format.compression_format(),
@@ -523,7 +524,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
     }
 
     async fn close(&self) -> Result<(), anyhow::Error> {
-        self.inner.close().await;
+        self.inner.close();
         Ok(())
     }
 }
@@ -534,7 +535,13 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         self.check_writable()?;
         let path = self.check_ignored(FileType::Dir, path.as_ref())?;
 
-        self.inner.create_dir_all(path)
+        if self.is_primary_server_fs {
+            self.server.filesystem.create_chowned_dir_all(&path)?;
+        } else {
+            self.inner.create_dir_all(&path)?;
+        }
+
+        Ok(())
     }
     async fn async_create_dir_all(
         &self,
@@ -543,14 +550,25 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         self.check_writable()?;
         let path = self.check_ignored(FileType::Dir, path.as_ref())?;
 
-        self.inner.async_create_dir_all(path).await
+        if self.is_primary_server_fs {
+            self.server
+                .filesystem
+                .async_create_chowned_dir_all(&path)
+                .await?;
+        } else {
+            self.inner.async_create_dir_all(&path).await?;
+        }
+
+        Ok(())
     }
 
     fn remove_dir_all(&self, path: &(dyn AsRef<Path> + Send + Sync)) -> Result<(), anyhow::Error> {
         self.check_writable()?;
         let path = self.check_ignored(FileType::Dir, path.as_ref())?;
 
-        self.inner.remove_dir_all(path)
+        self.inner.remove_dir_all(path)?;
+
+        Ok(())
     }
     async fn async_remove_dir_all(
         &self,
@@ -559,14 +577,18 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         self.check_writable()?;
         let path = self.check_ignored(FileType::Dir, path.as_ref())?;
 
-        self.inner.async_remove_dir_all(path).await
+        self.inner.async_remove_dir_all(path).await?;
+
+        Ok(())
     }
 
     fn remove_file(&self, path: &(dyn AsRef<Path> + Send + Sync)) -> Result<(), anyhow::Error> {
         self.check_writable()?;
         let path = self.check_ignored(FileType::File, path.as_ref())?;
 
-        self.inner.remove_file(path)
+        self.inner.remove_file(path)?;
+
+        Ok(())
     }
     async fn async_remove_file(
         &self,
@@ -575,7 +597,9 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         self.check_writable()?;
         let path = self.check_ignored(FileType::File, path.as_ref())?;
 
-        self.inner.async_remove_file(path).await
+        self.inner.async_remove_file(path).await?;
+
+        Ok(())
     }
 
     fn create_symlink(
@@ -587,7 +611,12 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         let original = self.check_ignored(FileType::File, original.as_ref())?;
         let link = self.check_ignored(FileType::Symlink, link.as_ref())?;
 
-        self.inner.symlink(original, link)
+        self.inner.symlink(original, &link)?;
+        if self.is_primary_server_fs {
+            self.server.filesystem.chown_path(&link)?;
+        }
+
+        Ok(())
     }
     async fn async_create_symlink(
         &self,
@@ -598,7 +627,12 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         let original = self.check_ignored(FileType::File, original.as_ref())?;
         let link = self.check_ignored(FileType::Symlink, link.as_ref())?;
 
-        self.inner.async_symlink(original, link).await
+        self.inner.async_symlink(original, &link).await?;
+        if self.is_primary_server_fs {
+            self.server.filesystem.async_chown_path(&link).await?;
+        }
+
+        Ok(())
     }
 
     fn create_seekable_file(
@@ -609,14 +643,14 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         let path = self.check_ignored(FileType::File, path.as_ref())?;
 
         if self.is_primary_server_fs {
-            let writer = crate::server::filesystem::writer::FileSystemWriter::new(
+            let file = crate::server::filesystem::file::ServerFile::new(
                 self.server.clone(),
                 &path,
                 None,
                 None,
             )?;
 
-            Ok(Box::new(writer))
+            Ok(Box::new(file))
         } else {
             let file = self.inner.create(path)?;
 
@@ -631,7 +665,7 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         let path = self.check_ignored(FileType::File, path.as_ref())?;
 
         if self.is_primary_server_fs {
-            let writer = crate::server::filesystem::writer::AsyncFileSystemWriter::new(
+            let file = crate::server::filesystem::file::AsyncServerFile::new(
                 self.server.clone(),
                 &path,
                 None,
@@ -639,7 +673,7 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
             )
             .await?;
 
-            Ok(Box::new(writer))
+            Ok(Box::new(file))
         } else {
             let file = self.inner.async_create(path).await?;
 
@@ -656,7 +690,17 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
 
         let file = self.inner.open_with(&path, options)?;
 
-        Ok(Box::new(file))
+        if self.is_primary_server_fs {
+            let file = crate::server::filesystem::file::ServerFile::new_file(
+                self.server.clone(),
+                &path,
+                file,
+            )?;
+
+            Ok(Box::new(file))
+        } else {
+            Ok(Box::new(file))
+        }
     }
     async fn async_open_file_with_options(
         &self,
@@ -668,7 +712,17 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
 
         let file = self.inner.async_open_with(&path, options).await?;
 
-        Ok(Box::new(file))
+        if self.is_primary_server_fs {
+            let file = crate::server::filesystem::file::AsyncServerFile::new_file(
+                self.server.clone(),
+                &path,
+                file,
+            )?;
+
+            Ok(Box::new(file))
+        } else {
+            Ok(Box::new(file))
+        }
     }
 
     fn set_permissions(
@@ -679,7 +733,9 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         self.check_writable()?;
         let path = self.check_ignored(FileType::File, path.as_ref())?;
 
-        self.inner.set_permissions(path, permissions)
+        self.inner.set_permissions(path, permissions)?;
+
+        Ok(())
     }
     async fn async_set_permissions(
         &self,
@@ -689,7 +745,9 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         self.check_writable()?;
         let path = self.check_ignored(FileType::File, path.as_ref())?;
 
-        self.inner.async_set_permissions(path, permissions).await
+        self.inner.async_set_permissions(path, permissions).await?;
+
+        Ok(())
     }
 
     fn rename(
@@ -701,7 +759,9 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         let from = self.check_ignored(FileType::File, from.as_ref())?;
         let to = self.check_ignored(FileType::File, to.as_ref())?;
 
-        self.inner.rename(from, &self.inner, to)
+        self.inner.rename(from, &self.inner, to)?;
+
+        Ok(())
     }
     async fn async_rename(
         &self,
@@ -712,49 +772,7 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         let from = self.check_ignored(FileType::File, from.as_ref())?;
         let to = self.check_ignored(FileType::File, to.as_ref())?;
 
-        self.inner.async_rename(from, &self.inner, to).await
-    }
-
-    fn chown(&self, path: &(dyn AsRef<Path> + Send + Sync)) -> Result<(), anyhow::Error> {
-        if self
-            .server
-            .app_state
-            .config
-            .load()
-            .system
-            .user
-            .rootless
-            .enabled
-        {
-            return Ok(());
-        }
-
-        if self.is_primary_server_fs {
-            tokio::runtime::Handle::current().block_on(self.server.filesystem.chown_path(path))?;
-        }
-
-        Ok(())
-    }
-    async fn async_chown(
-        &self,
-        path: &(dyn AsRef<Path> + Send + Sync),
-    ) -> Result<(), anyhow::Error> {
-        if self
-            .server
-            .app_state
-            .config
-            .load()
-            .system
-            .user
-            .rootless
-            .enabled
-        {
-            return Ok(());
-        }
-
-        if self.is_primary_server_fs {
-            self.server.filesystem.chown_path(path).await?;
-        }
+        self.inner.async_rename(from, &self.inner, to).await?;
 
         Ok(())
     }

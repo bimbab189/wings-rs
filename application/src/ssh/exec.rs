@@ -21,11 +21,10 @@ pub struct ExecSession {
 
 impl ExecSession {
     #[inline]
-    async fn has_permission(&self, permission: Permission) -> bool {
+    fn has_permission(&self, permission: Permission) -> bool {
         self.server
             .user_permissions
             .has_permission(self.user_uuid, permission)
-            .await
     }
 
     pub fn run(self, command: String, channel: Channel<Msg>) {
@@ -37,7 +36,7 @@ impl ExecSession {
                 match segments.next() {
                     Some("tar") => {
                         if let Some("-xzpPf") = segments.next() {
-                            if !self.has_permission(Permission::FileCreate).await {
+                            if !self.has_permission(Permission::FileCreate) {
                                 channel
                                     .make_writer()
                                     .write_all(b"Permission denied.\r\n")
@@ -73,20 +72,17 @@ impl ExecSession {
                             )
                             .await?;
 
-                            self.server
-                                .activity
-                                .log_activity(Activity {
-                                    event: ActivityEvent::FileDecompress,
-                                    user: Some(self.user_uuid),
-                                    ip: Some(self.user_ip),
-                                    metadata: Some(json!({
-                                        "directory": destination.trim(),
-                                        "file": path.trim(),
-                                    })),
-                                    schedule: None,
-                                    timestamp: chrono::Utc::now(),
-                                })
-                                .await;
+                            self.server.activity.log_activity(Activity {
+                                event: ActivityEvent::FileDecompress,
+                                user: Some(self.user_uuid),
+                                ip: Some(self.user_ip),
+                                metadata: Some(json!({
+                                    "directory": destination.trim(),
+                                    "file": path.trim(),
+                                })),
+                                schedule: None,
+                                timestamp: chrono::Utc::now(),
+                            });
 
                             archive
                                 .extract(PathBuf::from(destination.trim()), None, None)
@@ -103,7 +99,7 @@ impl ExecSession {
                             && segments.next() == Some("tar")
                             && segments.next().is_some()
                         {
-                            if !self.has_permission(Permission::FileArchive).await {
+                            if !self.has_permission(Permission::FileArchive) {
                                 channel
                                     .make_writer()
                                     .write_all(b"Permission denied.\r\n")
@@ -153,15 +149,14 @@ impl ExecSession {
                                     })),
                                     schedule: None,
                                     timestamp: chrono::Utc::now(),
-                                })
-                                .await;
+                                });
 
                             let writer = tokio::task::spawn_blocking({
                                 let server = self.server.clone();
                                 let destination = destination.clone();
 
                                 move || {
-                                    crate::server::filesystem::writer::FileSystemWriter::new(
+                                    crate::server::filesystem::file::ServerFile::new(
                                         server,
                                         &destination,
                                         None,
@@ -175,8 +170,8 @@ impl ExecSession {
                                 writer,
                                 base,
                                 paths,
-                                None,
-                                self.server.filesystem.get_ignored().await.into(),
+                                crate::server::filesystem::archive::create::ArchiveProgress::default(),
+                                self.server.filesystem.get_ignored().into(),
                                 crate::server::filesystem::archive::create::CreateTarOptions {
                                     compression_type: match destination
                                         .extension()
@@ -219,7 +214,7 @@ impl ExecSession {
                     _ => {}
                 }
 
-                if self.has_permission(Permission::ControlConsole).await {
+                if self.has_permission(Permission::ControlConsole) {
                     if self.server.state.get_state() != crate::server::state::ServerState::Offline {
                         if let Err(err) =
                             self.server.send_stdin(format!("{command}\n").into()).await
@@ -230,20 +225,17 @@ impl ExecSession {
                                 err
                             );
                         } else {
-                            self.server
-                                .activity
-                                .log_activity(Activity {
-                                    event: ActivityEvent::SshCommand,
-                                    user: Some(self.user_uuid),
-                                    ip: Some(self.user_ip),
-                                    metadata: Some(json!({
-                                        "command": command,
-                                        "source": "ssh",
-                                    })),
-                                    schedule: None,
-                                    timestamp: chrono::Utc::now(),
-                                })
-                                .await;
+                            self.server.activity.log_activity(Activity {
+                                event: ActivityEvent::SshCommand,
+                                user: Some(self.user_uuid),
+                                ip: Some(self.user_ip),
+                                metadata: Some(json!({
+                                    "command_length": command.len(),
+                                    "source": "ssh",
+                                })),
+                                schedule: None,
+                                timestamp: chrono::Utc::now(),
+                            });
                         }
                     } else {
                         channel

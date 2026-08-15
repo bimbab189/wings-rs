@@ -1,6 +1,6 @@
 use super::ServerHandle;
 use crate::{
-    io::{SafeDigest, SafeSlice, SafeWrite},
+    io::{SafeDigestExt, SafeSliceExt, SafeWriteExt},
     server::{
         activity::{Activity, ActivityEvent},
         permissions::Permission,
@@ -31,7 +31,7 @@ pub async fn handle_extended(
     command: String,
     data: Vec<u8>,
 ) -> Result<russh_sftp::protocol::Packet, StatusCode> {
-    if !sftp_session.allow_action().await {
+    if !sftp_session.allow_action() {
         return Err(StatusCode::PermissionDenied);
     }
 
@@ -39,7 +39,7 @@ pub async fn handle_extended(
 
     match command.as_str() {
         "check-file" | "check-file-name" => {
-            if !sftp_session.has_permission(Permission::FileRead).await {
+            if !sftp_session.has_permission(Permission::FileRead) {
                 return Err(StatusCode::PermissionDenied);
             }
 
@@ -86,7 +86,7 @@ pub async fn handle_extended(
                     return Err(StatusCode::NoSuchFile);
                 }
 
-                if sftp_session.is_ignored(&path, metadata.is_dir()).await {
+                if sftp_session.is_ignored(&path, metadata.is_dir()) {
                     return Err(StatusCode::NoSuchFile);
                 }
 
@@ -107,7 +107,9 @@ pub async fn handle_extended(
                 fn bytes(length: u64, bytes_read: usize, total_bytes_read: u64) -> usize {
                     if length > 0 {
                         if total_bytes_read > length {
-                            (length - (total_bytes_read - bytes_read as u64)) as usize
+                            (length
+                                .saturating_sub(total_bytes_read.saturating_sub(bytes_read as u64)))
+                                as usize
                         } else {
                             bytes_read
                         }
@@ -127,13 +129,18 @@ pub async fn handle_extended(
                                 let bytes_read = file.read(&mut buffer).await?;
                                 total_bytes_read += bytes_read as u64;
 
-                                if bytes_read == 0 {
+                                if crate::unlikely(bytes_read == 0) {
                                     break;
                                 }
 
-                                let bytes_read =
-                                    bytes(request.length, bytes_read, total_bytes_read);
-                                hasher.safe_write_all(&buffer, bytes_read)?;
+                                let take = bytes(request.length, bytes_read, total_bytes_read);
+                                hasher.safe_write_all(&buffer, take)?;
+
+                                if crate::unlikely(
+                                    request.length != 0 && total_bytes_read >= request.length,
+                                ) {
+                                    break;
+                                }
                             }
 
                             (*hasher.finalize()).into()
@@ -145,13 +152,18 @@ pub async fn handle_extended(
                                 let bytes_read = file.read(&mut buffer).await?;
                                 total_bytes_read += bytes_read as u64;
 
-                                if bytes_read == 0 {
+                                if crate::unlikely(bytes_read == 0) {
                                     break;
                                 }
 
-                                let bytes_read =
-                                    bytes(request.length, bytes_read, total_bytes_read);
-                                hasher.update(buffer.get_slice(..bytes_read)?);
+                                let take = bytes(request.length, bytes_read, total_bytes_read);
+                                hasher.update(buffer.get_slice(..take)?);
+
+                                if crate::unlikely(
+                                    request.length != 0 && total_bytes_read >= request.length,
+                                ) {
+                                    break;
+                                }
                             }
 
                             hasher.finalize().to_be_bytes().to_vec()
@@ -163,13 +175,18 @@ pub async fn handle_extended(
                                 let bytes_read = file.read(&mut buffer).await?;
                                 total_bytes_read += bytes_read as u64;
 
-                                if bytes_read == 0 {
+                                if crate::unlikely(bytes_read == 0) {
                                     break;
                                 }
 
-                                let bytes_read =
-                                    bytes(request.length, bytes_read, total_bytes_read);
-                                hasher.safe_update(&buffer, bytes_read)?;
+                                let take = bytes(request.length, bytes_read, total_bytes_read);
+                                hasher.safe_update(&buffer, take)?;
+
+                                if crate::unlikely(
+                                    request.length != 0 && total_bytes_read >= request.length,
+                                ) {
+                                    break;
+                                }
                             }
 
                             (*hasher.finalize()).into()
@@ -181,13 +198,18 @@ pub async fn handle_extended(
                                 let bytes_read = file.read(&mut buffer).await?;
                                 total_bytes_read += bytes_read as u64;
 
-                                if bytes_read == 0 {
+                                if crate::unlikely(bytes_read == 0) {
                                     break;
                                 }
 
-                                let bytes_read =
-                                    bytes(request.length, bytes_read, total_bytes_read);
-                                hasher.safe_update(&buffer, bytes_read)?;
+                                let take = bytes(request.length, bytes_read, total_bytes_read);
+                                hasher.safe_update(&buffer, take)?;
+
+                                if crate::unlikely(
+                                    request.length != 0 && total_bytes_read >= request.length,
+                                ) {
+                                    break;
+                                }
                             }
 
                             (*hasher.finalize()).into()
@@ -199,13 +221,18 @@ pub async fn handle_extended(
                                 let bytes_read = file.read(&mut buffer).await?;
                                 total_bytes_read += bytes_read as u64;
 
-                                if bytes_read == 0 {
+                                if crate::unlikely(bytes_read == 0) {
                                     break;
                                 }
 
-                                let bytes_read =
-                                    bytes(request.length, bytes_read, total_bytes_read);
-                                hasher.safe_update(&buffer, bytes_read)?;
+                                let take = bytes(request.length, bytes_read, total_bytes_read);
+                                hasher.safe_update(&buffer, take)?;
+
+                                if crate::unlikely(
+                                    request.length != 0 && total_bytes_read >= request.length,
+                                ) {
+                                    break;
+                                }
                             }
 
                             (*hasher.finalize()).into()
@@ -217,13 +244,18 @@ pub async fn handle_extended(
                                 let bytes_read = file.read(&mut buffer).await?;
                                 total_bytes_read += bytes_read as u64;
 
-                                if bytes_read == 0 {
+                                if crate::unlikely(bytes_read == 0) {
                                     break;
                                 }
 
-                                let bytes_read =
-                                    bytes(request.length, bytes_read, total_bytes_read);
-                                hasher.safe_update(&buffer, bytes_read)?;
+                                let take = bytes(request.length, bytes_read, total_bytes_read);
+                                hasher.safe_update(&buffer, take)?;
+
+                                if crate::unlikely(
+                                    request.length != 0 && total_bytes_read >= request.length,
+                                ) {
+                                    break;
+                                }
                             }
 
                             (*hasher.finalize()).into()
@@ -235,13 +267,18 @@ pub async fn handle_extended(
                                 let bytes_read = file.read(&mut buffer).await?;
                                 total_bytes_read += bytes_read as u64;
 
-                                if bytes_read == 0 {
+                                if crate::unlikely(bytes_read == 0) {
                                     break;
                                 }
 
-                                let bytes_read =
-                                    bytes(request.length, bytes_read, total_bytes_read);
-                                hasher.safe_update(&buffer, bytes_read)?;
+                                let take = bytes(request.length, bytes_read, total_bytes_read);
+                                hasher.safe_update(&buffer, take)?;
+
+                                if crate::unlikely(
+                                    request.length != 0 && total_bytes_read >= request.length,
+                                ) {
+                                    break;
+                                }
                             }
 
                             (*hasher.finalize()).into()
@@ -294,10 +331,8 @@ pub async fn handle_extended(
             }
         }
         "copy-file" => {
-            if !sftp_session
-                .has_permission(Permission::FileReadContent)
-                .await
-                || !sftp_session.has_permission(Permission::FileCreate).await
+            if !sftp_session.has_permission(Permission::FileReadContent)
+                || !sftp_session.has_permission(Permission::FileCreate)
             {
                 return Err(StatusCode::PermissionDenied);
             }
@@ -338,7 +373,7 @@ pub async fn handle_extended(
                 return Err(StatusCode::NoSuchFile);
             }
 
-            if sftp_session.is_ignored(&source_path, false).await {
+            if sftp_session.is_ignored(&source_path, false) {
                 return Err(StatusCode::NoSuchFile);
             }
 
@@ -347,52 +382,34 @@ pub async fn handle_extended(
             if let Ok(metadata) = sftp_session
                 .server
                 .filesystem
-                .async_metadata(destination_path)
-                .await
-                && !metadata.is_file()
-                && request.overwrite == 0
-            {
-                return Err(StatusCode::NoSuchFile);
-            }
-
-            if !sftp_session
-                .server
-                .filesystem
-                .async_allocate_in_path(
-                    destination_path.parent().ok_or(StatusCode::NoSuchFile)?,
-                    metadata.len() as i64,
-                    false,
-                )
+                .async_symlink_metadata(destination_path)
                 .await
             {
-                return Err(StatusCode::Failure);
+                if metadata.is_dir() {
+                    return Err(StatusCode::NoSuchFile);
+                }
+                if request.overwrite == 0 {
+                    return Err(StatusCode::Failure);
+                }
             }
 
             sftp_session
                 .server
                 .filesystem
-                .async_copy(
-                    &source_path,
-                    &sftp_session.server.filesystem,
-                    &destination_path,
-                )
+                .async_quota_copy(&source_path, &destination_path, &sftp_session.server, None)
                 .await
                 .map_err(|_| StatusCode::NoSuchFile)?;
 
-            sftp_session
-                .server
-                .activity
-                .log_activity(Activity {
-                    event: ActivityEvent::SftpCreate,
-                    user: Some(sftp_session.user_uuid),
-                    ip: Some(sftp_session.user_ip),
-                    metadata: Some(serde_json::json!({
-                        "files": [sftp_session.server.filesystem.relative_path(destination_path)],
-                    })),
-                    schedule: None,
-                    timestamp: chrono::Utc::now(),
-                })
-                .await;
+            sftp_session.server.activity.log_activity(Activity {
+                event: ActivityEvent::SftpCreate,
+                user: Some(sftp_session.user_uuid),
+                ip: Some(sftp_session.user_ip),
+                metadata: Some(serde_json::json!({
+                    "files": [sftp_session.server.filesystem.relative_path(destination_path)],
+                })),
+                schedule: None,
+                timestamp: chrono::Utc::now(),
+            });
 
             Ok(russh_sftp::protocol::Packet::Status(Status {
                 id,
@@ -411,7 +428,7 @@ pub async fn handle_extended(
                 available_user_space: u64,
             }
 
-            let (total_space, free_space) = match sftp_session.server.filesystem.disk_limit() {
+            let (total_space, available_space) = match sftp_session.server.filesystem.disk_limit() {
                 0 => {
                     let disks = sysinfo::Disks::new();
 
@@ -439,7 +456,8 @@ pub async fn handle_extended(
                 }
                 total => (
                     total as u64,
-                    total as u64 - sftp_session.server.filesystem.limiter_usage().await,
+                    (total as u64)
+                        .saturating_sub(sftp_session.server.filesystem.limiter_usage().await),
                 ),
             };
 
@@ -448,10 +466,10 @@ pub async fn handle_extended(
                     id,
                     data: russh_sftp::ser::to_bytes(&SpaceAvailableReply {
                         total_space,
-                        available_space: free_space,
+                        available_space,
 
                         total_user_space: total_space,
-                        available_user_space: free_space,
+                        available_user_space: available_space,
                     })
                     .map_err(map_ser_err)?
                     .into(),
@@ -474,7 +492,15 @@ pub async fn handle_extended(
                         max_packet_length: 32 * 1024,
                         max_read_length: 128 * 1024,
                         max_write_length: 128 * 1024,
-                        max_handle_count: super::HANDLE_LIMIT as u64,
+                        max_handle_count: sftp_session
+                            .state
+                            .config
+                            .load()
+                            .system
+                            .sftp
+                            .limits
+                            .max_handles_per_channel
+                            as u64,
                     })
                     .map_err(map_ser_err)?
                     .into(),
@@ -525,7 +551,8 @@ pub async fn handle_extended(
                 }
                 total => (
                     total as u64,
-                    total as u64 - sftp_session.server.filesystem.limiter_usage().await,
+                    (total as u64)
+                        .saturating_sub(sftp_session.server.filesystem.limiter_usage().await),
                 ),
             };
 
@@ -566,7 +593,7 @@ pub async fn handle_extended(
                 return Err(StatusCode::PermissionDenied);
             }
 
-            if !sftp_session.has_permission(Permission::FileCreate).await {
+            if !sftp_session.has_permission(Permission::FileCreate) {
                 return Err(StatusCode::PermissionDenied);
             }
 
@@ -598,10 +625,8 @@ pub async fn handle_extended(
             };
 
             if !metadata.is_file()
-                || sftp_session
-                    .is_ignored(&targetpath, metadata.is_dir())
-                    .await
-                || sftp_session.is_ignored(&linkpath, false).await
+                || sftp_session.is_ignored(&targetpath, metadata.is_dir())
+                || sftp_session.is_ignored(&linkpath, false)
             {
                 return Err(StatusCode::NoSuchFile);
             }
@@ -616,20 +641,16 @@ pub async fn handle_extended(
                 return Err(StatusCode::Failure);
             }
 
-            sftp_session
-                .server
-                .activity
-                .log_activity(Activity {
-                    event: ActivityEvent::SftpCreate,
-                    user: Some(sftp_session.user_uuid),
-                    ip: Some(sftp_session.user_ip),
-                    metadata: Some(serde_json::json!({
-                        "files": [sftp_session.server.filesystem.relative_path(&linkpath)],
-                    })),
-                    schedule: None,
-                    timestamp: chrono::Utc::now(),
-                })
-                .await;
+            sftp_session.server.activity.log_activity(Activity {
+                event: ActivityEvent::SftpCreate,
+                user: Some(sftp_session.user_uuid),
+                ip: Some(sftp_session.user_ip),
+                metadata: Some(serde_json::json!({
+                    "files": [sftp_session.server.filesystem.relative_path(&linkpath)],
+                })),
+                schedule: None,
+                timestamp: chrono::Utc::now(),
+            });
 
             Ok(russh_sftp::protocol::Packet::Status(Status {
                 id,
@@ -653,7 +674,7 @@ pub async fn handle_extended(
                 return Err(StatusCode::PermissionDenied);
             }
 
-            if !sftp_session.has_permission(Permission::FileUpdate).await {
+            if !sftp_session.has_permission(Permission::FileUpdate) {
                 return Err(StatusCode::PermissionDenied);
             }
 
@@ -694,7 +715,7 @@ pub async fn handle_extended(
                 return Err(StatusCode::PermissionDenied);
             }
 
-            if !sftp_session.has_permission(Permission::FileUpdate).await {
+            if !sftp_session.has_permission(Permission::FileUpdate) {
                 return Err(StatusCode::PermissionDenied);
             }
 
@@ -741,7 +762,7 @@ pub async fn handle_extended(
                 Err(_) => return Err(StatusCode::BadMessage),
             };
 
-            if !sftp_session.has_permission(Permission::FileRead).await {
+            if !sftp_session.has_permission(Permission::FileRead) {
                 return Err(StatusCode::PermissionDenied);
             }
 
@@ -792,6 +813,149 @@ pub async fn handle_extended(
                     .into(),
                 },
             ))
+        }
+        "posix-rename@openssh.com" => {
+            #[derive(Deserialize)]
+            struct PosixRenameRequest {
+                oldpath: String,
+                newpath: String,
+            }
+
+            let request: PosixRenameRequest = match russh_sftp::de::from_bytes(&mut data.into()) {
+                Ok(request) => request,
+                Err(_) => return Err(StatusCode::BadMessage),
+            };
+
+            if sftp_session.state.config.load().system.sftp.read_only {
+                return Err(StatusCode::PermissionDenied);
+            }
+
+            if !sftp_session.has_permission(Permission::FileUpdate) {
+                return Err(StatusCode::PermissionDenied);
+            }
+
+            let old_path = match sftp_session
+                .server
+                .filesystem
+                .async_canonicalize(&request.oldpath)
+                .await
+            {
+                Ok(path) => path,
+                Err(_) => return Err(StatusCode::NoSuchFile),
+            };
+            let new_path = PathBuf::from(request.newpath);
+
+            let old_metadata = match sftp_session
+                .server
+                .filesystem
+                .async_symlink_metadata(&old_path)
+                .await
+            {
+                Ok(metadata) => metadata,
+                Err(_) => return Err(StatusCode::NoSuchFile),
+            };
+
+            if sftp_session.is_ignored(&old_path, old_metadata.is_dir())
+                || sftp_session.is_ignored(&new_path, old_metadata.is_dir())
+            {
+                return Err(StatusCode::Failure);
+            }
+
+            let activity = Activity {
+                event: ActivityEvent::SftpRename,
+                user: Some(sftp_session.user_uuid),
+                ip: Some(sftp_session.user_ip),
+                metadata: Some(serde_json::json!({
+                    "files": [
+                        {
+                            "from": sftp_session.server.filesystem.relative_path(&old_path),
+                            "to": sftp_session.server.filesystem.relative_path(&new_path),
+                        }
+                    ],
+                })),
+                schedule: None,
+                timestamp: chrono::Utc::now(),
+            };
+
+            if sftp_session
+                .server
+                .filesystem
+                .rename_path(&old_path, &new_path)
+                .await
+                .is_err()
+            {
+                return Err(StatusCode::NoSuchFile);
+            }
+
+            let new_path = sftp_session.server.filesystem.relative_path(&new_path);
+            let new_key = new_path.to_string_lossy().to_string();
+            let replaced = match sftp_session
+                .server
+                .diff
+                .rename_file(&old_path.to_string_lossy(), &new_key)
+                .await
+            {
+                Ok(replaced) => replaced,
+                Err(err) => {
+                    tracing::error!("failed to rename file in diff storage: {:?}", err);
+                    None
+                }
+            };
+
+            if let Some(before) = replaced {
+                let file_size_cap = sftp_session
+                    .state
+                    .config
+                    .load()
+                    .system
+                    .file_history
+                    .file_size_cap;
+
+                match sftp_session
+                    .server
+                    .filesystem
+                    .async_read_to_vec(&new_path, file_size_cap.saturating_add(1) as usize)
+                    .await
+                {
+                    Ok(after) if after.len() as u64 <= file_size_cap => {
+                        if let Err(err) = sftp_session
+                            .server
+                            .diff
+                            .record_edit(&new_key, before, after, Some(sftp_session.user_uuid))
+                            .await
+                        {
+                            tracing::warn!(
+                                server = %sftp_session.server.uuid,
+                                path = %new_key,
+                                "diff: sftp record_edit on replace failed: {err:#}"
+                            );
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::debug!(
+                            server = %sftp_session.server.uuid,
+                            path = %new_key,
+                            "diff: sftp replace content exceeds file_size_cap; not recorded"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            server = %sftp_session.server.uuid,
+                            path = %new_key,
+                            "diff: sftp failed to read replaced content: {err}"
+                        );
+                    }
+                }
+            }
+
+            sftp_session.server.activity.log_activity(activity);
+
+            Ok(russh_sftp::protocol::Packet::Status(Status {
+                id,
+                status_code: StatusCode::Ok,
+                error_message: "Ok".to_string(),
+                language_tag: "en-US".to_string(),
+            }))
         }
         _ => Err(StatusCode::OpUnsupported),
     }

@@ -135,6 +135,22 @@ macro_rules! exit_error {
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response<Body> {
+    let details = if let Some(s) = err.downcast_ref::<String>() {
+        s.as_str()
+    } else if let Some(s) = err.downcast_ref::<&str>() {
+        s
+    } else {
+        "unknown panic"
+    };
+
+    tracing::error!("a panic occurred while handling a request: {}", details);
+
+    ApiResponse::error("internal server error")
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+        .into_response()
+}
+
 async fn handle_request(req: Request<Body>, next: Next) -> Result<Response<Body>, StatusCode> {
     tracing::info!(
         path = req.uri().path(),
@@ -386,6 +402,16 @@ async fn main_rt() {
         Err(err) => exit_error!("failed to reset remote state: {:?}", err),
     }
 
+    if config.load().system.disk_limiter_mode
+        == crate::server::filesystem::limiter::DiskLimiterMode::BtrfsSubvolume
+    {
+        tracing::info!("cleaning up stale btrfs send snapshots from previous runs");
+        crate::server::backup::adapters::btrfs::BtrfsBackup::cleanup_stale_btrfs_send_snapshots(
+            &config,
+        )
+        .await;
+    }
+
     tracing::info!("creating server manager");
     let servers = match config.client.servers().await {
         Ok(servers) => servers,
@@ -450,6 +476,9 @@ async fn main_rt() {
             handle_cors,
         ))
         .layer(axum::middleware::from_fn(handle_request))
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            handle_panic,
+        ))
         .with_state(state.clone());
 
     let (mut router, mut openapi) = app.split_for_parts();
@@ -536,14 +565,24 @@ async fn main_rt() {
                             "generating new sftp host key"
                         );
 
-                        let key = match russh::keys::PrivateKey::random(
-                            &mut rand::rngs::ThreadRng::default(),
-                            match state.config.load().system.sftp.key_algorithm.parse() {
-                                Ok(alg) => alg,
-                                Err(_) => exit_error!("invalid sftp host key algorithm configured"),
-                            },
-                        ) {
-                            Ok(key) => key,
+                        let algorithm = match state.config.load().system.sftp.key_algorithm.parse()
+                        {
+                            Ok(alg) => alg,
+                            Err(_) => exit_error!("invalid sftp host key algorithm configured"),
+                        };
+
+                        let key = match tokio::task::spawn_blocking(move || {
+                            russh::keys::PrivateKey::random(
+                                &mut rand::rngs::ThreadRng::default(),
+                                algorithm,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(Ok(key)) => key,
+                            Ok(Err(err)) => {
+                                exit_error!("failed to generate sftp host key: {:?}", err)
+                            }
                             Err(err) => exit_error!("failed to generate sftp host key: {:?}", err),
                         };
 

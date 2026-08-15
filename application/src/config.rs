@@ -14,6 +14,7 @@ use std::{
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
+    filter::Targets,
     fmt::writer::MakeWriterExt,
     layer::{Layered, SubscriberExt},
     util::SubscriberInitExt,
@@ -317,6 +318,18 @@ fn system_sftp_limits_authentication_pubkey_attempts() -> usize {
 fn system_sftp_limits_authentication_cooldown() -> u64 {
     60
 }
+fn system_sftp_limits_max_connections_per_user() -> usize {
+    10
+}
+fn system_sftp_limits_max_channels_per_connection() -> usize {
+    10
+}
+fn system_sftp_limits_max_handles_per_channel() -> usize {
+    32
+}
+fn system_sftp_limits_max_handles_total() -> usize {
+    1024
+}
 
 fn system_sftp_shell_enabled() -> bool {
     true
@@ -346,7 +359,7 @@ fn system_file_history_anchor_interval() -> u64 {
     4
 }
 fn system_file_history_keep_chains() -> u64 {
-    2
+    5
 }
 fn system_file_history_file_size_cap() -> u64 {
     1024 * 1024
@@ -485,6 +498,13 @@ fn docker_network_interfaces_v6_subnet() -> String {
 }
 fn docker_network_interfaces_v6_gateway() -> String {
     "fdba:17c8:6c94::1011".to_string()
+}
+
+fn docker_registry_image_fetch_cache_enabled() -> bool {
+    true
+}
+fn docker_registry_image_fetch_cache_duration() -> u64 {
+    5 * 60
 }
 
 fn docker_tmpfs_size() -> u64 {
@@ -858,6 +878,15 @@ nestify::nest! {
                     pub authentication_pubkey_attempts: usize,
                     #[serde(default = "system_sftp_limits_authentication_cooldown")]
                     pub authentication_cooldown: u64,
+
+                    #[serde(default = "system_sftp_limits_max_connections_per_user")]
+                    pub max_connections_per_user: usize,
+                    #[serde(default = "system_sftp_limits_max_channels_per_connection")]
+                    pub max_channels_per_connection: usize,
+                    #[serde(default = "system_sftp_limits_max_handles_per_channel")]
+                    pub max_handles_per_channel: usize,
+                    #[serde(default = "system_sftp_limits_max_handles_total")]
+                    pub max_handles_total: usize,
                 },
 
                 #[serde(default)]
@@ -1078,6 +1107,14 @@ nestify::nest! {
                 pub username: String,
                 pub password: String,
             }>,
+            #[serde(default)]
+            #[schema(inline)]
+            pub registry_image_fetch_cache: #[derive(Clone, Copy, ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerRegistryImageFetchCache {
+                #[serde(default = "docker_registry_image_fetch_cache_enabled")]
+                pub enabled: bool,
+                #[serde(default = "docker_registry_image_fetch_cache_duration")]
+                pub duration: u64,
+            },
 
             #[serde(default = "docker_tmpfs_size")]
             pub tmpfs_size: u64,
@@ -1237,10 +1274,21 @@ pub struct ConfigGuard(
 );
 
 pub type ConfigSnapshot = arc_swap::Guard<Arc<InnerConfig>>;
-type ReloadHandle = tracing_subscriber::reload::Handle<
-    LevelFilter,
-    Layered<LevelFilter, tracing_subscriber::Registry>,
->;
+type ReloadHandle =
+    tracing_subscriber::reload::Handle<Targets, Layered<LevelFilter, tracing_subscriber::Registry>>;
+
+fn log_filter(debug: bool) -> Targets {
+    let crate_level = if debug {
+        LevelFilter::DEBUG
+    } else {
+        LevelFilter::INFO
+    };
+
+    Targets::new()
+        .with_default(LevelFilter::INFO)
+        .with_target("wings_rs", crate_level)
+        .with_target("pbs_client", crate_level)
+}
 
 pub struct Config {
     inner: ArcSwap<InnerConfig>,
@@ -1301,13 +1349,9 @@ impl Config {
         Self::validate_inner(&inner)?;
         Self::save_to(path, &inner)?;
 
-        let initial_level = if inner.debug && !ignore_debug {
-            LevelFilter::DEBUG
-        } else {
-            LevelFilter::INFO
-        };
+        let initial_filter = log_filter(inner.debug && !ignore_debug);
         let (reload_layer, log_reload_handle) =
-            tracing_subscriber::reload::Layer::new(initial_level);
+            tracing_subscriber::reload::Layer::new(initial_filter);
 
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
@@ -1345,6 +1389,23 @@ impl Config {
         Ok((config, ConfigGuard(guard, stdout_guard)))
     }
 
+    #[cfg(test)]
+    pub fn mock() -> Self {
+        let inner = InnerConfig::default();
+        let client = crate::remote::client::Client::new(&inner, true);
+        let jwt = crate::remote::jwt::JwtClient::new(&inner);
+
+        Self {
+            inner: ArcSwap::new(Arc::new(inner)),
+            log_reload_handle: tracing_subscriber::reload::Layer::new(log_filter(false)).1,
+            path: String::new(),
+            ignore_certificate_errors: false,
+            disk_check_concurrency_semaphore: tokio::sync::Semaphore::new(1),
+            client,
+            jwt,
+        }
+    }
+
     #[inline]
     pub fn load(&self) -> ConfigSnapshot {
         self.inner.load()
@@ -1360,14 +1421,8 @@ impl Config {
         self.inner.store(Arc::new(new));
 
         if old_debug != new_debug {
-            let new_level = if new_debug {
-                LevelFilter::DEBUG
-            } else {
-                LevelFilter::INFO
-            };
-
             self.log_reload_handle
-                .modify(|filter| *filter = new_level)
+                .modify(|filter| *filter = log_filter(new_debug))
                 .context("failed to reload tracing level filter")?;
         }
 
@@ -1379,6 +1434,12 @@ impl Config {
         let arc = self.inner.load();
         let ptr = Arc::as_ptr(&arc) as *mut InnerConfig;
         unsafe { &mut *ptr }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    #[cfg(test)]
+    pub fn mutate_in_place_for_testing(&self) -> &mut InnerConfig {
+        unsafe { self.mutate_in_place() }
     }
 
     fn save_to(path: &str, inner: &InnerConfig) -> Result<(), anyhow::Error> {
@@ -1419,23 +1480,32 @@ impl Config {
         connect_info: ConnectInfo<std::net::SocketAddr>,
     ) -> std::net::IpAddr {
         let cfg = self.load();
-        for cidr in &cfg.api.trusted_proxies {
-            if cidr.contains(&connect_info.ip()) {
-                if let Some(forwarded) = headers.get("X-Forwarded-For")
-                    && let Ok(forwarded) = forwarded.to_str()
-                    && let Some(ip) = forwarded.split(',').next()
-                {
-                    return ip.trim().parse().unwrap_or_else(|_| connect_info.ip());
-                }
 
-                if let Some(forwarded) = headers.get("X-Real-IP")
-                    && let Ok(forwarded) = forwarded.to_str()
-                {
-                    return forwarded
-                        .trim()
-                        .parse()
-                        .unwrap_or_else(|_| connect_info.ip());
-                }
+        let trusted = headers
+            .get("X-Real-Ip-Token")
+            .and_then(|token| token.to_str().ok())
+            == Some(cfg.token.as_str())
+            || cfg
+                .api
+                .trusted_proxies
+                .iter()
+                .any(|cidr| cidr.contains(&connect_info.ip()));
+
+        if trusted {
+            if let Some(forwarded) = headers.get("X-Forwarded-For")
+                && let Ok(forwarded) = forwarded.to_str()
+                && let Some(ip) = forwarded.split(',').next()
+            {
+                return ip.trim().parse().unwrap_or_else(|_| connect_info.ip());
+            }
+
+            if let Some(forwarded) = headers.get("X-Real-IP")
+                && let Ok(forwarded) = forwarded.to_str()
+            {
+                return forwarded
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|_| connect_info.ip());
             }
         }
 
@@ -1987,9 +2057,7 @@ impl Config {
                     let mut attempts = 0;
                     loop {
                         fn increment_ip_or_cidr(ip: &str) -> String {
-                            let (ip, network_mask) = ip
-                                .split_once('/')
-                                .unwrap_or((ip, if ip.contains(':') { "128" } else { "32" }));
+                            let (ip, network_mask) = ip.split_once('/').unwrap_or((ip, ""));
 
                             if let Ok(ip) = ip.parse::<std::net::Ipv4Addr>() {
                                 let octets = ip.octets();
@@ -1999,7 +2067,11 @@ impl Config {
                                     octets[2],
                                     octets[3],
                                 );
-                                format!("{incremented}/{network_mask}")
+                                if network_mask.is_empty() {
+                                    incremented.to_string()
+                                } else {
+                                    format!("{incremented}/{network_mask}")
+                                }
                             } else if let Ok(ip) = ip.parse::<std::net::Ipv6Addr>() {
                                 let segments = ip.segments();
                                 let incremented = std::net::Ipv6Addr::new(
@@ -2012,7 +2084,11 @@ impl Config {
                                     segments[6],
                                     segments[7],
                                 );
-                                format!("{incremented}/{network_mask}")
+                                if network_mask.is_empty() {
+                                    incremented.to_string()
+                                } else {
+                                    format!("{incremented}/{network_mask}")
+                                }
                             } else {
                                 ip.into()
                             }

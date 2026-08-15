@@ -1,20 +1,16 @@
+use super::ArchiveProgress;
 use crate::{
     io::{
         abort::{AbortGuard, AbortWriter},
         compression::CompressionLevel,
-        counting_reader::CountingReader,
     },
     server::filesystem::virtualfs::IsIgnoredFn,
     utils::PortablePermissions,
 };
 use chrono::{Datelike, Timelike};
 use std::{
-    io::{Read, Seek, Write},
+    io::{Seek, Write},
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
 };
 
 pub struct CreateZipOptions {
@@ -26,7 +22,7 @@ pub async fn create_zip<W: Write + Seek + Send + 'static>(
     destination: W,
     base: &Path,
     sources: Vec<impl AsRef<Path> + Send + 'static>,
-    bytes_archived: Option<Arc<AtomicU64>>,
+    progress: ArchiveProgress,
     is_ignored: IsIgnoredFn,
     options: CreateZipOptions,
 ) -> Result<W, anyhow::Error> {
@@ -44,7 +40,10 @@ pub async fn create_zip<W: Write + Seek + Send + 'static>(
 
             let source_metadata = match filesystem.symlink_metadata(&source) {
                 Ok(metadata) => metadata,
-                Err(_) => continue,
+                Err(err) => {
+                    tracing::debug!(path = %source.display(), "skipping source while creating zip archive, failed to read metadata: {err:#}");
+                    continue;
+                }
             };
 
             let Some(source) = (is_ignored)(source_metadata.file_type().into(), source) else {
@@ -74,14 +73,20 @@ pub async fn create_zip<W: Write + Seek + Send + 'static>(
 
             if source_metadata.is_dir() {
                 archive.add_directory(relative.to_string_lossy(), zip_options)?;
-                if let Some(bytes_archived) = &bytes_archived {
-                    bytes_archived.fetch_add(source_metadata.len(), Ordering::SeqCst);
-                }
+                progress.increment_bytes(source_metadata.len());
 
                 let mut walker = filesystem
                     .walk_dir(source)?
                     .with_is_ignored(is_ignored.clone());
-                while let Some(Ok((_, path))) = walker.next_entry() {
+                while let Some(entry) = walker.next_entry() {
+                    let (_, path) = match entry {
+                        Ok(entry) => entry,
+                        Err(err) => {
+                            tracing::debug!("failed to read directory entry while creating zip archive: {err:#}");
+                            break;
+                        }
+                    };
+
                     let relative = match path.strip_prefix(&base) {
                         Ok(path) => path,
                         Err(_) => continue,
@@ -89,7 +94,10 @@ pub async fn create_zip<W: Write + Seek + Send + 'static>(
 
                     let metadata = match filesystem.symlink_metadata(&path) {
                         Ok(metadata) => metadata,
-                        Err(_) => continue,
+                        Err(err) => {
+                            tracing::debug!(path = %path.display(), "skipping entry while creating zip archive, failed to read metadata: {err:#}");
+                            continue;
+                        }
                     };
 
                     let mut zip_options: zip::write::FileOptions<'_, ()> =
@@ -120,53 +128,39 @@ pub async fn create_zip<W: Write + Seek + Send + 'static>(
 
                     if metadata.is_dir() {
                         archive.add_directory(relative.to_string_lossy(), zip_options)?;
-                        if let Some(bytes_archived) = &bytes_archived {
-                            bytes_archived.fetch_add(metadata.len(), Ordering::SeqCst);
-                        }
+                        progress.increment_bytes(metadata.len());
                     } else if metadata.is_file() {
                         let file = filesystem.open(&path)?;
-                        let mut reader: Box<dyn Read + Send> = match &bytes_archived {
-                            Some(bytes_archived) => Box::new(CountingReader::new_with_bytes_read(
-                                file,
-                                Arc::clone(bytes_archived),
-                            )),
-                            None => Box::new(file),
-                        };
+                        let mut reader = progress.counting_reader(file);
 
                         archive.start_file(relative.to_string_lossy(), zip_options)?;
                         crate::io::copy_shared(&mut read_buffer, &mut reader, &mut archive)?;
+                        progress.increment_files();
                     } else if let Ok(link_target) = filesystem.read_link_contents(&path) {
                         archive.add_symlink(
                             relative.to_string_lossy(),
                             link_target.to_string_lossy(),
                             zip_options,
                         )?;
-                        if let Some(bytes_archived) = &bytes_archived {
-                            bytes_archived.fetch_add(source_metadata.len(), Ordering::SeqCst);
-                        }
+                        progress.increment_bytes(source_metadata.len());
+                        progress.increment_files();
                     }
                 }
             } else if source_metadata.is_file() {
                 let file = filesystem.open(&source)?;
-                let mut reader: Box<dyn Read + Send> = match &bytes_archived {
-                    Some(bytes_archived) => Box::new(CountingReader::new_with_bytes_read(
-                        file,
-                        Arc::clone(bytes_archived),
-                    )),
-                    None => Box::new(file),
-                };
+                let mut reader = progress.counting_reader(file);
 
                 archive.start_file(relative.to_string_lossy(), zip_options)?;
                 crate::io::copy_shared(&mut read_buffer, &mut reader, &mut archive)?;
+                progress.increment_files();
             } else if let Ok(link_target) = filesystem.read_link_contents(&source) {
                 archive.add_symlink(
                     relative.to_string_lossy(),
                     link_target.to_string_lossy(),
                     zip_options,
                 )?;
-                if let Some(bytes_archived) = &bytes_archived {
-                    bytes_archived.fetch_add(source_metadata.len(), Ordering::SeqCst);
-                }
+                progress.increment_bytes(source_metadata.len());
+                progress.increment_files();
             }
         }
 
@@ -183,7 +177,7 @@ pub async fn create_zip_streaming<W: Write + Send + 'static>(
     destination: W,
     base: &Path,
     sources: Vec<impl AsRef<Path> + Send + 'static>,
-    bytes_archived: Option<Arc<AtomicU64>>,
+    progress: ArchiveProgress,
     is_ignored: IsIgnoredFn,
     options: CreateZipOptions,
 ) -> Result<W, anyhow::Error> {
@@ -201,7 +195,10 @@ pub async fn create_zip_streaming<W: Write + Send + 'static>(
 
             let source_metadata = match filesystem.symlink_metadata(&source) {
                 Ok(metadata) => metadata,
-                Err(_) => continue,
+                Err(err) => {
+                    tracing::debug!(path = %source.display(), "skipping source while creating zip archive, failed to read metadata: {err:#}");
+                    continue;
+                }
             };
 
             let Some(source) = (is_ignored)(source_metadata.file_type().into(), source) else {
@@ -231,14 +228,20 @@ pub async fn create_zip_streaming<W: Write + Send + 'static>(
 
             if source_metadata.is_dir() {
                 archive.add_directory(relative.to_string_lossy(), zip_options)?;
-                if let Some(bytes_archived) = &bytes_archived {
-                    bytes_archived.fetch_add(source_metadata.len(), Ordering::SeqCst);
-                }
+                progress.increment_bytes(source_metadata.len());
 
                 let mut walker = filesystem
                     .walk_dir(source)?
                     .with_is_ignored(is_ignored.clone());
-                while let Some(Ok((_, path))) = walker.next_entry() {
+                while let Some(entry) = walker.next_entry() {
+                    let (_, path) = match entry {
+                        Ok(entry) => entry,
+                        Err(err) => {
+                            tracing::debug!("failed to read directory entry while creating zip archive: {err:#}");
+                            break;
+                        }
+                    };
+
                     let relative = match path.strip_prefix(&base) {
                         Ok(path) => path,
                         Err(_) => continue,
@@ -246,7 +249,10 @@ pub async fn create_zip_streaming<W: Write + Send + 'static>(
 
                     let metadata = match filesystem.symlink_metadata(&path) {
                         Ok(metadata) => metadata,
-                        Err(_) => continue,
+                        Err(err) => {
+                            tracing::debug!(path = %path.display(), "skipping entry while creating zip archive, failed to read metadata: {err:#}");
+                            continue;
+                        }
                     };
 
                     let mut zip_options: zip::write::FileOptions<'_, ()> =
@@ -277,53 +283,39 @@ pub async fn create_zip_streaming<W: Write + Send + 'static>(
 
                     if metadata.is_dir() {
                         archive.add_directory(relative.to_string_lossy(), zip_options)?;
-                        if let Some(bytes_archived) = &bytes_archived {
-                            bytes_archived.fetch_add(metadata.len(), Ordering::SeqCst);
-                        }
+                        progress.increment_bytes(metadata.len());
                     } else if metadata.is_file() {
                         let file = filesystem.open(&path)?;
-                        let mut reader: Box<dyn Read + Send> = match &bytes_archived {
-                            Some(bytes_archived) => Box::new(CountingReader::new_with_bytes_read(
-                                file,
-                                Arc::clone(bytes_archived),
-                            )),
-                            None => Box::new(file),
-                        };
+                        let mut reader = progress.counting_reader(file);
 
                         archive.start_file(relative.to_string_lossy(), zip_options)?;
                         crate::io::copy_shared(&mut read_buffer, &mut reader, &mut archive)?;
+                        progress.increment_files();
                     } else if let Ok(link_target) = filesystem.read_link_contents(&path) {
                         archive.add_symlink(
                             relative.to_string_lossy(),
                             link_target.to_string_lossy(),
                             zip_options,
                         )?;
-                        if let Some(bytes_archived) = &bytes_archived {
-                            bytes_archived.fetch_add(source_metadata.len(), Ordering::SeqCst);
-                        }
+                        progress.increment_bytes(source_metadata.len());
+                        progress.increment_files();
                     }
                 }
             } else if source_metadata.is_file() {
                 let file = filesystem.open(&source)?;
-                let mut reader: Box<dyn Read + Send> = match &bytes_archived {
-                    Some(bytes_archived) => Box::new(CountingReader::new_with_bytes_read(
-                        file,
-                        Arc::clone(bytes_archived),
-                    )),
-                    None => Box::new(file),
-                };
+                let mut reader = progress.counting_reader(file);
 
                 archive.start_file(relative.to_string_lossy(), zip_options)?;
                 crate::io::copy_shared(&mut read_buffer, &mut reader, &mut archive)?;
+                progress.increment_files();
             } else if let Ok(link_target) = filesystem.read_link_contents(&source) {
                 archive.add_symlink(
                     relative.to_string_lossy(),
                     link_target.to_string_lossy(),
                     zip_options,
                 )?;
-                if let Some(bytes_archived) = &bytes_archived {
-                    bytes_archived.fetch_add(source_metadata.len(), Ordering::SeqCst);
-                }
+                progress.increment_bytes(source_metadata.len());
+                progress.increment_files();
             }
         }
 

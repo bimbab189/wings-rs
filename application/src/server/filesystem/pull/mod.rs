@@ -218,7 +218,7 @@ impl Download {
         }
 
         if filesystem.is_primary_server_fs()
-            && server.filesystem.is_ignored(&real_destination, false).await
+            && server.filesystem.is_ignored(&real_destination, false)
         {
             return Err(anyhow::anyhow!("file not found"));
         }
@@ -267,8 +267,8 @@ impl Download {
                 super::operations::FilesystemOperation::Pull {
                     destination_path: self.destination.clone(),
                     start_time: chrono::Utc::now(),
-                    progress: self.progress.clone(),
-                    total: Arc::new(AtomicU64::new(self.total)),
+                    bytes_processed: self.progress.clone(),
+                    bytes_total: Arc::new(AtomicU64::new(self.total)),
                 },
                 async move {
                     let mut run_inner = async || -> Result<(), anyhow::Error> {

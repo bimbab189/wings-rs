@@ -22,6 +22,12 @@ pub struct BtrfsBackup {
     uuid: uuid::Uuid,
 }
 
+pub struct BtrfsSendStream {
+    pub stdout: tokio::process::ChildStdout,
+    pub snapshot_path: PathBuf,
+    pub send_dir: PathBuf,
+}
+
 impl BtrfsBackup {
     #[inline]
     pub fn get_backup_path(config: &crate::config::Config, uuid: uuid::Uuid) -> PathBuf {
@@ -38,6 +44,241 @@ impl BtrfsBackup {
     #[inline]
     pub fn get_ignore_path(config: &crate::config::Config, uuid: uuid::Uuid) -> PathBuf {
         Self::get_backup_path(config, uuid).join("ignored")
+    }
+
+    pub async fn open_send_stream(
+        &self,
+        state: &crate::routes::State,
+        parent: Option<&Path>,
+    ) -> Result<BtrfsSendStream, anyhow::Error> {
+        let subvolume_path = Self::get_subvolume_path(&state.config, self.uuid);
+
+        if tokio::fs::metadata(&subvolume_path).await.is_err() {
+            return Err(anyhow::anyhow!(
+                "btrfs backup subvolume does not exist: {}",
+                subvolume_path.display()
+            ));
+        }
+
+        let send_dir = Self::get_backup_path(&state.config, self.uuid)
+            .join(format!(".send-{}", uuid::Uuid::new_v4()));
+        let send_path = send_dir.join("subvolume");
+
+        tokio::fs::create_dir_all(&send_dir).await?;
+
+        let output = Command::new("btrfs")
+            .args(["subvolume", "snapshot", "-r"])
+            .arg(&subvolume_path)
+            .arg(&send_path)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            tokio::fs::remove_dir_all(&send_dir).await.ok();
+
+            return Err(anyhow::anyhow!(
+                "failed to create read-only snapshot for btrfs send: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let mut command = Command::new("btrfs");
+        command.arg("send");
+        if let Some(parent) = parent {
+            command.arg("-p").arg(parent);
+        }
+
+        let mut child = command
+            .arg(&send_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture btrfs send stdout"))?;
+
+        tokio::spawn(async move {
+            match child.wait_with_output().await {
+                Ok(output) if !output.status.success() => {
+                    tracing::error!(
+                        "btrfs send failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Err(err) => tracing::error!("failed to wait for btrfs send: {err}"),
+                _ => {}
+            }
+        });
+
+        Ok(BtrfsSendStream {
+            stdout,
+            snapshot_path: send_path,
+            send_dir,
+        })
+    }
+
+    pub async fn cleanup_stale_btrfs_send_snapshots(config: &crate::config::Config) {
+        let btrfs_dir = Path::new(&config.load().system.backup_directory).join("btrfs");
+
+        let mut backups = match tokio::fs::read_dir(&btrfs_dir).await {
+            Ok(backups) => backups,
+            Err(_) => return,
+        };
+
+        while let Ok(Some(backup)) = backups.next_entry().await {
+            let mut entries = match tokio::fs::read_dir(backup.path()).await {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".send-"))
+                {
+                    tracing::warn!("removing stale btrfs send snapshot {}", path.display());
+                    Self::cleanup_send_dir(&path).await;
+                }
+            }
+        }
+    }
+
+    pub fn filesystem_mount_point(path: &Path) -> Option<PathBuf> {
+        let target = std::fs::canonicalize(path).ok()?;
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+
+        let mut best: Option<PathBuf> = None;
+        for line in mountinfo.lines() {
+            if let Some(mount_point) = line.split(' ').nth(4) {
+                let mount_point = PathBuf::from(mount_point);
+
+                if target.starts_with(&mount_point)
+                    && best
+                        .as_ref()
+                        .is_none_or(|best| mount_point.as_os_str().len() > best.as_os_str().len())
+                {
+                    best = Some(mount_point);
+                }
+            }
+        }
+
+        best
+    }
+
+    pub async fn cleanup_send_dir(send_dir: &Path) {
+        let send_path = send_dir.join("subvolume");
+
+        if tokio::fs::metadata(&send_path).await.is_ok() {
+            let output = Command::new("btrfs")
+                .args(["subvolume", "delete"])
+                .arg(&send_path)
+                .output()
+                .await;
+            if let Ok(output) = output
+                && !output.status.success()
+            {
+                tracing::warn!(
+                    "failed to delete temporary btrfs send snapshot {}: {}",
+                    send_path.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+
+        tokio::fs::remove_dir_all(send_dir).await.ok();
+    }
+
+    pub async fn open_archive_stream(
+        &self,
+        state: &crate::routes::State,
+        archive_format: StreamableArchiveFormat,
+        compression_level: crate::io::compression::CompressionLevel,
+    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+        let subvolume_path = Self::get_subvolume_path(&state.config, self.uuid);
+
+        if tokio::fs::metadata(&subvolume_path).await.is_err() {
+            return Err(anyhow::anyhow!(
+                "btrfs backup subvolume does not exist: {}",
+                subvolume_path.display()
+            ));
+        }
+
+        let filesystem =
+            crate::server::filesystem::cap::CapFilesystem::new(&subvolume_path).await?;
+        let names = filesystem.async_read_dir_all(Path::new("")).await?;
+        let ignore = Self::get_ignore(&state.config, self.uuid).await?;
+        let threads = state.config.load().api.file_compression_threads;
+
+        let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+
+        tokio::spawn(async move {
+            let writer = tokio_util::io::SyncIoBridge::new(writer);
+
+            let result = match archive_format {
+                StreamableArchiveFormat::Zip => {
+                    crate::server::filesystem::archive::create::create_zip_streaming(
+                        filesystem,
+                        writer,
+                        Path::new(""),
+                        names,
+                        crate::server::filesystem::archive::create::ArchiveProgress::default(),
+                        ignore.into(),
+                        crate::server::filesystem::archive::create::CreateZipOptions {
+                            compression_level,
+                        },
+                    )
+                    .await
+                    .map(|inner| inner.into_inner())
+                }
+                f if f.is_itaf() => crate::server::filesystem::archive::create::create_itaf(
+                    filesystem,
+                    writer,
+                    Path::new(""),
+                    names,
+                    crate::server::filesystem::archive::create::ArchiveProgress::default(),
+                    ignore.into(),
+                    crate::server::filesystem::archive::create::CreateItafOptions {
+                        compression_type: f.compression_format(),
+                        compression_level,
+                        threads,
+                        crc_enabled: true,
+                    },
+                )
+                .await
+                .map(|inner| inner.into_inner()),
+                f => crate::server::filesystem::archive::create::create_tar(
+                    filesystem,
+                    writer,
+                    Path::new(""),
+                    names,
+                    crate::server::filesystem::archive::create::ArchiveProgress::default(),
+                    ignore.into(),
+                    crate::server::filesystem::archive::create::CreateTarOptions {
+                        compression_type: f.compression_format(),
+                        compression_level,
+                        threads,
+                    },
+                )
+                .await
+                .map(|inner| inner.into_inner()),
+            };
+
+            match result {
+                Ok(mut inner) => {
+                    inner.shutdown().await.ok();
+                }
+                Err(err) => {
+                    tracing::error!("failed to create archive for btrfs backup: {err}");
+                }
+            }
+        });
+
+        Ok(reader)
     }
 
     pub async fn get_ignore(
@@ -81,7 +322,7 @@ impl BackupCreateExt for BtrfsBackup {
     async fn create(
         server: &crate::server::Server,
         uuid: uuid::Uuid,
-        _progress: Arc<AtomicU64>,
+        _progress: crate::server::filesystem::archive::create::ArchiveProgress,
         _total: Arc<AtomicU64>,
         ignore: ignore::gitignore::Gitignore,
         ignore_raw: compact_str::CompactString,
@@ -228,117 +469,13 @@ impl BackupExt for BtrfsBackup {
         archive_format: StreamableArchiveFormat,
         _range: Option<ByteRange>,
     ) -> Result<ApiResponse, anyhow::Error> {
-        let subvolume_path = Self::get_subvolume_path(&state.config, self.uuid);
-
-        if tokio::fs::metadata(&subvolume_path).await.is_err() {
-            return Err(anyhow::anyhow!(
-                "btrfs backup subvolume does not exist: {}",
-                subvolume_path.display()
-            ));
-        }
-
-        let filesystem = crate::server::filesystem::cap::CapFilesystem::new(subvolume_path).await?;
-        let names = filesystem.async_read_dir_all(Path::new("")).await?;
-        let ignore = Self::get_ignore(&state.config, self.uuid).await?;
-
-        let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
-
-        tokio::spawn({
-            let config = Arc::clone(&state.config);
-
-            async move {
-                let writer = tokio_util::io::SyncIoBridge::new(writer);
-
-                match archive_format {
-                    StreamableArchiveFormat::Zip => {
-                        match crate::server::filesystem::archive::create::create_zip_streaming(
-                            filesystem,
-                            writer,
-                            Path::new(""),
-                            names,
-                            None,
-                            ignore.into(),
-                            crate::server::filesystem::archive::create::CreateZipOptions {
-                                compression_level: config.load().system.backups.compression_level,
-                            },
-                        )
-                        .await
-                        {
-                            Ok(inner) => {
-                                inner.into_inner().shutdown().await.ok();
-                            }
-                            Err(err) => {
-                                tracing::error!(
-                                    "failed to create zip archive for btrfs backup: {}",
-                                    err
-                                );
-                            }
-                        }
-                    }
-                    f if f.is_tar() => {
-                        match crate::server::filesystem::archive::create::create_tar(
-                            filesystem,
-                            writer,
-                            Path::new(""),
-                            names,
-                            None,
-                            ignore.into(),
-                            crate::server::filesystem::archive::create::CreateTarOptions {
-                                compression_type: f.compression_format(),
-                                compression_level: config.load().system.backups.compression_level,
-                                threads: config.load().api.file_compression_threads,
-                            },
-                        )
-                        .await
-                        {
-                            Ok(inner) => {
-                                inner.into_inner().shutdown().await.ok();
-                            }
-                            Err(err) => {
-                                tracing::error!(
-                                    "failed to create tar archive for btrfs backup: {}",
-                                    err
-                                );
-                            }
-                        }
-                    }
-                    f if f.is_itaf() => {
-                        match crate::server::filesystem::archive::create::create_itaf(
-                            filesystem,
-                            writer,
-                            Path::new(""),
-                            names,
-                            None,
-                            ignore.into(),
-                            crate::server::filesystem::archive::create::CreateItafOptions {
-                                compression_type: f.compression_format(),
-                                compression_level: config.load().system.backups.compression_level,
-                                threads: config.load().api.file_compression_threads,
-                                crc_enabled: true,
-                            },
-                        )
-                        .await
-                        {
-                            Ok(inner) => {
-                                inner.into_inner().shutdown().await.ok();
-                            }
-                            Err(err) => {
-                                tracing::error!(
-                                    "failed to create itaf archive for btrfs backup: {}",
-                                    err
-                                );
-                            }
-                        }
-                    }
-                    _ => {
-                        tracing::error!(
-                            "unsupported archive format for btrfs backup: {}",
-                            archive_format.extension()
-                        );
-                    }
-                }
-            }
-        });
+        let reader = self
+            .open_archive_stream(
+                state,
+                archive_format,
+                state.config.load().system.backups.compression_level,
+            )
+            .await?;
 
         Ok(ApiResponse::new_stream(reader)
             .with_header(
@@ -355,7 +492,7 @@ impl BackupExt for BtrfsBackup {
     async fn restore(
         &self,
         server: &crate::server::Server,
-        progress: Arc<AtomicU64>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
         _download_url: Option<compact_str::CompactString>,
     ) -> Result<(), anyhow::Error> {
@@ -368,7 +505,8 @@ impl BackupExt for BtrfsBackup {
             ));
         }
 
-        let filesystem = crate::server::filesystem::cap::CapFilesystem::new(subvolume_path).await?;
+        let filesystem =
+            crate::server::filesystem::cap::CapFilesystem::new(&subvolume_path).await?;
         let ignore = Self::get_ignore(&server.app_state.config, self.uuid).await?;
 
         let total_task = {
@@ -404,12 +542,12 @@ impl BackupExt for BtrfsBackup {
                     Arc::new({
                         let server = server.clone();
                         let filesystem = filesystem.clone();
-                        let progress = Arc::clone(&progress);
+                        let progress = progress.clone();
 
                         move |_, path: PathBuf| {
                             let server = server.clone();
                             let filesystem = filesystem.clone();
-                            let progress = Arc::clone(&progress);
+                            let progress = progress.clone();
 
                             async move {
                                 let metadata =
@@ -425,7 +563,8 @@ impl BackupExt for BtrfsBackup {
                                         server.filesystem.async_create_dir_all(parent).await?;
                                     }
 
-                                    filesystem.async_quota_copy(&path, &path, &server, Some(&progress)).await?;
+                                    filesystem.async_quota_copy(&path, &path, &server, progress.clone_bytes().as_ref()).await?;
+                                    progress.increment_files();
                                 } else if metadata.is_dir() {
                                     server.filesystem.async_create_dir_all(&path).await?;
                                     server
@@ -442,12 +581,16 @@ impl BackupExt for BtrfsBackup {
                                 } else if metadata.is_symlink() && let Ok(target) = filesystem.async_read_link(&path).await {
                                     if let Err(err) = server.filesystem.async_symlink(&target, &path).await {
                                         tracing::debug!(path = %path.display(), "failed to create symlink from backup: {:?}", err);
-                                    } else if let Ok(modified_time) = metadata.modified() {
-                                        server.filesystem.async_set_times(
-                                            &path,
-                                            modified_time.into_std(),
-                                            None,
-                                        ).await?;
+                                    } else {
+                                        progress.increment_files();
+
+                                        if let Ok(modified_time) = metadata.modified() {
+                                            server.filesystem.async_set_times(
+                                                &path,
+                                                modified_time.into_std(),
+                                                None,
+                                            ).await?;
+                                        }
                                     }
                                 }
 
@@ -540,7 +683,8 @@ impl BackupExt for BtrfsBackup {
             ));
         }
 
-        let filesystem = crate::server::filesystem::cap::CapFilesystem::new(subvolume_path).await?;
+        let filesystem =
+            crate::server::filesystem::cap::CapFilesystem::new(&subvolume_path).await?;
         let ignore = Self::get_ignore(&server.app_state.config, self.uuid).await?;
 
         Ok(Arc::new(

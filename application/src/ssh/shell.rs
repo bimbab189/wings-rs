@@ -35,14 +35,13 @@ pub struct ShellSession {
 
 impl ShellSession {
     #[inline]
-    async fn has_permission(&self, permission: Permission) -> bool {
+    fn has_permission(&self, permission: Permission) -> bool {
         if let Some(permissions) = &self.permission_override {
             return permissions.has_permission(permission);
         }
         self.server
             .user_permissions
             .has_permission(self.user_uuid, permission)
-            .await
     }
 
     async fn handle_cli_command(
@@ -77,7 +76,7 @@ impl ShellSession {
             }
             Some("power") => match segments.next() {
                 Some("start") => {
-                    if self.has_permission(Permission::ControlStart).await {
+                    if self.has_permission(Permission::ControlStart) {
                         if self.server.state.get_state()
                             != crate::server::state::ServerState::Offline
                         {
@@ -101,24 +100,21 @@ impl ShellSession {
                             }
                         } else {
                             writeln("Server start requested.").await;
-                            self.server
-                                .activity
-                                .log_activity(Activity {
-                                    event: ActivityEvent::PowerStart,
-                                    user: Some(self.user_uuid),
-                                    ip: Some(self.user_ip),
-                                    metadata: Some(json!({ "source": self.activity_source })),
-                                    schedule: None,
-                                    timestamp: chrono::Utc::now(),
-                                })
-                                .await;
+                            self.server.activity.log_activity(Activity {
+                                event: ActivityEvent::PowerStart,
+                                user: Some(self.user_uuid),
+                                ip: Some(self.user_ip),
+                                metadata: Some(json!({ "source": self.activity_source })),
+                                schedule: None,
+                                timestamp: chrono::Utc::now(),
+                            });
                         }
                     } else {
                         writeln("You are missing the `control.start` permission to do this.").await;
                     }
                 }
                 Some("restart") => {
-                    if self.has_permission(Permission::ControlRestart).await {
+                    if self.has_permission(Permission::ControlRestart) {
                         if self
                             .server
                             .restarting
@@ -154,17 +150,14 @@ impl ShellSession {
                             }
                         } else {
                             writeln("Server restart requested.").await;
-                            self.server
-                                .activity
-                                .log_activity(Activity {
-                                    event: ActivityEvent::PowerRestart,
-                                    user: Some(self.user_uuid),
-                                    ip: Some(self.user_ip),
-                                    metadata: Some(json!({ "source": self.activity_source })),
-                                    schedule: None,
-                                    timestamp: chrono::Utc::now(),
-                                })
-                                .await;
+                            self.server.activity.log_activity(Activity {
+                                event: ActivityEvent::PowerRestart,
+                                user: Some(self.user_uuid),
+                                ip: Some(self.user_ip),
+                                metadata: Some(json!({ "source": self.activity_source })),
+                                schedule: None,
+                                timestamp: chrono::Utc::now(),
+                            });
                         }
                     } else {
                         writeln("You are missing the `control.restart` permission to do this.")
@@ -172,7 +165,7 @@ impl ShellSession {
                     }
                 }
                 Some("stop") => {
-                    if self.has_permission(Permission::ControlStop).await {
+                    if self.has_permission(Permission::ControlStop) {
                         if matches!(
                             self.server.state.get_state(),
                             crate::server::state::ServerState::Offline
@@ -208,24 +201,21 @@ impl ShellSession {
                             }
                         } else {
                             writeln("Server stop requested.").await;
-                            self.server
-                                .activity
-                                .log_activity(Activity {
-                                    event: ActivityEvent::PowerStop,
-                                    user: Some(self.user_uuid),
-                                    ip: Some(self.user_ip),
-                                    metadata: Some(json!({ "source": self.activity_source })),
-                                    schedule: None,
-                                    timestamp: chrono::Utc::now(),
-                                })
-                                .await;
+                            self.server.activity.log_activity(Activity {
+                                event: ActivityEvent::PowerStop,
+                                user: Some(self.user_uuid),
+                                ip: Some(self.user_ip),
+                                metadata: Some(json!({ "source": self.activity_source })),
+                                schedule: None,
+                                timestamp: chrono::Utc::now(),
+                            });
                         }
                     } else {
                         writeln("You are missing the `control.stop` permission to do this.").await;
                     }
                 }
                 Some("kill") => {
-                    if self.has_permission(Permission::ControlStop).await {
+                    if self.has_permission(Permission::ControlStop) {
                         if self.server.state.get_state()
                             == crate::server::state::ServerState::Offline
                         {
@@ -244,17 +234,14 @@ impl ShellSession {
                                         .await;
                         } else {
                             writeln("Server kill requested.").await;
-                            self.server
-                                .activity
-                                .log_activity(Activity {
-                                    event: ActivityEvent::PowerKill,
-                                    user: Some(self.user_uuid),
-                                    ip: Some(self.user_ip),
-                                    metadata: Some(json!({ "source": self.activity_source })),
-                                    schedule: None,
-                                    timestamp: chrono::Utc::now(),
-                                })
-                                .await;
+                            self.server.activity.log_activity(Activity {
+                                event: ActivityEvent::PowerKill,
+                                user: Some(self.user_uuid),
+                                ip: Some(self.user_ip),
+                                metadata: Some(json!({ "source": self.activity_source })),
+                                schedule: None,
+                                timestamp: chrono::Utc::now(),
+                            });
                         }
                     } else {
                         writeln("You are missing the `control.stop` permission to do this.").await;
@@ -350,7 +337,7 @@ impl ShellSession {
 
         if line.split_whitespace().next() == Some(cli_name.as_str()) {
             self.handle_cli_command(line, &mut writer).await;
-        } else if self.has_permission(Permission::ControlConsole).await {
+        } else if self.has_permission(Permission::ControlConsole) {
             if self.server.state.get_state() != crate::server::state::ServerState::Offline {
                 if let Err(error) = self.server.send_stdin(format!("{line}\n").into()).await {
                     writer.write_all(b"\r\n").await.unwrap_or_default();
@@ -369,8 +356,7 @@ impl ShellSession {
                             })),
                             schedule: None,
                             timestamp: chrono::Utc::now(),
-                        })
-                        .await;
+                        });
                 }
             } else {
                 let prelude = nu_ansi_term::Color::Yellow
@@ -552,7 +538,7 @@ impl ShellSession {
                                 .starts_with(&self.state.config.load().system.sftp.shell.cli.name)
                             {
                                 self.handle_cli_command(&line, data_writer).await;
-                            } else if self.has_permission(Permission::ControlConsole).await {
+                            } else if self.has_permission(Permission::ControlConsole) {
                                 if self.server.state.get_state()
                                     != crate::server::state::ServerState::Offline
                                 {
@@ -581,8 +567,7 @@ impl ShellSession {
                                                 })),
                                                 schedule: None,
                                                 timestamp: chrono::Utc::now(),
-                                            })
-                                            .await;
+                                            });
                                     }
                                 } else {
                                     let prelude = self.state.config.daemon_prelude();
@@ -718,12 +703,11 @@ impl ShellSession {
                 .await
                 .unwrap_or_default();
 
-            if self
-                .server
-                .user_permissions
-                .has_calagopus_permission_or(self.user_uuid, Permission::ControlReadConsole, true)
-                .await
-            {
+            if self.server.user_permissions.has_calagopus_permission_or(
+                self.user_uuid,
+                Permission::ControlReadConsole,
+                true,
+            ) {
                 let mut log_stream = self
                     .server
                     .logs(Some(self.state.config.load().system.websocket_log_count))
@@ -780,13 +764,10 @@ impl ShellSession {
                             match receiver.recv().await {
                                 Ok(message) => match message.event {
                                     WebsocketEvent::ServerInstallOutput
-                                        if server
-                                            .user_permissions
-                                            .has_permission(
-                                                user_uuid,
-                                                Permission::AdminWebsocketInstall,
-                                            )
-                                            .await =>
+                                        if server.user_permissions.has_permission(
+                                            user_uuid,
+                                            Permission::AdminWebsocketInstall,
+                                        ) =>
                                     {
                                         writer
                                             .write_all(
@@ -797,13 +778,10 @@ impl ShellSession {
                                             .unwrap_or_default();
                                     }
                                     WebsocketEvent::ServerTransferLogs
-                                        if server
-                                            .user_permissions
-                                            .has_permission(
-                                                user_uuid,
-                                                Permission::AdminWebsocketTransfer,
-                                            )
-                                            .await =>
+                                        if server.user_permissions.has_permission(
+                                            user_uuid,
+                                            Permission::AdminWebsocketTransfer,
+                                        ) =>
                                     {
                                         writer
                                             .write_all(
@@ -875,30 +853,22 @@ impl ShellSession {
 
                     Box::pin(async move {
                         'outer: loop {
-                            if !server
-                                .user_permissions
-                                .has_calagopus_permission_or(
-                                    user_uuid,
-                                    Permission::ControlReadConsole,
-                                    true,
-                                )
-                                .await
-                            {
+                            if !server.user_permissions.has_calagopus_permission_or(
+                                user_uuid,
+                                Permission::ControlReadConsole,
+                                true,
+                            ) {
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                                 continue;
                             }
 
                             if let Some(mut stdout) = server.get_stdout_lines_ratelimited().await {
                                 loop {
-                                    if !server
-                                        .user_permissions
-                                        .has_calagopus_permission_or(
-                                            user_uuid,
-                                            Permission::ControlReadConsole,
-                                            true,
-                                        )
-                                        .await
-                                    {
+                                    if !server.user_permissions.has_calagopus_permission_or(
+                                        user_uuid,
+                                        Permission::ControlReadConsole,
+                                        true,
+                                    ) {
                                         let prelude = config.daemon_prelude();
 
                                         writer

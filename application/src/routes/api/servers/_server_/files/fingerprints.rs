@@ -3,7 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 pub(crate) mod get {
     use crate::{
-        io::{SafeDigest, SafeSlice, SafeWrite},
+        io::{SafeDigestExt, SafeSliceExt, SafeWriteExt},
         response::{ApiResponse, ApiResponseResult},
         routes::api::servers::_server_::GetServer,
     };
@@ -85,8 +85,7 @@ pub(crate) mod get {
             };
 
             if !metadata.file_type.is_file()
-                || (filesystem.is_primary_server_fs()
-                    && server.filesystem.is_ignored(&path, false).await)
+                || (filesystem.is_primary_server_fs() && server.filesystem.is_ignored(&path, false))
             {
                 continue;
             }

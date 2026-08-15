@@ -1,20 +1,16 @@
+use super::ArchiveProgress;
 use crate::{
     io::{
         abort::{AbortGuard, AbortWriter},
         compression::{CompressionLevel, CompressionType, writer::CompressionWriter},
-        counting_reader::CountingReader,
         fixed_reader::FixedReader,
     },
     server::filesystem::virtualfs::IsIgnoredFn,
     utils::PortablePermissions,
 };
 use std::{
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
 };
 
 pub struct CreateTarOptions {
@@ -28,7 +24,7 @@ pub async fn create_tar<W: Write + Send + 'static>(
     destination: W,
     base: &Path,
     sources: Vec<impl AsRef<Path> + Send + 'static>,
-    bytes_archived: Option<Arc<AtomicU64>>,
+    progress: ArchiveProgress,
     is_ignored: IsIgnoredFn,
     options: CreateTarOptions,
 ) -> Result<W, anyhow::Error> {
@@ -51,7 +47,10 @@ pub async fn create_tar<W: Write + Send + 'static>(
 
             let source_metadata = match filesystem.symlink_metadata(&source) {
                 Ok(metadata) => metadata,
-                Err(_) => continue,
+                Err(err) => {
+                    tracing::debug!(path = %source.display(), "skipping source while creating tar archive, failed to read metadata: {err:#}");
+                    continue;
+                }
             };
 
             let Some(source) = (is_ignored)(source_metadata.file_type().into(), source) else {
@@ -77,14 +76,20 @@ pub async fn create_tar<W: Write + Send + 'static>(
                 header.set_entry_type(tar::EntryType::Directory);
 
                 archive.append_data(&mut header, relative, std::io::empty())?;
-                if let Some(bytes_archived) = &bytes_archived {
-                    bytes_archived.fetch_add(source_metadata.len(), Ordering::SeqCst);
-                }
+                progress.increment_bytes(source_metadata.len());
 
                 let mut walker = filesystem
                     .walk_dir(source)?
                     .with_is_ignored(is_ignored.clone());
-                while let Some(Ok((_, path))) = walker.next_entry() {
+                while let Some(entry) = walker.next_entry() {
+                    let (_, path) = match entry {
+                        Ok(entry) => entry,
+                        Err(err) => {
+                            tracing::debug!("failed to read directory entry while creating tar archive: {err:#}");
+                            break;
+                        }
+                    };
+
                     let relative = match path.strip_prefix(&base) {
                         Ok(path) => path,
                         Err(_) => continue,
@@ -92,7 +97,10 @@ pub async fn create_tar<W: Write + Send + 'static>(
 
                     let metadata = match filesystem.symlink_metadata(&path) {
                         Ok(metadata) => metadata,
-                        Err(_) => continue,
+                        Err(err) => {
+                            tracing::debug!(path = %path.display(), "skipping entry while creating tar archive, failed to read metadata: {err:#}");
+                            continue;
+                        }
                     };
 
                     let mut header = tar::Header::new_gnu();
@@ -114,18 +122,10 @@ pub async fn create_tar<W: Write + Send + 'static>(
                         header.set_entry_type(tar::EntryType::Directory);
 
                         archive.append_data(&mut header, relative, std::io::empty())?;
-                        if let Some(bytes_archived) = &bytes_archived {
-                            bytes_archived.fetch_add(metadata.len(), Ordering::SeqCst);
-                        }
+                        progress.increment_bytes(metadata.len());
                     } else if metadata.is_file() {
                         let file = filesystem.open(&path)?;
-                        let reader: Box<dyn Read> = match &bytes_archived {
-                            Some(bytes_archived) => Box::new(CountingReader::new_with_bytes_read(
-                                file,
-                                Arc::clone(bytes_archived),
-                            )),
-                            None => Box::new(file),
-                        };
+                        let reader = progress.counting_reader(file);
                         let reader =
                             FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
 
@@ -133,26 +133,20 @@ pub async fn create_tar<W: Write + Send + 'static>(
                         header.set_entry_type(tar::EntryType::Regular);
 
                         archive.append_data(&mut header, relative, reader)?;
+                        progress.increment_files();
                     } else if let Ok(link_target) = filesystem.read_link_contents(&path) {
                         header.set_entry_type(tar::EntryType::Symlink);
 
                         if header.set_link_name(link_target).is_ok() {
                             archive.append_data(&mut header, relative, std::io::empty())?;
-                            if let Some(bytes_archived) = &bytes_archived {
-                                bytes_archived.fetch_add(source_metadata.len(), Ordering::SeqCst);
-                            }
+                            progress.increment_bytes(source_metadata.len());
+                            progress.increment_files();
                         }
                     }
                 }
             } else if source_metadata.is_file() {
                 let file = filesystem.open(&source)?;
-                let reader: Box<dyn Read> = match &bytes_archived {
-                    Some(bytes_archived) => Box::new(CountingReader::new_with_bytes_read(
-                        file,
-                        Arc::clone(bytes_archived),
-                    )),
-                    None => Box::new(file),
-                };
+                let reader = progress.counting_reader(file);
                 let reader =
                     FixedReader::new_with_fixed_bytes(reader, source_metadata.len() as usize);
                 let reader = std::io::BufReader::with_capacity(crate::BUFFER_SIZE, reader);
@@ -161,14 +155,14 @@ pub async fn create_tar<W: Write + Send + 'static>(
                 header.set_entry_type(tar::EntryType::Regular);
 
                 archive.append_data(&mut header, relative, reader)?;
+                progress.increment_files();
             } else if let Ok(link_target) = filesystem.read_link_contents(&source) {
                 header.set_entry_type(tar::EntryType::Symlink);
 
                 if header.set_link_name(link_target).is_ok() {
                     archive.append_data(&mut header, relative, std::io::empty())?;
-                    if let Some(bytes_archived) = &bytes_archived {
-                        bytes_archived.fetch_add(source_metadata.len(), Ordering::SeqCst);
-                    }
+                    progress.increment_bytes(source_metadata.len());
+                    progress.increment_files();
                 }
             }
         }
@@ -187,7 +181,7 @@ pub async fn create_tar_distributed<W: Write + Send + 'static>(
     destination: W,
     base: &Path,
     sources: async_channel::Receiver<PathBuf>,
-    bytes_archived: Option<Arc<AtomicU64>>,
+    progress: ArchiveProgress,
     options: CreateTarOptions,
 ) -> Result<W, anyhow::Error> {
     let base = filesystem.relative_path(base);
@@ -209,7 +203,10 @@ pub async fn create_tar_distributed<W: Write + Send + 'static>(
 
             let source_metadata = match filesystem.symlink_metadata(&source) {
                 Ok(metadata) => metadata,
-                Err(_) => continue,
+                Err(err) => {
+                    tracing::debug!(path = %source.display(), "skipping source while creating tar archive, failed to read metadata: {err:#}");
+                    continue;
+                }
             };
 
             let mut header = tar::Header::new_gnu();
@@ -231,18 +228,10 @@ pub async fn create_tar_distributed<W: Write + Send + 'static>(
                 header.set_entry_type(tar::EntryType::Directory);
 
                 archive.append_data(&mut header, relative, std::io::empty())?;
-                if let Some(bytes_archived) = &bytes_archived {
-                    bytes_archived.fetch_add(source_metadata.len(), Ordering::SeqCst);
-                }
+                progress.increment_bytes(source_metadata.len());
             } else if source_metadata.is_file() {
                 let file = filesystem.open(&source)?;
-                let reader: Box<dyn Read> = match &bytes_archived {
-                    Some(bytes_archived) => Box::new(CountingReader::new_with_bytes_read(
-                        file,
-                        Arc::clone(bytes_archived),
-                    )),
-                    None => Box::new(file),
-                };
+                let reader = progress.counting_reader(file);
                 let reader =
                     FixedReader::new_with_fixed_bytes(reader, source_metadata.len() as usize);
                 let reader = std::io::BufReader::with_capacity(crate::TRANSFER_BUFFER_SIZE, reader);
@@ -251,14 +240,14 @@ pub async fn create_tar_distributed<W: Write + Send + 'static>(
                 header.set_entry_type(tar::EntryType::Regular);
 
                 archive.append_data(&mut header, relative, reader)?;
+                progress.increment_files();
             } else if let Ok(link_target) = filesystem.read_link_contents(&source) {
                 header.set_entry_type(tar::EntryType::Symlink);
 
                 if header.set_link_name(link_target).is_ok() {
                     archive.append_data(&mut header, relative, std::io::empty())?;
-                    if let Some(bytes_archived) = &bytes_archived {
-                        bytes_archived.fetch_add(source_metadata.len(), Ordering::SeqCst);
-                    }
+                    progress.increment_bytes(source_metadata.len());
+                    progress.increment_files();
                 }
             }
         }

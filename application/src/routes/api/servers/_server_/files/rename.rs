@@ -68,11 +68,9 @@ pub(crate) mod put {
                     && (server
                         .filesystem
                         .is_ignored(&from, from_metadata.file_type.is_dir())
-                        .await
                         || server
                             .filesystem
-                            .is_ignored(&to, from_metadata.file_type.is_dir())
-                            .await))
+                            .is_ignored(&to, from_metadata.file_type.is_dir())))
             {
                 continue;
             }

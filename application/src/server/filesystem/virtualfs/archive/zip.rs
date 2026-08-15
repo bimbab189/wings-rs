@@ -1,8 +1,7 @@
 use crate::{
     io::{
-        SafeAsyncWrite, SafeSlice,
+        SafeAsyncWriteExt, SafeSliceExt, UninterruptedReadExt,
         compression::{CompressionLevel, writer::CompressionWriter},
-        counting_reader::CountingReader,
     },
     models::DirectoryEntry,
     routes::MimeCacheValue,
@@ -19,17 +18,14 @@ use crate::{
             VirtualReadableFilesystem,
         },
     },
-    utils::PortablePermissions,
+    utils::{CmpExt, PortablePermissions},
 };
 use compact_str::ToCompactString;
 use itaf::encoder::{EncoderOptions, ItafEncoder, Metadata};
 use std::{
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -79,10 +75,10 @@ impl SortableZipEntry {
             size: entry.size(),
             size_compressed: entry.compressed_size(),
             modified: crate::server::filesystem::archive::zip_entry_get_modified_time(entry)
-                .map(|dt| dt.into_std().into())
+                .map(|dt| dt.into())
                 .unwrap_or_default(),
             created: crate::server::filesystem::archive::zip_entry_get_created_time(entry)
-                .map(|dt| dt.into_std().into())
+                .map(|dt| dt.into())
                 .unwrap_or_else(|| *archive_created),
         }
     }
@@ -95,8 +91,8 @@ impl SortableZipEntry {
         use crate::models::DirectorySortingMode::*;
 
         match sort {
-            NameAsc => self.name.cmp(&other.name),
-            NameDesc => other.name.cmp(&self.name),
+            NameAsc => self.name.cmp_ascii_case_insensitive(&other.name),
+            NameDesc => other.name.cmp_ascii_case_insensitive(&self.name),
             SizeAsc => self.size.cmp(&other.size),
             SizeDesc => other.size.cmp(&self.size),
             PhysicalSizeAsc => self.size_compressed.cmp(&other.size_compressed),
@@ -249,9 +245,11 @@ impl VirtualZipArchive {
 
             mime_cache.insert(entry_index, detected_mime);
             detected_mime
+        } else if entry.size() == 0 {
+            MimeCacheValue::text()
         } else {
             let mut buffer = [0; 64];
-            let buffer = if entry.read(&mut buffer).is_err() {
+            let buffer = if entry.read_uninterrupted(&mut buffer).is_err() {
                 None
             } else {
                 Some(&buffer[..])
@@ -284,10 +282,10 @@ impl VirtualZipArchive {
             symlink: entry.is_symlink(),
             mime: detected_mime.mime,
             modified: crate::server::filesystem::archive::zip_entry_get_modified_time(&entry)
-                .map(|dt| dt.into_std().into())
+                .map(|dt| dt.into())
                 .unwrap_or_default(),
             created: crate::server::filesystem::archive::zip_entry_get_created_time(&entry)
-                .map(|dt| dt.into_std().into())
+                .map(|dt| dt.into())
                 .unwrap_or_else(|| *archive_created),
         }
     }
@@ -337,10 +335,8 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                     PortablePermissions::from_mode(0o644)
                 },
                 size: entry.size(),
-                modified: crate::server::filesystem::archive::zip_entry_get_modified_time(&entry)
-                    .map(|dt| dt.into_std()),
-                created: crate::server::filesystem::archive::zip_entry_get_created_time(&entry)
-                    .map(|dt| dt.into_std()),
+                modified: crate::server::filesystem::archive::zip_entry_get_modified_time(&entry),
+                created: crate::server::filesystem::archive::zip_entry_get_created_time(&entry),
             }),
             Err(e) => {
                 if Self::is_virtual_directory(&self.sizes, path_ref) {
@@ -481,12 +477,12 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                                 crate::server::filesystem::archive::zip_entry_get_modified_time(
                                     &entry,
                                 )
-                                .map(|dt| dt.into_std().into())
+                                .map(|dt| dt.into())
                                 .unwrap_or_default();
                             let c = crate::server::filesystem::archive::zip_entry_get_created_time(
                                 &entry,
                             )
-                            .map(|dt| dt.into_std().into())
+                            .map(|dt| dt.into())
                             .unwrap_or(archive_created);
                             (m, c)
                         } else {
@@ -716,7 +712,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
 
                                     let mut buffer = vec![0; crate::BUFFER_SIZE];
                                     loop {
-                                        match entry.read(&mut buffer) {
+                                        match entry.read_uninterrupted(&mut buffer) {
                                             Ok(0) => break,
                                             Ok(bytes_read) => {
                                                 if runtime
@@ -811,7 +807,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
 
             let mut buffer = vec![0; crate::BUFFER_SIZE];
             loop {
-                match entry.read(&mut buffer) {
+                match entry.read_uninterrupted(&mut buffer) {
                     Ok(0) => break,
                     Ok(bytes_read) => {
                         if runtime
@@ -896,7 +892,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         path: &(dyn AsRef<Path> + Send + Sync),
         archive_format: StreamableArchiveFormat,
         compression_level: CompressionLevel,
-        bytes_archived: Option<Arc<AtomicU64>>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
     ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
         let mut archive = self.archive.clone();
@@ -940,9 +936,8 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                         } else {
                             let entry_size = entry.size();
                             zip.raw_copy_file_to_path(entry, name)?;
-                            if let Some(bytes_archived) = &bytes_archived {
-                                bytes_archived.fetch_add(entry_size, Ordering::SeqCst);
-                            }
+                            progress.increment_bytes(entry_size);
+                            progress.increment_files();
                         }
                     }
 
@@ -1003,8 +998,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                         entry_header.set_mtime(
                             zip_entry_get_modified_time(&entry)
                                 .map(|dt| {
-                                    dt.into_std()
-                                        .duration_since(std::time::UNIX_EPOCH)
+                                    dt.duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs()
                                 })
@@ -1019,22 +1013,16 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                             entry_header.set_entry_type(tar::EntryType::Regular);
                             entry_header.set_size(entry.size());
 
-                            let reader: Box<dyn Read> = match &bytes_archived {
-                                Some(bytes_archived) => {
-                                    Box::new(CountingReader::new_with_bytes_read(
-                                        entry,
-                                        Arc::clone(bytes_archived),
-                                    ))
-                                }
-                                None => Box::new(entry),
-                            };
+                            let reader = progress.counting_reader(entry);
 
                             tar.append_data(&mut entry_header, name, reader)?;
+                            progress.increment_files();
                         } else if entry.is_symlink() && (1..=2048).contains(&entry.size()) {
                             entry_header.set_entry_type(tar::EntryType::Symlink);
 
                             let link_name = std::io::read_to_string(entry)?;
                             tar.append_link(&mut entry_header, name, link_name)?;
+                            progress.increment_files();
                         }
                     }
 
@@ -1134,7 +1122,6 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
 
                         let entry = archive.by_index(zip_index)?;
                         let mtime = zip_entry_get_modified_time(&entry)
-                            .map(|t| t.into_std())
                             .unwrap_or_else(std::time::SystemTime::now);
                         let meta = Metadata {
                             uid: 0,
@@ -1148,21 +1135,17 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                             let link_target = std::io::read_to_string(entry)?;
                             if itaf::spec::validate_name(name).is_ok() {
                                 itaf_enc.add_symlink(name, &link_target, false, &meta)?;
+                                progress.increment_files();
                             }
                         } else if entry.is_file() {
-                            let reader: Box<dyn Read> = match &bytes_archived {
-                                Some(ba) => Box::new(CountingReader::new_with_bytes_read(
-                                    entry,
-                                    Arc::clone(ba),
-                                )),
-                                None => Box::new(entry),
-                            };
+                            let reader = progress.counting_reader(entry);
                             let mut reader =
                                 crate::io::fixed_reader::FixedReader::new_with_fixed_bytes(
                                     reader,
                                     size as usize,
                                 );
                             itaf_enc.add_file(name, &meta, size, &mut { reader })?;
+                            progress.increment_files();
                         }
                     }
 

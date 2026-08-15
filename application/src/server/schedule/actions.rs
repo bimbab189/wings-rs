@@ -345,17 +345,14 @@ impl ScheduleAction {
                             }
                         }
                     } else {
-                        server
-                            .activity
-                            .log_activity(Activity {
-                                event: ActivityEvent::PowerStart,
-                                user: None,
-                                ip: None,
-                                metadata: None,
-                                schedule: Some(execution_context.schedule_uuid),
-                                timestamp: chrono::Utc::now(),
-                            })
-                            .await;
+                        server.activity.log_activity(Activity {
+                            event: ActivityEvent::PowerStart,
+                            user: None,
+                            ip: None,
+                            metadata: None,
+                            schedule: Some(execution_context.schedule_uuid),
+                            timestamp: chrono::Utc::now(),
+                        });
                     }
                 }
                 crate::models::ServerPowerAction::Restart => {
@@ -392,17 +389,14 @@ impl ScheduleAction {
                             }
                         }
                     } else {
-                        server
-                            .activity
-                            .log_activity(Activity {
-                                event: ActivityEvent::PowerRestart,
-                                user: None,
-                                ip: None,
-                                metadata: None,
-                                schedule: Some(execution_context.schedule_uuid),
-                                timestamp: chrono::Utc::now(),
-                            })
-                            .await;
+                        server.activity.log_activity(Activity {
+                            event: ActivityEvent::PowerRestart,
+                            user: None,
+                            ip: None,
+                            metadata: None,
+                            schedule: Some(execution_context.schedule_uuid),
+                            timestamp: chrono::Utc::now(),
+                        });
                     }
                 }
                 crate::models::ServerPowerAction::Stop => {
@@ -443,17 +437,14 @@ impl ScheduleAction {
                             }
                         }
                     } else {
-                        server
-                            .activity
-                            .log_activity(Activity {
-                                event: ActivityEvent::PowerStop,
-                                user: None,
-                                ip: None,
-                                metadata: None,
-                                schedule: Some(execution_context.schedule_uuid),
-                                timestamp: chrono::Utc::now(),
-                            })
-                            .await;
+                        server.activity.log_activity(Activity {
+                            event: ActivityEvent::PowerStop,
+                            user: None,
+                            ip: None,
+                            metadata: None,
+                            schedule: Some(execution_context.schedule_uuid),
+                            timestamp: chrono::Utc::now(),
+                        });
                     }
                 }
                 crate::models::ServerPowerAction::Kill => {
@@ -470,17 +461,14 @@ impl ScheduleAction {
 
                         return Err("an unexpected error occurred while killing the server.".into());
                     } else {
-                        server
-                            .activity
-                            .log_activity(Activity {
-                                event: ActivityEvent::PowerKill,
-                                user: None,
-                                ip: None,
-                                metadata: None,
-                                schedule: Some(execution_context.schedule_uuid),
-                                timestamp: chrono::Utc::now(),
-                            })
-                            .await;
+                        server.activity.log_activity(Activity {
+                            event: ActivityEvent::PowerKill,
+                            user: None,
+                            ip: None,
+                            metadata: None,
+                            schedule: Some(execution_context.schedule_uuid),
+                            timestamp: chrono::Utc::now(),
+                        });
                     }
                 }
             },
@@ -501,19 +489,16 @@ impl ScheduleAction {
                     .await
                     .is_ok()
                 {
-                    server
-                        .activity
-                        .log_activity(Activity {
-                            event: ActivityEvent::ConsoleCommand,
-                            user: None,
-                            ip: None,
-                            metadata: Some(serde_json::json!({
-                                "command": command,
-                            })),
-                            schedule: Some(execution_context.schedule_uuid),
-                            timestamp: chrono::Utc::now(),
-                        })
-                        .await;
+                    server.activity.log_activity(Activity {
+                        event: ActivityEvent::ConsoleCommand,
+                        user: None,
+                        ip: None,
+                        metadata: Some(serde_json::json!({
+                            "command": command,
+                        })),
+                        schedule: Some(execution_context.schedule_uuid),
+                        timestamp: chrono::Utc::now(),
+                    });
                 }
             }
             ScheduleAction::CreateBackup {
@@ -613,16 +598,14 @@ impl ScheduleAction {
                     return Err("path is not a directory".into());
                 }
 
-                if filesystem.is_primary_server_fs()
-                    && server.filesystem.is_ignored(&root, true).await
-                {
+                if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(&root, true) {
                     return Err("path not found".into());
                 }
 
                 let destination = root.join(name);
 
                 if filesystem.is_primary_server_fs()
-                    && server.filesystem.is_ignored(&destination, true).await
+                    && server.filesystem.is_ignored(&destination, true)
                 {
                     return Err("destination not found".into());
                 }
@@ -633,26 +616,17 @@ impl ScheduleAction {
                     return Err("failed to create directory".into());
                 }
 
-                server
-                    .activity
-                    .log_activity(Activity {
-                        event: ActivityEvent::FileCreateDirectory,
-                        user: None,
-                        ip: None,
-                        metadata: Some(serde_json::json!({
-                            "directory": raw_root,
-                            "name": name,
-                        })),
-                        schedule: Some(execution_context.schedule_uuid),
-                        timestamp: chrono::Utc::now(),
-                    })
-                    .await;
-
-                if let Err(err) = filesystem.async_chown(&destination).await {
-                    tracing::error!(path = %destination.display(), "failed to change ownership: {:?}", err);
-
-                    return Err("failed to change ownership".into());
-                }
+                server.activity.log_activity(Activity {
+                    event: ActivityEvent::FileCreateDirectory,
+                    user: None,
+                    ip: None,
+                    metadata: Some(serde_json::json!({
+                        "directory": raw_root,
+                        "name": name,
+                    })),
+                    schedule: Some(execution_context.schedule_uuid),
+                    timestamp: chrono::Utc::now(),
+                });
             }
             ScheduleAction::WriteFile {
                 file: file_path,
@@ -693,9 +667,7 @@ impl ScheduleAction {
 
                 let metadata = filesystem.async_metadata(&path).await;
 
-                if filesystem.is_primary_server_fs()
-                    && server.filesystem.is_ignored(parent, true).await
-                {
+                if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true) {
                     return Err("file not found".into());
                 }
 
@@ -709,9 +681,7 @@ impl ScheduleAction {
                     0
                 };
 
-                if filesystem.is_primary_server_fs()
-                    && server.filesystem.is_ignored(parent, true).await
-                {
+                if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true) {
                     return Err("parent directory not found".into());
                 }
 
@@ -762,25 +732,16 @@ impl ScheduleAction {
                     return Err("failed to shutdown file".into());
                 }
 
-                server
-                    .activity
-                    .log_activity(Activity {
-                        event: ActivityEvent::FileWrite,
-                        user: None,
-                        ip: None,
-                        metadata: Some(serde_json::json!({
-                            "file": file_path,
-                        })),
-                        schedule: Some(execution_context.schedule_uuid),
-                        timestamp: chrono::Utc::now(),
-                    })
-                    .await;
-
-                if let Err(err) = server.filesystem.chown_path(&path).await {
-                    tracing::error!(path = %path.display(), "failed to change ownership: {:?}", err);
-
-                    return Err("failed to change ownership".into());
-                }
+                server.activity.log_activity(Activity {
+                    event: ActivityEvent::FileWrite,
+                    user: None,
+                    ip: None,
+                    metadata: Some(serde_json::json!({
+                        "file": file_path,
+                    })),
+                    schedule: Some(execution_context.schedule_uuid),
+                    timestamp: chrono::Utc::now(),
+                });
             }
             ScheduleAction::CopyFile {
                 foreground,
@@ -827,8 +788,7 @@ impl ScheduleAction {
                             || (filesystem.is_primary_server_fs()
                                 && server
                                     .filesystem
-                                    .is_ignored(&path, metadata.file_type.is_dir())
-                                    .await)
+                                    .is_ignored(&path, metadata.file_type.is_dir()))
                         {
                             return Err("file not found".into());
                         } else {
@@ -840,9 +800,7 @@ impl ScheduleAction {
                     }
                 };
 
-                if filesystem.is_primary_server_fs()
-                    && server.filesystem.is_ignored(parent, true).await
-                {
+                if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true) {
                     return Err("parent directory not found".into());
                 }
 
@@ -868,8 +826,9 @@ impl ScheduleAction {
                     .filesystem
                     .relative_path(&destination_path.join(destination_file_name));
 
-                let progress = Arc::new(AtomicU64::new(0));
-                let total = Arc::new(AtomicU64::new(metadata.size));
+                let bytes_processed = Arc::new(AtomicU64::new(0));
+                let bytes_total = Arc::new(AtomicU64::new(metadata.size));
+                let files_processed = Arc::new(AtomicU64::new(0));
 
                 let (_, task) = server
                     .filesystem
@@ -879,8 +838,9 @@ impl ScheduleAction {
                             path: path.clone(),
                             destination_path: file_name,
                             start_time: chrono::Utc::now(),
-                            progress: progress.clone(),
-                            total: total.clone(),
+                            bytes_processed: bytes_processed.clone(),
+                            bytes_total: bytes_total.clone(),
+                            files_processed: files_processed.clone(),
                         },
                         {
                             let server = server.clone();
@@ -891,7 +851,10 @@ impl ScheduleAction {
                                 server
                                     .filesystem
                                     .copy_path(
-                                        progress,
+                                        crate::server::filesystem::archive::create::ArchiveProgress::new(
+                                            bytes_processed,
+                                            files_processed,
+                                        ),
                                         &server,
                                         metadata,
                                         path,
@@ -936,20 +899,17 @@ impl ScheduleAction {
                     }
                 }
 
-                server
-                    .activity
-                    .log_activity(Activity {
-                        event: ActivityEvent::FileCopy,
-                        user: None,
-                        ip: None,
-                        metadata: Some(serde_json::json!({
-                            "file": file,
-                            "name": destination,
-                        })),
-                        schedule: Some(execution_context.schedule_uuid),
-                        timestamp: chrono::Utc::now(),
-                    })
-                    .await;
+                server.activity.log_activity(Activity {
+                    event: ActivityEvent::FileCopy,
+                    user: None,
+                    ip: None,
+                    metadata: Some(serde_json::json!({
+                        "file": file,
+                        "name": destination,
+                    })),
+                    schedule: Some(execution_context.schedule_uuid),
+                    timestamp: chrono::Utc::now(),
+                });
             }
             ScheduleAction::DeleteFiles { root, files } => {
                 let raw_root = match execution_context.resolve_parameter(root) {
@@ -977,7 +937,6 @@ impl ScheduleAction {
                         && server
                             .filesystem
                             .is_ignored(&source, metadata.file_type.is_dir())
-                            .await
                     {
                         continue;
                     }
@@ -991,20 +950,17 @@ impl ScheduleAction {
                     }
                 }
 
-                server
-                    .activity
-                    .log_activity(Activity {
-                        event: ActivityEvent::FileDelete,
-                        user: None,
-                        ip: None,
-                        metadata: Some(serde_json::json!({
-                            "directory": raw_root,
-                            "files": files,
-                        })),
-                        schedule: Some(execution_context.schedule_uuid),
-                        timestamp: chrono::Utc::now(),
-                    })
-                    .await;
+                server.activity.log_activity(Activity {
+                    event: ActivityEvent::FileDelete,
+                    user: None,
+                    ip: None,
+                    metadata: Some(serde_json::json!({
+                        "directory": raw_root,
+                        "files": files,
+                    })),
+                    schedule: Some(execution_context.schedule_uuid),
+                    timestamp: chrono::Utc::now(),
+                });
             }
             ScheduleAction::RenameFiles { root, files } => {
                 let raw_root = match execution_context.resolve_parameter(root) {
@@ -1044,11 +1000,9 @@ impl ScheduleAction {
                             && (server
                                 .filesystem
                                 .is_ignored(&from, from_metadata.file_type.is_dir())
-                                .await
                                 || server
                                     .filesystem
-                                    .is_ignored(&to, from_metadata.file_type.is_dir())
-                                    .await))
+                                    .is_ignored(&to, from_metadata.file_type.is_dir())))
                     {
                         continue;
                     }
@@ -1066,20 +1020,17 @@ impl ScheduleAction {
                     }
                 }
 
-                server
-                    .activity
-                    .log_activity(Activity {
-                        event: ActivityEvent::FileRename,
-                        user: None,
-                        ip: None,
-                        metadata: Some(serde_json::json!({
-                            "directory": raw_root,
-                            "files": files,
-                        })),
-                        schedule: Some(execution_context.schedule_uuid),
-                        timestamp: chrono::Utc::now(),
-                    })
-                    .await;
+                server.activity.log_activity(Activity {
+                    event: ActivityEvent::FileRename,
+                    user: None,
+                    ip: None,
+                    metadata: Some(serde_json::json!({
+                        "directory": raw_root,
+                        "files": files,
+                    })),
+                    schedule: Some(execution_context.schedule_uuid),
+                    timestamp: chrono::Utc::now(),
+                });
             }
             ScheduleAction::CompressFiles {
                 foreground,
@@ -1133,13 +1084,14 @@ impl ScheduleAction {
                 let destination_path = destination_root.join(file_name);
 
                 if destination_filesystem.is_primary_server_fs()
-                    && server.filesystem.is_ignored(&destination_path, false).await
+                    && server.filesystem.is_ignored(&destination_path, false)
                 {
                     return Err("file not found".into());
                 }
 
-                let progress = Arc::new(AtomicU64::new(0));
-                let total = Arc::new(AtomicU64::new(0));
+                let bytes_processed = Arc::new(AtomicU64::new(0));
+                let bytes_total = Arc::new(AtomicU64::new(0));
+                let files_processed = Arc::new(AtomicU64::new(0));
 
                 let (_, task) = server
                     .filesystem
@@ -1150,8 +1102,9 @@ impl ScheduleAction {
                             files: files.iter().map(PathBuf::from).collect(),
                             destination_path: PathBuf::from(&raw_root).join(file_name),
                             start_time: chrono::Utc::now(),
-                            progress: progress.clone(),
-                            total: total.clone(),
+                            bytes_processed: bytes_processed.clone(),
+                            bytes_total: bytes_total.clone(),
+                            files_processed: files_processed.clone(),
                         },
                         {
                             let state = state.clone();
@@ -1164,7 +1117,7 @@ impl ScheduleAction {
                             let destination_filesystem = destination_filesystem.clone();
 
                             async move {
-                                let ignored = server.filesystem.get_ignored().await;
+                                let ignored = server.filesystem.get_ignored();
                                 let writer = tokio::task::spawn_blocking(move || {
                                     destination_filesystem.create_seekable_file(&destination_path)
                                 })
@@ -1183,7 +1136,7 @@ impl ScheduleAction {
                                     total_size += directory_entry.size;
                                 }
 
-                                total.store(total_size, std::sync::atomic::Ordering::Relaxed);
+                                bytes_total.store(total_size, std::sync::atomic::Ordering::Relaxed);
 
                                 match format {
                                     ArchiveFormat::Tar
@@ -1198,7 +1151,7 @@ impl ScheduleAction {
                                             writer,
                                             &root,
                                             files,
-                                            Some(progress),
+                                            crate::server::filesystem::archive::create::ArchiveProgress::new(bytes_processed.clone(), files_processed.clone()),
                                             ignored.into(),
                                             crate::server::filesystem::archive::create::CreateTarOptions {
                                                 compression_type: format.compression_format(),
@@ -1218,7 +1171,7 @@ impl ScheduleAction {
                                             writer,
                                             &root,
                                             files,
-                                            Some(progress),
+                                            crate::server::filesystem::archive::create::ArchiveProgress::new(bytes_processed.clone(), files_processed.clone()),
                                             ignored.into(),
                                             crate::server::filesystem::archive::create::CreateZipOptions {
                                                 compression_level: state
@@ -1236,7 +1189,7 @@ impl ScheduleAction {
                                             writer,
                                             &root,
                                             files,
-                                            Some(progress),
+                                            crate::server::filesystem::archive::create::ArchiveProgress::new(bytes_processed.clone(), files_processed.clone()),
                                             ignored.into(),
                                             crate::server::filesystem::archive::create::Create7zOptions {
                                                 compression_level: state
@@ -1257,21 +1210,18 @@ impl ScheduleAction {
                     )
                     .await;
 
-                server
-                    .activity
-                    .log_activity(Activity {
-                        event: ActivityEvent::FileCompress,
-                        user: None,
-                        ip: None,
-                        metadata: Some(serde_json::json!({
-                            "directory": raw_root,
-                            "name": name,
-                            "files": files,
-                        })),
-                        schedule: Some(execution_context.schedule_uuid),
-                        timestamp: chrono::Utc::now(),
-                    })
-                    .await;
+                server.activity.log_activity(Activity {
+                    event: ActivityEvent::FileCompress,
+                    user: None,
+                    ip: None,
+                    metadata: Some(serde_json::json!({
+                        "directory": raw_root,
+                        "name": name,
+                        "files": files,
+                    })),
+                    schedule: Some(execution_context.schedule_uuid),
+                    timestamp: chrono::Utc::now(),
+                });
 
                 if *foreground {
                     match task.await {
@@ -1335,18 +1285,14 @@ impl ScheduleAction {
 
                 let source = root.join(file);
 
-                if server
-                    .filesystem
-                    .is_ignored(
-                        &source,
-                        server
-                            .filesystem
-                            .async_metadata(&source)
-                            .await
-                            .is_ok_and(|m| m.is_dir()),
-                    )
-                    .await
-                {
+                if server.filesystem.is_ignored(
+                    &source,
+                    server
+                        .filesystem
+                        .async_metadata(&source)
+                        .await
+                        .is_ok_and(|m| m.is_dir()),
+                ) {
                     return Err("file not found".into());
                 }
 
@@ -1364,20 +1310,17 @@ impl ScheduleAction {
 
                 let thread = tokio::spawn(archive.extract(root.clone(), None, None));
 
-                server
-                    .activity
-                    .log_activity(Activity {
-                        event: ActivityEvent::FileDecompress,
-                        user: None,
-                        ip: None,
-                        metadata: Some(serde_json::json!({
-                            "directory": root.display().to_string(),
-                            "file": file,
-                        })),
-                        schedule: Some(execution_context.schedule_uuid),
-                        timestamp: chrono::Utc::now(),
-                    })
-                    .await;
+                server.activity.log_activity(Activity {
+                    event: ActivityEvent::FileDecompress,
+                    user: None,
+                    ip: None,
+                    metadata: Some(serde_json::json!({
+                        "directory": root.display().to_string(),
+                        "file": file,
+                    })),
+                    schedule: Some(execution_context.schedule_uuid),
+                    timestamp: chrono::Utc::now(),
+                });
 
                 if *foreground && let Ok(Err(err)) = thread.await {
                     tracing::error!(path = %source.display(), "failed to decompress file: {:?}", err);

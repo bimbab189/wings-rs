@@ -1,4 +1,4 @@
-use super::client::Client;
+use super::{ResponseExt, client::Client};
 use crate::server::backup::adapters::BackupAdapter;
 use compact_str::ToCompactString;
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,29 @@ impl ResticBackupConfiguration {
     }
 }
 
+#[derive(Debug, Clone, ToSchema, Deserialize)]
+pub struct PbsBackupConfiguration {
+    pub url: String,
+    pub datastore: String,
+    pub namespace: Option<String>,
+    pub token_id: String,
+    pub token_secret: String,
+    pub fingerprint: String,
+    pub backup_id_prefix: Option<String>,
+    #[serde(default)]
+    pub server_uuid: Option<uuid::Uuid>,
+    pub backup_created: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, ToSchema, Deserialize)]
+pub struct KopiaBackupConfiguration {
+    pub url: String,
+    pub username: String,
+    pub password: String,
+    pub fingerprint: String,
+    pub tags: BTreeMap<String, String>,
+}
+
 pub async fn set_backup_status(
     client: &Client,
     uuid: uuid::Uuid,
@@ -54,7 +77,8 @@ pub async fn set_backup_status(
         .json(data)
         .send()
         .await?
-        .error_for_status()?;
+        .error_for_remote_status()
+        .await?;
 
     Ok(())
 }
@@ -74,7 +98,8 @@ pub async fn set_backup_restore_status(
         }))
         .send()
         .await?
-        .error_for_status()?;
+        .error_for_remote_status()
+        .await?;
 
     Ok(())
 }
@@ -90,7 +115,8 @@ pub async fn backup_upload_urls(
             .get(format!("{}/backups/{}?size={}", client.url, uuid, size))
             .send()
             .await?
-            .error_for_status()?
+            .error_for_remote_status()
+            .await?
             .text()
             .await?,
     )?;
@@ -118,7 +144,8 @@ pub async fn backup_s3_part_urls(
             ))
             .send()
             .await?
-            .error_for_status()?
+            .error_for_remote_status()
+            .await?
             .text()
             .await?,
     )?;
@@ -142,7 +169,46 @@ pub async fn backup_restic_configuration(
             .get(format!("{}/backups/{}/restic", client.url, uuid))
             .send()
             .await?
-            .error_for_status()?
+            .error_for_remote_status()
+            .await?
+            .text()
+            .await?,
+    )?;
+
+    Ok(response)
+}
+
+pub async fn backup_pbs_configuration(
+    client: &Client,
+    uuid: uuid::Uuid,
+) -> Result<PbsBackupConfiguration, anyhow::Error> {
+    let response: PbsBackupConfiguration = super::into_json(
+        client
+            .client
+            .get(format!("{}/backups/{}/pbs", client.url, uuid))
+            .send()
+            .await?
+            .error_for_remote_status()
+            .await?
+            .text()
+            .await?,
+    )?;
+
+    Ok(response)
+}
+
+pub async fn backup_kopia_configuration(
+    client: &Client,
+    uuid: uuid::Uuid,
+) -> Result<KopiaBackupConfiguration, anyhow::Error> {
+    let response: KopiaBackupConfiguration = super::into_json(
+        client
+            .client
+            .get(format!("{}/backups/{}/kopia", client.url, uuid))
+            .send()
+            .await?
+            .error_for_remote_status()
+            .await?
             .text()
             .await?,
     )?;
@@ -168,7 +234,8 @@ pub async fn create_backup(
             }))
             .send()
             .await?
-            .error_for_status()?
+            .error_for_remote_status()
+            .await?
             .text()
             .await?,
     )?;

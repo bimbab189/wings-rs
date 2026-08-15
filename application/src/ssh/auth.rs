@@ -31,12 +31,13 @@ fn validate_username(username: &str) -> bool {
 }
 
 pub struct SshSession {
-    pub ratelimiter: Arc<super::ratelimiter::SshRatelimiter>,
+    pub limiter: Arc<super::limiter::SshLimiter>,
     pub state: State,
     pub server: Option<crate::server::Server>,
 
     pub user_ip: IpAddr,
     pub user_uuid: Option<uuid::Uuid>,
+    pub open_channels: usize,
 
     pub clients: HashMap<ChannelId, Channel<Msg>>,
     pub shell_clients: HashSet<ChannelId>,
@@ -83,7 +84,7 @@ impl russh::server::Handler for SshSession {
             });
         }
 
-        self.ratelimiter
+        self.limiter
             .check_attempt(self.user_ip, AuthenticationType::Password)
             .await?;
 
@@ -110,8 +111,9 @@ impl russh::server::Handler for SshSession {
             return Ok(Auth::reject());
         }
 
+        self.limiter.increment_sessions(user)?;
         self.user_uuid = Some(user);
-        self.ratelimiter
+        self.limiter
             .finish_attempt(&self.user_ip, AuthenticationType::Password)
             .await;
 
@@ -133,22 +135,18 @@ impl russh::server::Handler for SshSession {
 
         server
             .user_permissions
-            .set_permissions(user, permissions, Some(&ignored_files))
-            .await;
+            .set_permissions(user, permissions, Some(&ignored_files));
         if self.state.config.load().system.sftp.activity.log_logins {
-            server
-                .activity
-                .log_activity(Activity {
-                    event: ActivityEvent::SftpLogin,
-                    user: Some(user),
-                    ip: Some(self.user_ip),
-                    metadata: Some(json!({
-                        "method": "password",
-                    })),
-                    schedule: None,
-                    timestamp: chrono::Utc::now(),
-                })
-                .await;
+            server.activity.log_activity(Activity {
+                event: ActivityEvent::SftpLogin,
+                user: Some(user),
+                ip: Some(self.user_ip),
+                metadata: Some(json!({
+                    "method": "password",
+                })),
+                schedule: None,
+                timestamp: chrono::Utc::now(),
+            });
         }
         self.server = Some(server);
 
@@ -167,7 +165,7 @@ impl russh::server::Handler for SshSession {
             });
         }
 
-        self.ratelimiter
+        self.limiter
             .check_attempt(self.user_ip, AuthenticationType::PublicKey)
             .await?;
 
@@ -201,8 +199,9 @@ impl russh::server::Handler for SshSession {
             return Ok(Auth::reject());
         }
 
+        self.limiter.increment_sessions(user)?;
         self.user_uuid = Some(user);
-        self.ratelimiter
+        self.limiter
             .finish_attempt(&self.user_ip, AuthenticationType::PublicKey)
             .await;
 
@@ -219,22 +218,18 @@ impl russh::server::Handler for SshSession {
 
         server
             .user_permissions
-            .set_permissions(user, permissions, Some(&ignored_files))
-            .await;
+            .set_permissions(user, permissions, Some(&ignored_files));
         if self.state.config.load().system.sftp.activity.log_logins {
-            server
-                .activity
-                .log_activity(Activity {
-                    event: ActivityEvent::SftpLogin,
-                    user: Some(user),
-                    ip: Some(self.user_ip),
-                    metadata: Some(json!({
-                        "method": "public_key",
-                    })),
-                    schedule: None,
-                    timestamp: chrono::Utc::now(),
-                })
-                .await;
+            server.activity.log_activity(Activity {
+                event: ActivityEvent::SftpLogin,
+                user: Some(user),
+                ip: Some(self.user_ip),
+                metadata: Some(json!({
+                    "method": "public_key",
+                })),
+                schedule: None,
+                timestamp: chrono::Utc::now(),
+            });
         }
         self.server = Some(server);
 
@@ -246,8 +241,24 @@ impl russh::server::Handler for SshSession {
         channel: Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        if self.open_channels
+            >= self
+                .state
+                .config
+                .load()
+                .system
+                .sftp
+                .limits
+                .max_channels_per_connection
+        {
+            return Err(russh::Error::ChannelOpenFailure(
+                russh::ChannelOpenFailure::ResourceShortage,
+            ));
+        }
+
         tracing::debug!("opening new channel: {}", channel.id());
         self.clients.insert(channel.id(), channel);
+        self.open_channels += 1;
 
         Ok(true)
     }
@@ -257,6 +268,8 @@ impl russh::server::Handler for SshSession {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.open_channels = self.open_channels.saturating_sub(1);
+
         tracing::debug!("channel eof: {}", channel);
         session.close(channel)?;
 
@@ -284,8 +297,7 @@ impl russh::server::Handler for SshSession {
                         metadata: None,
                         schedule: None,
                         timestamp: chrono::Utc::now(),
-                    })
-                    .await;
+                    });
             }
         }
 
@@ -338,8 +350,7 @@ impl russh::server::Handler for SshSession {
                 metadata: Some(json!({ "type": "shell" })),
                 schedule: None,
                 timestamp: chrono::Utc::now(),
-            })
-            .await;
+            });
 
         session.channel_success(channel_id)?;
         let ssh = super::shell::ShellSession {
@@ -447,6 +458,7 @@ impl russh::server::Handler for SshSession {
             self.tracked_sessions.insert(channel_id, session_id);
 
             let sftp = super::sftp::SftpSession {
+                limiter: Arc::clone(&self.limiter),
                 state: Arc::clone(&self.state),
                 server,
 
@@ -464,5 +476,13 @@ impl russh::server::Handler for SshSession {
         }
 
         Ok(())
+    }
+}
+
+impl Drop for SshSession {
+    fn drop(&mut self) {
+        if let Some(user) = self.user_uuid {
+            self.limiter.decrement_sessions(user);
+        }
     }
 }

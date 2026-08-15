@@ -65,11 +65,7 @@ pub async fn handle_jwt(
                 .verify::<WebsocketJwtPayload>(message.args.first().map_or("", |v| v.as_str()))
             {
                 Ok(jwt) => {
-                    if let Err(err) = jwt
-                        .base
-                        .validate(&state.config.jwt, Some("websocket"))
-                        .await
-                    {
+                    if let Err(err) = jwt.base.validate(&state.config.jwt, Some("websocket")) {
                         return Err(JwtError::MiscStr(format!("invalid token: {err}")));
                     }
 
@@ -111,14 +107,11 @@ pub async fn handle_jwt(
                     let has_console_read = jwt
                         .permissions
                         .has_calagopus_permission_or(Permission::ControlReadConsole, true);
-                    server
-                        .user_permissions
-                        .set_permissions(
-                            jwt.user_uuid,
-                            jwt.permissions.clone(),
-                            jwt.ignored_files.as_deref(),
-                        )
-                        .await;
+                    server.user_permissions.set_permissions(
+                        jwt.user_uuid,
+                        jwt.permissions.clone(),
+                        jwt.ignored_files.as_deref(),
+                    );
 
                     if websocket_handler
                         .socket_jwt
@@ -157,11 +150,7 @@ pub async fn handle_jwt(
         }
         _ => {
             if let Some(jwt) = websocket_handler.socket_jwt.read().await.as_ref() {
-                if let Err(err) = jwt
-                    .base
-                    .validate(&state.config.jwt, Some("websocket"))
-                    .await
-                {
+                if let Err(err) = jwt.base.validate(&state.config.jwt, Some("websocket")) {
                     return Err(JwtError::MiscStr(format!("invalid token: {err}")));
                 }
 

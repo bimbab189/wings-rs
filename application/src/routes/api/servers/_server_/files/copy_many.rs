@@ -57,8 +57,9 @@ pub(crate) mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        let progress = Arc::new(AtomicU64::new(0));
-        let total = Arc::new(AtomicU64::new(0));
+        let bytes_processed = Arc::new(AtomicU64::new(0));
+        let bytes_total = Arc::new(AtomicU64::new(0));
+        let files_processed = Arc::new(AtomicU64::new(0));
 
         let (identifier, task) = server
             .filesystem
@@ -68,8 +69,9 @@ pub(crate) mod post {
                     path: PathBuf::from(&data.root),
                     files: data.files.clone(),
                     start_time: chrono::Utc::now(),
-                    progress: progress.clone(),
-                    total: total.clone(),
+                    bytes_processed: bytes_processed.clone(),
+                    bytes_total: bytes_total.clone(),
+                    files_processed: files_processed.clone(),
                 },
                 {
                     let server = server.clone();
@@ -101,7 +103,7 @@ pub(crate) mod post {
                             total_size += directory_entry.size;
                         }
 
-                        total.store(total_size, std::sync::atomic::Ordering::Relaxed);
+                        bytes_total.store(total_size, std::sync::atomic::Ordering::Relaxed);
 
                         let mut copied_count = 0;
                         for file in data.files {
@@ -141,7 +143,6 @@ pub(crate) mod post {
                                 && server
                                     .filesystem
                                     .is_ignored(&from, metadata.file_type.is_dir())
-                                    .await
                             {
                                 continue;
                             }
@@ -172,7 +173,6 @@ pub(crate) mod post {
                                 && server
                                     .filesystem
                                     .is_ignored(&to, metadata.file_type.is_dir())
-                                    .await
                             {
                                 continue;
                             }
@@ -180,7 +180,10 @@ pub(crate) mod post {
                             if server
                                 .filesystem
                                 .copy_path(
-                                    progress.clone(),
+                                    crate::server::filesystem::archive::create::ArchiveProgress::new(
+                                        bytes_processed.clone(),
+                                        files_processed.clone(),
+                                    ),
                                     &server,
                                     metadata,
                                     from,

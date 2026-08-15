@@ -11,14 +11,15 @@ use crate::{
 };
 use axum::http::{HeaderMap, HeaderValue};
 pub use functions::{DirectoryStreamWalkFn, DirectoryWalkFn, IsIgnoredFn};
+use parking_lot::RwLock;
 use std::{
     ops::Bound,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicU64},
+    sync::Arc,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{RwLock, Semaphore},
+    sync::Semaphore,
 };
 
 pub mod archive;
@@ -281,7 +282,7 @@ pub trait DirectoryWalk {
                     let error = Arc::clone(&error);
                     let func = func.clone();
 
-                    if crate::unlikely(error.read().await.is_some()) {
+                    if crate::unlikely(error.read().is_some()) {
                         break;
                     }
 
@@ -294,7 +295,7 @@ pub trait DirectoryWalk {
                         match func(file_type, path).await {
                             Ok(_) => {}
                             Err(err) => {
-                                *error.write().await = Some(err);
+                                *error.write() = Some(err);
                             }
                         }
                     });
@@ -305,7 +306,7 @@ pub trait DirectoryWalk {
 
         semaphore.acquire_many(threads as u32).await.ok();
 
-        if let Some(err) = error.write().await.take() {
+        if let Some(err) = error.write().take() {
             return Err(err);
         }
 
@@ -339,7 +340,7 @@ pub trait DirectoryStreamWalk {
                     let error = Arc::clone(&error);
                     let func = func.clone();
 
-                    if crate::unlikely(error.read().await.is_some()) {
+                    if crate::unlikely(error.read().is_some()) {
                         break;
                     }
 
@@ -353,7 +354,7 @@ pub trait DirectoryStreamWalk {
                             match func(file_type, path, stream).await {
                                 Ok(_) => {}
                                 Err(err) => {
-                                    *error.write().await = Some(err);
+                                    *error.write() = Some(err);
                                 }
                             }
                         });
@@ -370,7 +371,7 @@ pub trait DirectoryStreamWalk {
 
         semaphore.acquire_many(threads as u32).await.ok();
 
-        if let Some(err) = error.write().await.take() {
+        if let Some(err) = error.write().take() {
             return Err(err);
         }
 
@@ -498,7 +499,7 @@ pub trait VirtualReadableFilesystem: Send + Sync {
         path: &(dyn AsRef<Path> + Send + Sync),
         archive_format: StreamableArchiveFormat,
         compression_level: CompressionLevel,
-        bytes_archived: Option<Arc<AtomicU64>>,
+        progress: super::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
     ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error>;
     async fn async_read_dir_files_archive(
@@ -507,7 +508,7 @@ pub trait VirtualReadableFilesystem: Send + Sync {
         file_paths: Vec<PathBuf>,
         archive_format: StreamableArchiveFormat,
         compression_level: CompressionLevel,
-        bytes_archived: Option<Arc<AtomicU64>>,
+        progress: super::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
     ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
         let root_path = path.as_ref().to_path_buf();
@@ -523,7 +524,7 @@ pub trait VirtualReadableFilesystem: Send + Sync {
             path,
             archive_format,
             compression_level,
-            bytes_archived,
+            progress,
             IsIgnoredFn::from(is_ignored),
         )
         .await
@@ -610,10 +611,5 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
         &self,
         from: &(dyn AsRef<Path> + Send + Sync),
         to: &(dyn AsRef<Path> + Send + Sync),
-    ) -> Result<(), anyhow::Error>;
-    fn chown(&self, path: &(dyn AsRef<Path> + Send + Sync)) -> Result<(), anyhow::Error>;
-    async fn async_chown(
-        &self,
-        path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error>;
 }

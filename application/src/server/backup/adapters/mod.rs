@@ -8,6 +8,8 @@ use utoipa::ToSchema;
 
 pub mod btrfs;
 pub mod ddup_bak;
+pub mod kopia;
+pub mod pbs;
 pub mod restic;
 pub mod s3;
 pub mod wings;
@@ -23,6 +25,8 @@ pub enum BackupAdapter {
     Btrfs,
     Zfs,
     Restic,
+    ProxmoxBackupServer,
+    Kopia,
 }
 
 impl BackupAdapter {
@@ -35,6 +39,8 @@ impl BackupAdapter {
             Self::Btrfs,
             Self::Zfs,
             Self::Restic,
+            Self::ProxmoxBackupServer,
+            Self::Kopia,
         ]
     }
 
@@ -47,6 +53,8 @@ impl BackupAdapter {
             Self::Btrfs => "btrfs",
             Self::Zfs => "zfs",
             Self::Restic => "restic",
+            Self::ProxmoxBackupServer => "proxmox-backup-server",
+            Self::Kopia => "kopia",
         }
     }
 }
@@ -72,6 +80,12 @@ impl BackupAdapter {
                 BackupAdapter::Restic => {
                     <restic::ResticBackup as BackupFindExt>::find(state, uuid).await
                 }
+                BackupAdapter::ProxmoxBackupServer => {
+                    <pbs::PbsBackup as BackupFindExt>::find(state, uuid).await
+                }
+                BackupAdapter::Kopia => {
+                    <kopia::KopiaBackup as BackupFindExt>::find(state, uuid).await
+                }
             }? {
                 return Ok(Some((*adapter, backup)));
             }
@@ -92,6 +106,8 @@ impl BackupAdapter {
             BackupAdapter::Btrfs => btrfs::BtrfsBackup::find(state, uuid).await,
             BackupAdapter::Zfs => zfs::ZfsBackup::find(state, uuid).await,
             BackupAdapter::Restic => restic::ResticBackup::find(state, uuid).await,
+            BackupAdapter::ProxmoxBackupServer => pbs::PbsBackup::find(state, uuid).await,
+            BackupAdapter::Kopia => kopia::KopiaBackup::find(state, uuid).await,
         }
     }
 
@@ -99,7 +115,7 @@ impl BackupAdapter {
         self,
         server: &crate::server::Server,
         uuid: uuid::Uuid,
-        progress: Arc<AtomicU64>,
+        progress: crate::server::filesystem::archive::create::ArchiveProgress,
         total: Arc<AtomicU64>,
         ignore: ignore::gitignore::Gitignore,
         ignore_raw: compact_str::CompactString,
@@ -125,6 +141,12 @@ impl BackupAdapter {
                 restic::ResticBackup::create(server, uuid, progress, total, ignore, ignore_raw)
                     .await
             }
+            BackupAdapter::ProxmoxBackupServer => {
+                pbs::PbsBackup::create(server, uuid, progress, total, ignore, ignore_raw).await
+            }
+            BackupAdapter::Kopia => {
+                kopia::KopiaBackup::create(server, uuid, progress, total, ignore, ignore_raw).await
+            }
         }
     }
 
@@ -140,6 +162,8 @@ impl BackupAdapter {
             BackupAdapter::Btrfs => btrfs::BtrfsBackup::clean(server, uuid).await,
             BackupAdapter::Zfs => zfs::ZfsBackup::clean(server, uuid).await,
             BackupAdapter::Restic => restic::ResticBackup::clean(server, uuid).await,
+            BackupAdapter::ProxmoxBackupServer => pbs::PbsBackup::clean(server, uuid).await,
+            BackupAdapter::Kopia => kopia::KopiaBackup::clean(server, uuid).await,
         }
     }
 }

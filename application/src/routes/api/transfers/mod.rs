@@ -7,29 +7,37 @@ use utoipa_axum::{
 
 pub(crate) mod _server_;
 pub(crate) mod files;
+mod capabilities;
+mod query;
+mod ws;
 
 pub(crate) mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
     };
-    use std::{collections::HashMap, sync::atomic::Ordering};
+    use std::{collections::BTreeMap, sync::atomic::Ordering};
 
     #[utoipa::path(get, path = "/", responses(
-        (status = OK, body = HashMap<uuid::Uuid, crate::models::TransferProgress>),
+        (status = OK, body = BTreeMap<uuid::Uuid, crate::models::TransferProgress>),
         (status = NOT_FOUND, body = ApiError),
     ))]
     pub async fn route(state: GetState) -> ApiResponseResult {
-        let mut transfers = HashMap::new();
+        let mut transfers = BTreeMap::new();
 
         for server in state.server_manager.get_servers().await.iter() {
             if let Some(outgoing_transfer) = server.outgoing_transfer.read().await.as_ref() {
                 transfers.insert(
                     server.uuid,
                     crate::models::TransferProgress {
-                        archive_progress: outgoing_transfer.bytes_archived.load(Ordering::Relaxed),
-                        network_progress: outgoing_transfer.bytes_sent.load(Ordering::Relaxed),
-                        total: outgoing_transfer.bytes_total.load(Ordering::Relaxed),
+                        archive_bytes_processed: outgoing_transfer
+                            .bytes_archived
+                            .load(Ordering::Relaxed),
+                        network_bytes_processed: outgoing_transfer
+                            .bytes_sent
+                            .load(Ordering::Relaxed),
+                        bytes_total: outgoing_transfer.bytes_total.load(Ordering::Relaxed),
+                        files_processed: outgoing_transfer.files_archived.load(Ordering::Relaxed),
                     },
                 );
             }
@@ -49,7 +57,7 @@ pub(crate) mod post {
         },
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
-        server::transfer::TransferArchiveFormat,
+        server::{filesystem::archive::Archive, transfer::TransferArchiveFormat},
         utils::PortablePermissions,
     };
     use axum::{
@@ -59,7 +67,7 @@ pub(crate) mod post {
     use futures::TryStreamExt;
     use serde::Serialize;
     use sha1::Digest;
-    use std::{io::Write, path::Path, str::FromStr, sync::atomic::Ordering};
+    use std::{io::Write, str::FromStr, sync::atomic::Ordering};
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Serialize)]
@@ -105,7 +113,7 @@ pub(crate) mod post {
             }
         };
 
-        if let Err(err) = payload.validate(&state.config.jwt, Some("transfer")).await {
+        if let Err(err) = payload.validate(&state.config.jwt, Some("transfer")) {
             return ApiResponse::error(&format!("invalid token: {err}"))
                 .with_status(StatusCode::UNAUTHORIZED)
                 .ok();
@@ -187,10 +195,16 @@ pub(crate) mod post {
                 let (guard, listener) = AbortGuard::new();
 
                 let handle = tokio::task::spawn_blocking(
-                    move || -> Result<Vec<uuid::Uuid>, anyhow::Error> {
-                        let mut backups = Vec::new();
+                    move || -> Result<
+                        crate::server::backup::transfer::ReceivedBackups,
+                        anyhow::Error,
+                    > {
                         let mut archive_checksum = None;
-                        let mut backup_checksum = None;
+                        let mut backup_receiver =
+                            crate::server::backup::transfer::BackupReceiver::new(
+                                state.0.clone(),
+                                listener.clone(),
+                            );
 
                         while let Ok(Some(mut field)) = runtime.block_on(multipart.next_field()) {
                             if field.name() == Some("archive") {
@@ -228,6 +242,7 @@ pub(crate) mod post {
                                 {
                                     let archive = itaf::decoder::ItafDecoder::new(&mut reader)?;
                                     let mut directory_entries = chunked_vec::ChunkedVec::new();
+                                    let mut last_parent = None;
                                     let mut entries = archive.entries();
 
                                     let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
@@ -243,7 +258,7 @@ pub(crate) mod post {
                                             itaf::decoder::ArchiveEntry::Directory(dir) => {
                                                 server
                                                     .filesystem
-                                                    .create_dir_all(&destination_path)?;
+                                                    .create_chowned_dir_all(&destination_path)?;
 
                                                 let meta = dir.metadata();
                                                 server.filesystem.set_permissions(
@@ -251,21 +266,27 @@ pub(crate) mod post {
                                                     PortablePermissions::from_mode(meta.mode),
                                                 )?;
 
-                                                directory_entries
-                                                    .push((destination_path, meta.modified));
+                                                if directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
+                                                    directory_entries.push((destination_path, meta.modified));
+                                                }
                                             }
                                             itaf::decoder::ArchiveEntry::File(file_entry) => {
-                                                if let Some(parent) = destination_path.parent() {
-                                                    server.filesystem.create_dir_all(parent)?;
+                                                if let Some(parent) = destination_path.parent()
+                                                    && last_parent.as_deref() != Some(parent)
+                                                {
+                                                    server
+                                                        .filesystem
+                                                        .create_chowned_dir_all(parent)?;
+                                                    last_parent = Some(parent.to_path_buf());
                                                 }
 
-                                                let meta = file_entry.metadata().clone();
+                                                let meta = file_entry.metadata();
                                                 let mut writer =
-                                                    crate::server::filesystem::writer::FileSystemWriter::new(
+                                                    crate::server::filesystem::file::ServerFile::new(
                                                         server.clone(),
                                                         &destination_path,
                                                         Some(PortablePermissions::from_mode(meta.mode)),
-                                                        Some(cap_std::time::SystemTime::from_std(meta.modified)),
+                                                        Some(meta.modified),
                                                     )?
                                                     .ignorant();
 
@@ -283,7 +304,9 @@ pub(crate) mod post {
                                                 if let Some(parent) = destination_path.parent()
                                                     && !parent.as_os_str().is_empty()
                                                 {
-                                                    server.filesystem.create_dir_all(parent)?;
+                                                    server
+                                                        .filesystem
+                                                        .create_chowned_dir_all(parent)?;
                                                 }
 
                                                 if let Err(err) = server
@@ -319,7 +342,9 @@ pub(crate) mod post {
                                                 if let Some(parent) = destination_path.parent()
                                                     && !parent.as_os_str().is_empty()
                                                 {
-                                                    server.filesystem.create_dir_all(parent)?;
+                                                    server
+                                                        .filesystem
+                                                        .create_chowned_dir_all(parent)?;
                                                 }
 
                                                 if let Err(err) = server.filesystem.hard_link(
@@ -356,6 +381,7 @@ pub(crate) mod post {
                                 } else {
                                     let mut archive = tar::Archive::new(reader);
                                     let mut directory_entries = chunked_vec::ChunkedVec::new();
+                                    let mut last_parent = None;
                                     let mut entries = archive.entries()?;
 
                                     let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
@@ -373,7 +399,7 @@ pub(crate) mod post {
                                             tar::EntryType::Directory => {
                                                 server
                                                     .filesystem
-                                                    .create_dir_all(destination_path)?;
+                                                    .create_chowned_dir_all(destination_path)?;
                                                 if let Ok(permissions) = header
                                                     .mode()
                                                     .map(PortablePermissions::from_mode)
@@ -384,7 +410,7 @@ pub(crate) mod post {
                                                     )?;
                                                 }
 
-                                                if let Ok(modified_time) = header.mtime() {
+                                                if let Ok(modified_time) = header.mtime() && directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
                                                     directory_entries.push((
                                                         destination_path.to_path_buf(),
                                                         modified_time,
@@ -392,23 +418,23 @@ pub(crate) mod post {
                                                 }
                                             }
                                             tar::EntryType::Regular => {
-                                                if let Some(parent) = destination_path.parent() {
-                                                    server.filesystem.create_dir_all(parent)?;
+                                                if let Some(parent) = destination_path.parent()
+                                                    && last_parent.as_deref() != Some(parent)
+                                                {
+                                                    server
+                                                        .filesystem
+                                                        .create_chowned_dir_all(parent)?;
+                                                    last_parent = Some(parent.to_path_buf());
                                                 }
 
                                                 let mut writer =
-                                                crate::server::filesystem::writer::FileSystemWriter::new(
+                                                crate::server::filesystem::file::ServerFile::new(
                                                     server.clone(),
                                                     destination_path,
                                                     header.mode().map(PortablePermissions::from_mode).ok(),
                                                     header
                                                         .mtime()
-                                                        .map(|t| {
-                                                            cap_std::time::SystemTime::from_std(
-                                                                std::time::UNIX_EPOCH
-                                                                    + std::time::Duration::from_secs(t),
-                                                            )
-                                                        })
+                                                        .map(|t| std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
                                                         .ok(),
                                                 )?
                                                 .ignorant();
@@ -513,146 +539,11 @@ pub(crate) mod post {
                                     );
                                 }
                             } else if field.name().is_some_and(|n| n.starts_with("backup-")) {
-                                tracing::debug!(
-                                    "processing backup field: {}",
-                                    field.name().unwrap_or("unknown")
-                                );
-
-                                let backup_uuid = match field
-                                    .name()
-                                    .and_then(|n| n.strip_prefix("backup-"))
-                                    .and_then(|n| uuid::Uuid::from_str(n).ok())
-                                {
-                                    Some(uuid) => uuid,
-                                    None => {
-                                        if field.name().is_some_and(|n| n.contains("checksum")) {
-                                            let backup_checksum = match backup_checksum.take() {
-                                                Some(checksum) => hex::encode(checksum),
-                                                None => {
-                                                    return Err(anyhow::anyhow!(
-                                                        "backup checksum does not match multipart checksum, None to be found"
-                                                    ));
-                                                }
-                                            };
-                                            let checksum = runtime.block_on(field.text())?;
-
-                                            if backup_checksum != checksum {
-                                                return Err(anyhow::anyhow!(
-                                                    "backup checksum does not match multipart checksum, {checksum} != {backup_checksum}"
-                                                ));
-                                            }
-
-                                            continue;
-                                        }
-
-                                        tracing::warn!(
-                                            "invalid backup field name: {}",
-                                            field.name().unwrap_or("unknown")
-                                        );
-                                        continue;
-                                    }
-                                };
-
-                                let file_name = match field.file_name() {
-                                    Some(name) => name.to_string(),
-                                    None => {
-                                        tracing::warn!(
-                                            "backup field without file name found in transfer archive"
-                                        );
-                                        continue;
-                                    }
-                                };
-
-                                match field.content_type() {
-                                    Some("backup/wings") => {
-                                        if file_name.contains("..")
-                                            || file_name.contains('/')
-                                            || file_name.contains('\\')
-                                        {
-                                            tracing::warn!(
-                                                "invalid backup file name: {}",
-                                                file_name
-                                            );
-                                            continue;
-                                        }
-
-                                        let file_name =
-                                            Path::new(&state.config.load().system.backup_directory)
-                                                .join(file_name);
-                                        let reader = tokio_util::io::StreamReader::new(
-                                            field.into_stream().map_err(|err| {
-                                                std::io::Error::other(format!(
-                                                    "failed to read multipart field: {err}"
-                                                ))
-                                            }),
-                                        );
-                                        let reader = tokio_util::io::SyncIoBridge::new(reader);
-                                        let reader = AbortReader::new(reader, listener.clone());
-                                        let reader = LimitedReader::new_with_bytes_per_second(
-                                            reader,
-                                            state
-                                                .config
-                                                .load()
-                                                .system
-                                                .transfers
-                                                .download_limit
-                                                .as_bytes(),
-                                        );
-                                        let mut reader = HashReader::new_with_hasher(
-                                            reader,
-                                            sha2::Sha256::new(),
-                                        );
-
-                                        let mut file = match std::fs::File::create(&file_name) {
-                                            Ok(file) => file,
-                                            Err(err) => {
-                                                tracing::error!(
-                                                    "failed to create backup file {}: {:#?}",
-                                                    file_name.display(),
-                                                    err
-                                                );
-                                                continue;
-                                            }
-                                        };
-
-                                        if let Err(err) = crate::io::copy(&mut reader, &mut file) {
-                                            tracing::error!(
-                                                "failed to copy backup file {}: {:#?}",
-                                                file_name.display(),
-                                                err
-                                            );
-                                            continue;
-                                        }
-
-                                        if let Err(err) = file.flush() {
-                                            tracing::error!(
-                                                "failed to flush backup file {}: {:#?}",
-                                                file_name.display(),
-                                                err
-                                            );
-                                            continue;
-                                        }
-
-                                        backups.push(backup_uuid);
-                                        backup_checksum = Some(reader.finish());
-
-                                        tracing::debug!(
-                                            "backup file {} transferred successfully",
-                                            file_name.display()
-                                        );
-                                    }
-                                    _ => {
-                                        tracing::warn!(
-                                            "invalid content type for backup field: {:?}",
-                                            field.content_type()
-                                        );
-                                        continue;
-                                    }
-                                }
+                                backup_receiver.handle_field(&runtime, field)?;
                             }
                         }
 
-                        Ok(backups)
+                        Ok(backup_receiver.into_received())
                     },
                 );
 
@@ -764,7 +655,7 @@ pub(crate) mod post {
                                 state
                                     .config
                                     .client
-                                    .set_server_transfer(subject, false, vec![])
+                                    .set_server_transfer(subject, false, &Default::default())
                                     .await
                                     .ok();
 
@@ -783,7 +674,7 @@ pub(crate) mod post {
                         };
 
                         match incoming.try_join_handles(handle).await {
-                            Ok(backups) => {
+                            Ok(received_backups) => {
                                 tracing::info!(
                                     server = %server.uuid,
                                     "server transfer completed successfully"
@@ -791,7 +682,7 @@ pub(crate) mod post {
                                 if state
                                     .config
                                     .client
-                                    .set_server_transfer(subject, true, backups)
+                                    .set_server_transfer(subject, true, &received_backups)
                                     .await
                                     .is_ok()
                                 {
@@ -811,7 +702,7 @@ pub(crate) mod post {
                                     state
                                         .config
                                         .client
-                                        .set_server_transfer(subject, false, vec![])
+                                        .set_server_transfer(subject, false, &Default::default())
                                         .await
                                         .ok();
 
@@ -827,7 +718,7 @@ pub(crate) mod post {
                                 state
                                     .config
                                     .client
-                                    .set_server_transfer(subject, false, vec![])
+                                    .set_server_transfer(subject, false, &Default::default())
                                     .await
                                     .ok();
 
@@ -842,7 +733,7 @@ pub(crate) mod post {
                     let state = state.clone();
                     async move {
                         match handle.await {
-                            Ok(Ok(backups)) => {
+                            Ok(Ok(received_backups)) => {
                                 tracing::info!(
                                     server = %server.uuid,
                                     "server transfer completed successfully"
@@ -850,7 +741,7 @@ pub(crate) mod post {
                                 if state
                                     .config
                                     .client
-                                    .set_server_transfer(subject, true, backups)
+                                    .set_server_transfer(subject, true, &received_backups)
                                     .await
                                     .is_ok()
                                 {
@@ -870,7 +761,7 @@ pub(crate) mod post {
                                     state
                                         .config
                                         .client
-                                        .set_server_transfer(subject, false, vec![])
+                                        .set_server_transfer(subject, false, &Default::default())
                                         .await
                                         .ok();
 
@@ -886,7 +777,7 @@ pub(crate) mod post {
                                 state
                                     .config
                                     .client
-                                    .set_server_transfer(subject, false, vec![])
+                                    .set_server_transfer(subject, false, &Default::default())
                                     .await
                                     .ok();
 
@@ -901,7 +792,7 @@ pub(crate) mod post {
                                 state
                                     .config
                                     .client
-                                    .set_server_transfer(subject, false, vec![])
+                                    .set_server_transfer(subject, false, &Default::default())
                                     .await
                                     .ok();
 
@@ -932,6 +823,21 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
             )),
         )
         .routes(routes!(post::route).layer(DefaultBodyLimit::disable()))
+        .nest(
+            "/capabilities",
+            capabilities::router(state).route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::routes::api::auth,
+            )),
+        )
+        .nest("/query", query::router(state))
+        .nest(
+            "/ws",
+            ws::router(state).route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::routes::api::auth,
+            )),
+        )
         .nest("/files", files::router(state))
         .nest(
             "/{server}",

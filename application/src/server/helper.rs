@@ -713,12 +713,11 @@ pub async fn install_host_artifact(
                     .as_ref()
                     .is_ok_and(|m| m.file_type.is_dir()),
             )
-            .await
     {
         return Err(anyhow::anyhow!("target path is ignored"));
     }
 
-    if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true).await {
+    if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true) {
         return Err(anyhow::anyhow!("target parent directory is ignored"));
     }
 
@@ -757,10 +756,13 @@ pub async fn install_host_artifact(
     file.shutdown()
         .await
         .with_context(|| format!("failed to flush helper artifact {}", destination.display()))?;
-    filesystem
-        .async_chown(&destination)
-        .await
-        .with_context(|| format!("failed to chown helper artifact {}", destination.display()))?;
+    if filesystem.is_primary_server_fs() {
+        server
+            .filesystem
+            .async_chown_path(&destination)
+            .await
+            .with_context(|| format!("failed to chown helper artifact {}", destination.display()))?;
+    }
 
     Ok(HelperInstallResponse {
         variant: normalized_variant.to_string(),
