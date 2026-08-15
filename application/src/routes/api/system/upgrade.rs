@@ -3,6 +3,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 pub(crate) mod post {
     use crate::{
+        io::SafeDigest,
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
     };
@@ -44,7 +45,7 @@ pub(crate) mod post {
             .ok();
         }
 
-        if state.config.ignore_panel_wings_upgrades {
+        if state.config.load().ignore_panel_wings_upgrades {
             return ApiResponse::new_serialized(Response { applied: false }).ok();
         }
 
@@ -116,7 +117,7 @@ pub(crate) mod post {
         loop {
             match file.read(&mut buffer).await? {
                 0 => break,
-                bytes_read => hasher.update(&buffer[..bytes_read]),
+                bytes_read => hasher.safe_update(&buffer, bytes_read)?,
             }
         }
 

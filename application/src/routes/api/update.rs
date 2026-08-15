@@ -3,69 +3,12 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 pub(crate) mod post {
     use crate::{
+        config::InnerConfig,
         response::{ApiResponse, ApiResponseResult},
         routes::GetState,
     };
-    use serde::{Deserialize, Serialize};
+    use serde::Serialize;
     use utoipa::ToSchema;
-
-    nestify::nest! {
-        #[derive(ToSchema, Deserialize)]
-        pub struct Payload {
-            debug: Option<bool>,
-            app_name: Option<String>,
-
-            #[schema(inline)]
-            api: Option<#[derive(ToSchema, Deserialize)] pub struct ApiPayload {
-                host: Option<String>,
-                port: Option<u16>,
-
-                #[schema(inline)]
-                ssl: Option<#[derive(ToSchema, Deserialize)] pub struct ApiSslPayload {
-                    enabled: Option<bool>,
-                    cert: Option<String>,
-                    key: Option<String>,
-                }>,
-
-                upload_limit: Option<crate::config::MiB>,
-            }>,
-
-            #[schema(inline)]
-            system: Option<#[derive(ToSchema, Deserialize)] pub struct SystemPayload {
-                #[schema(inline)]
-                sftp: Option<#[derive(ToSchema, Deserialize)] pub struct SystemSftpPayload {
-                    #[schema(value_type = Option<String>)]
-                    bind_address: Option<std::net::IpAddr>,
-                    bind_port: Option<u16>,
-                }>,
-            }>,
-
-            allowed_origins: Option<Vec<String>>,
-
-            #[schema(inline)]
-            web_hosting: Option<#[derive(ToSchema, Deserialize)] pub struct WebHostingPayload {
-                enabled: Option<bool>,
-                vhost_dir: Option<String>,
-                vhost_path: Option<String>,
-                acme_root: Option<String>,
-                webroot_base: Option<String>,
-                state_dir: Option<String>,
-                backup_repository: Option<String>,
-                quarantine_path: Option<String>,
-                release_path: Option<String>,
-                reload_helper: Option<String>,
-                bind_address: Option<String>,
-                http_port: Option<u16>,
-                https_port: Option<u16>,
-                standby_bind_address: Option<String>,
-                standby_http_port: Option<u16>,
-                standby_https_port: Option<u16>,
-            }>,
-
-            allow_cors_private_network: Option<bool>,
-            ignore_panel_config_updates: Option<bool>,
-        }
-    }
 
     #[derive(ToSchema, Serialize)]
     struct Response {
@@ -74,115 +17,49 @@ pub(crate) mod post {
 
     #[utoipa::path(post, path = "/", responses(
         (status = OK, body = inline(Response)),
-    ), request_body = inline(Payload))]
+    ), request_body = serde_json::Value)]
     pub async fn route(
         state: GetState,
-        crate::Payload(data): crate::Payload<Payload>,
+        crate::Payload(mut patch): crate::Payload<serde_json::Value>,
     ) -> ApiResponseResult {
-        if state.config.ignore_panel_config_updates {
+        if state.config.load().ignore_panel_config_updates {
             return ApiResponse::new_serialized(Response { applied: false }).ok();
         }
 
-        let config = state.config.unsafe_mut();
-        if let Some(debug) = data.debug {
-            config.debug = debug;
-        }
-        if let Some(app_name) = data.app_name {
-            config.app_name = app_name;
-        }
-        if let Some(api) = data.api {
-            if let Some(host) = api.host {
-                config.api.host = host;
-            }
-            if let Some(port) = api.port {
-                config.api.port = port;
-            }
-            if let Some(ssl) = api.ssl {
-                if let Some(enabled) = ssl.enabled {
-                    config.api.ssl.enabled = enabled;
-                }
-                if let Some(cert) = ssl.cert {
-                    config.api.ssl.cert = cert;
-                }
-                if let Some(key) = ssl.key {
-                    config.api.ssl.key = key;
-                }
-            }
-            if let Some(upload_limit) = api.upload_limit {
-                config.api.upload_limit = upload_limit;
-            }
-        }
-        if let Some(system) = data.system
-            && let Some(sftp) = system.sftp
-        {
-            if let Some(bind_address) = sftp.bind_address {
-                config.system.sftp.bind_address = bind_address;
-            }
-            if let Some(bind_port) = sftp.bind_port {
-                config.system.sftp.bind_port = bind_port;
-            }
-        }
-        if let Some(allowed_origins) = data.allowed_origins {
-            config.allowed_origins = allowed_origins;
-        }
-        if let Some(web_hosting) = data.web_hosting {
-            if let Some(enabled) = web_hosting.enabled {
-                config.web_hosting.enabled = enabled;
-            }
-            if let Some(vhost_dir) = web_hosting.vhost_dir {
-                config.web_hosting.vhost_dir = vhost_dir;
-            }
-            if let Some(vhost_path) = web_hosting.vhost_path {
-                config.web_hosting.vhost_dir = vhost_path;
-            }
-            if let Some(acme_root) = web_hosting.acme_root {
-                config.web_hosting.acme_root = acme_root;
-            }
-            if let Some(webroot_base) = web_hosting.webroot_base {
-                config.web_hosting.webroot_base = webroot_base;
-            }
-            if let Some(state_dir) = web_hosting.state_dir {
-                config.web_hosting.state_dir = state_dir;
-            }
-            if let Some(backup_repository) = web_hosting.backup_repository {
-                config.web_hosting.backup_repository = backup_repository;
-            }
-            if let Some(quarantine_path) = web_hosting.quarantine_path {
-                config.web_hosting.quarantine_path = quarantine_path;
-            }
-            if let Some(release_path) = web_hosting.release_path {
-                config.web_hosting.release_path = release_path;
-            }
-            if let Some(reload_helper) = web_hosting.reload_helper {
-                config.web_hosting.reload_helper = reload_helper;
-            }
-            if let Some(bind_address) = web_hosting.bind_address {
-                config.web_hosting.bind_address = bind_address;
-            }
-            if let Some(http_port) = web_hosting.http_port {
-                config.web_hosting.http_port = http_port;
-            }
-            if let Some(https_port) = web_hosting.https_port {
-                config.web_hosting.https_port = https_port;
-            }
-            if let Some(standby_bind_address) = web_hosting.standby_bind_address {
-                config.web_hosting.standby_bind_address = standby_bind_address;
-            }
-            if let Some(standby_http_port) = web_hosting.standby_http_port {
-                config.web_hosting.standby_http_port = standby_http_port;
-            }
-            if let Some(standby_https_port) = web_hosting.standby_https_port {
-                config.web_hosting.standby_https_port = standby_https_port;
-            }
-        }
-        if let Some(allow_cors_private_network) = data.allow_cors_private_network {
-            config.allow_cors_private_network = allow_cors_private_network;
-        }
-        if let Some(ignore_panel_config_updates) = data.ignore_panel_config_updates {
-            config.ignore_panel_config_updates = ignore_panel_config_updates;
+        if !patch.is_object() {
+            return ApiResponse::error("config patch must be a JSON object")
+                .with_status(axum::http::StatusCode::BAD_REQUEST)
+                .ok();
         }
 
-        tokio::task::spawn_blocking(move || state.config.save()).await??;
+        crate::utils::strip_paths(&mut patch, crate::config::FORBIDDEN_PATHS);
+
+        let mut doc = match serde_json::to_value(&**state.config.load()) {
+            Ok(doc) => doc,
+            Err(err) => {
+                tracing::error!("failed to serialize current config: {err}");
+                return ApiResponse::error("failed to read current config")
+                    .with_status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .ok();
+            }
+        };
+
+        json_patch::merge(&mut doc, &patch);
+
+        let new_config: InnerConfig = match serde_json::from_value(doc) {
+            Ok(c) => c,
+            Err(err) => {
+                return ApiResponse::error(&format!("invalid config patch: {err}"))
+                    .with_status(axum::http::StatusCode::BAD_REQUEST)
+                    .ok();
+            }
+        };
+
+        if let Err(err) = state.config.replace(new_config) {
+            return ApiResponse::error(&format!("failed to apply config patch: {err}"))
+                .with_status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .ok();
+        }
 
         ApiResponse::new_serialized(Response { applied: true }).ok()
     }

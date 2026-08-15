@@ -1,9 +1,8 @@
+use crate::routes::MimeCacheValue;
 use std::{
     path::{Path, PathBuf},
     sync::LazyLock,
 };
-
-use crate::routes::MimeCacheValue;
 
 pub fn draw_progress_bar(width: usize, current: f64, total: f64) -> String {
     let progress_percentage = (current / total) * 100.0;
@@ -33,23 +32,30 @@ pub fn draw_progress_bar(width: usize, current: f64, total: f64) -> String {
     format!("[{bar}] {formatted_percentage}")
 }
 
+#[inline]
+pub fn slice_after_question_mark(s: &str) -> &str {
+    s.split_once('?').map(|(_, after)| after).unwrap_or("")
+}
+
 pub fn parse_content_disposition_filename(header: &str) -> Option<String> {
-    static RE_STAR: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?i)filename\*=utf-8''([^;]+)").unwrap());
+    static RE_STAR: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?i)filename\*=utf-8''([^;]+)").expect("Failed to compile regex")
+    });
 
     if let Some(caps) = RE_STAR.captures(header) {
         let encoded_filename = &caps[1];
 
         if let Ok(decoded) = percent_encoding::percent_decode_str(encoded_filename).decode_utf8() {
-            return Some(decoded.into_owned());
+            return Some(slice_after_question_mark(&decoded).to_string());
         }
     }
 
-    static RE_LEGACY: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r#"(?i)filename="?([^";]+)"?"#).unwrap());
+    static RE_LEGACY: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)filename="?([^";]+)"?"#).expect("Failed to compile regex")
+    });
 
     if let Some(caps) = RE_LEGACY.captures(header) {
-        return Some(caps[1].to_string());
+        return Some(slice_after_question_mark(&caps[1]).to_string());
     }
 
     None
@@ -145,16 +151,33 @@ pub fn deduplicate_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 #[inline]
 pub fn is_valid_utf8_slice(s: &[u8]) -> bool {
-    let mut idx = s.len();
-    while idx > s.len().saturating_sub(4) {
-        if str::from_utf8(&s[..idx]).is_ok() {
-            return true;
-        }
-
-        idx -= 1;
+    match str::from_utf8(s) {
+        Ok(_) => true,
+        Err(e) => e.error_len().is_none(),
     }
+}
 
-    false
+pub fn strip_paths(value: &mut serde_json::Value, paths: &[&str]) {
+    for path in paths {
+        let mut cursor = &mut *value;
+        let mut parts = path.split('.').peekable();
+
+        while let Some(part) = parts.next() {
+            let serde_json::Value::Object(map) = cursor else {
+                break;
+            };
+
+            if parts.peek().is_none() {
+                map.remove(part);
+                break;
+            }
+
+            match map.get_mut(part) {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -164,14 +187,12 @@ pub struct PortablePermissions {
 
 impl PortablePermissions {
     pub fn from_mode(mode: u32) -> Self {
-        Self { mode }
+        Self {
+            mode: mode & 0o0777,
+        }
     }
 
-    pub fn is_readonly(&self) -> bool {
-        self.mode & 0o200 == 0
-    }
-
-    pub fn into_os(self) -> Option<std::fs::Permissions> {
+    pub fn into_std_permissions(self) -> Option<std::fs::Permissions> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -306,5 +327,35 @@ impl PortableSizeExt for cap_std::fs::Metadata {
 
     fn size_physical(&self) -> u64 {
         self.len()
+    }
+}
+
+pub trait StdoutTakeExt: Sized {
+    fn take_stdout(&mut self) -> Result<std::process::ChildStdout, std::io::Error>;
+    fn into_stdout(mut self) -> Result<std::process::ChildStdout, std::io::Error> {
+        self.take_stdout()
+    }
+}
+
+impl StdoutTakeExt for std::process::Child {
+    fn take_stdout(&mut self) -> Result<std::process::ChildStdout, std::io::Error> {
+        self.stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("No stdout available"))
+    }
+}
+
+pub trait TokioStdoutTakeExt: Sized {
+    fn take_stdout(&mut self) -> Result<tokio::process::ChildStdout, std::io::Error>;
+    fn into_stdout(mut self) -> Result<tokio::process::ChildStdout, std::io::Error> {
+        self.take_stdout()
+    }
+}
+
+impl TokioStdoutTakeExt for tokio::process::Child {
+    fn take_stdout(&mut self) -> Result<tokio::process::ChildStdout, std::io::Error> {
+        self.stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("No stdout available"))
     }
 }

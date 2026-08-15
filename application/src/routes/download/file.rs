@@ -5,6 +5,7 @@ pub(crate) mod get {
     use std::path::Path;
 
     use crate::{
+        io::fixed_reader::AsyncFixedReader,
         response::{ApiResponse, ApiResponseResult},
         routes::GetState,
         server::filesystem::virtualfs::ByteRange,
@@ -56,7 +57,11 @@ pub(crate) mod get {
             }
         };
 
-        if let Err(err) = payload.base.validate(&state.config.jwt).await {
+        if let Err(err) = payload
+            .base
+            .validate(&state.config.jwt, Some("file-download"))
+            .await
+        {
             return ApiResponse::error(&format!("invalid token: {err}"))
                 .with_status(StatusCode::UNAUTHORIZED)
                 .ok();
@@ -154,15 +159,16 @@ pub(crate) mod get {
             headers.insert("Last-Modified", modified.to_rfc2822().parse()?);
         }
 
+        let reader =
+            AsyncFixedReader::new_with_fixed_bytes(file_read.reader, metadata.size as usize);
+
         if file_read.reader_range.is_some() {
-            ApiResponse::new_stream(file_read.reader)
+            ApiResponse::new_stream(reader)
                 .with_headers(headers)
                 .with_status(StatusCode::PARTIAL_CONTENT)
                 .ok()
         } else {
-            ApiResponse::new_stream(file_read.reader)
-                .with_headers(headers)
-                .ok()
+            ApiResponse::new_stream(reader).with_headers(headers).ok()
         }
     }
 }

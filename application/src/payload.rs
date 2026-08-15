@@ -27,10 +27,6 @@ const AVAILABLE_DESERIALIZERS: &[mime::Mime] = &[mime::APPLICATION_JSON, mime::A
 pub struct Payload<T: DeserializeOwned>(pub T);
 
 impl<T: DeserializeOwned> Payload<T> {
-    pub fn into_inner(self) -> T {
-        self.0
-    }
-
     pub fn from_bytes(content_type: mime::Mime, bytes: &Bytes) -> Result<Self, PayloadRejection> {
         match content_type.essence_str() {
             m if m == mime::APPLICATION_JSON.essence_str() => {

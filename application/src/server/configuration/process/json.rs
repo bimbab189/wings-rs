@@ -36,7 +36,7 @@ impl super::ProcessConfigurationFileParser for JsonFileParser {
                 other => other.clone(),
             };
 
-            let path: Vec<&str> = replacement.r#match.split('.').collect();
+            let path = parse_path(&replacement.r#match);
             set_nested_value(
                 &mut json,
                 &path,
@@ -50,36 +50,128 @@ impl super::ProcessConfigurationFileParser for JsonFileParser {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum PathSegment<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+pub fn parse_path(raw: &str) -> Vec<PathSegment<'_>> {
+    let mut out = Vec::new();
+
+    for part in raw.split('.') {
+        if part.is_empty() {
+            continue;
+        }
+
+        let (key, mut rest) = match part.find('[') {
+            Some(bracket) => part.split_at(bracket),
+            None => {
+                out.push(PathSegment::Key(part));
+                continue;
+            }
+        };
+
+        if !key.is_empty() {
+            out.push(PathSegment::Key(key));
+        }
+
+        while let Some((head, tail)) = rest.split_once(']') {
+            if let Some(idx_str) = head.strip_prefix('[')
+                && let Ok(idx) = idx_str.parse::<usize>()
+            {
+                out.push(PathSegment::Index(idx));
+            }
+            rest = tail;
+        }
+    }
+
+    out
+}
+
 pub fn set_nested_value(
     json: &mut serde_json::Value,
-    path: &[&str],
+    path: &[PathSegment<'_>],
     value: serde_json::Value,
     insert_new: bool,
     update_existing: bool,
 ) {
-    if path.is_empty() {
+    let Some((head, tail)) = path.split_first() else {
         return;
+    };
+
+    match head {
+        PathSegment::Key(_) if !json.is_object() => {
+            *json = serde_json::Value::Object(serde_json::Map::new());
+        }
+        PathSegment::Index(_) if !json.is_array() => {
+            *json = serde_json::Value::Array(Vec::new());
+        }
+        _ => {}
     }
 
-    if !json.is_object() {
-        *json = serde_json::Value::Object(serde_json::Map::new());
-    }
+    let Some(tail_first) = tail.first() else {
+        match head {
+            PathSegment::Key(k) => {
+                let Some(map) = json.as_object_mut() else {
+                    return;
+                };
+                let exists = map.contains_key(*k);
 
-    let map = json.as_object_mut().unwrap();
+                if (exists && update_existing) || (!exists && insert_new) {
+                    map.insert((*k).to_string(), value);
+                }
+            }
+            PathSegment::Index(i) => {
+                let Some(arr) = json.as_array_mut() else {
+                    return;
+                };
+                let mut arr_element = arr.get_mut(*i);
 
-    if path.len() == 1 {
-        let key = path[0].to_string();
-        let exists = map.contains_key(&key);
-
-        if (exists && update_existing) || (!exists && insert_new) {
-            map.insert(key, value);
+                if let Some(el) = arr_element.as_mut()
+                    && update_existing
+                {
+                    **el = value;
+                } else if arr_element.is_none() && insert_new {
+                    while arr.len() < *i {
+                        arr.push(serde_json::Value::Null);
+                    }
+                    arr.push(value);
+                }
+            }
         }
         return;
+    };
+
+    let default_child = || {
+        if matches!(tail_first, PathSegment::Index(_)) {
+            serde_json::Value::Array(Vec::new())
+        } else {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+    };
+
+    match head {
+        PathSegment::Key(k) => {
+            let Some(map) = json.as_object_mut() else {
+                return;
+            };
+
+            let child = map.entry((*k).to_string()).or_insert_with(default_child);
+            set_nested_value(child, tail, value, insert_new, update_existing);
+        }
+        PathSegment::Index(i) => {
+            let Some(arr) = json.as_array_mut() else {
+                return;
+            };
+
+            while arr.len() <= *i {
+                arr.push(default_child());
+            }
+            let Some(el) = arr.get_mut(*i) else {
+                return;
+            };
+            set_nested_value(el, tail, value, insert_new, update_existing);
+        }
     }
-
-    let child = map
-        .entry(path[0].to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-
-    set_nested_value(child, &path[1..], value, insert_new, update_existing);
 }

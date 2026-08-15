@@ -126,7 +126,8 @@ pub(crate) mod post_session {
             .await?;
 
         if created {
-            let terminal_socket = PathBuf::from(&state.config.web_ide.runtime_directory)
+            let runtime_directory = state.config.load().web_ide.runtime_directory.clone();
+            let terminal_socket = PathBuf::from(runtime_directory)
                 .join(data.session_uuid.to_string())
                 .join("terminal.sock");
             if let Err(error) = crate::routes::api::web_ide::start_local_terminal_listener(
@@ -153,7 +154,8 @@ pub(crate) mod post_session {
                     .ok();
             }
 
-            let addon_tools_socket = PathBuf::from(&state.config.web_ide.runtime_directory)
+            let runtime_directory = state.config.load().web_ide.runtime_directory.clone();
+            let addon_tools_socket = PathBuf::from(runtime_directory)
                 .join(data.session_uuid.to_string())
                 .join("addon-tools.sock");
             if let Err(error) = crate::routes::api::web_ide::start_local_addon_tools_listener(

@@ -30,8 +30,11 @@ pub(crate) mod get {
     #[derive(ToSchema, Serialize)]
     struct Response {
         total: usize,
+
+        filesystem_primary: bool,
         filesystem_writable: bool,
         filesystem_fast: bool,
+
         entries: Vec<crate::models::DirectoryEntry>,
     }
 
@@ -73,7 +76,7 @@ pub(crate) mod get {
     ) -> ApiResponseResult {
         let per_page = match data.per_page {
             Some(per_page) => Some(per_page),
-            None => match state.config.api.directory_entry_limit {
+            None => match state.config.load().api.directory_entry_limit {
                 0 => None,
                 limit => Some(limit),
             },
@@ -129,6 +132,7 @@ pub(crate) mod get {
 
         ApiResponse::new_serialized(Response {
             total: entries.total_entries,
+            filesystem_primary: filesystem.is_primary_server_fs(),
             filesystem_writable: filesystem.is_writable(),
             filesystem_fast: filesystem.is_fast(),
             entries: entries.entries,

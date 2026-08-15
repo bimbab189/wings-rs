@@ -55,7 +55,11 @@ pub(crate) mod get {
             }
         };
 
-        if let Err(err) = payload.base.validate(&state.config.jwt).await {
+        if let Err(err) = payload
+            .base
+            .validate(&state.config.jwt, Some("file-download"))
+            .await
+        {
             return ApiResponse::error(&format!("invalid token: {err}"))
                 .with_status(StatusCode::UNAUTHORIZED)
                 .ok();
@@ -142,7 +146,7 @@ pub(crate) mod get {
                 &path,
                 payload.file_paths.into_iter().map(PathBuf::from).collect(),
                 data.archive_format,
-                state.config.system.backups.compression_level,
+                state.config.load().system.backups.compression_level,
                 None,
                 ignore,
             )

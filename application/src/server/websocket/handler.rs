@@ -146,10 +146,11 @@ pub async fn handle_ws(
                             );
 
                             websocket_handler.send_message(
-                                websocket::WebsocketMessage::new(
+                                websocket::WebsocketMessage::builder(
                                     websocket::WebsocketEvent::JwtError,
-                                    [err.to_compact_string()].into(),
-                                ),
+                                )
+                                .arg(err.to_compact_string())
+                                .build(),
                             )
                             .await;
                         }
@@ -161,10 +162,11 @@ pub async fn handle_ws(
                             );
 
                             websocket_handler.send_message(
-                                websocket::WebsocketMessage::new(
+                                websocket::WebsocketMessage::builder(
                                     websocket::WebsocketEvent::JwtError,
-                                    [err.to_compact_string()].into(),
-                                ),
+                                )
+                                .arg(err.to_compact_string())
+                                .build(),
                             )
                             .await;
                         }
@@ -243,10 +245,11 @@ pub async fn handle_ws(
                                             );
 
                                             websocket_handler.send_message(
-                                                websocket::WebsocketMessage::new(
+                                                websocket::WebsocketMessage::builder(
                                                     websocket::WebsocketEvent::JwtError,
-                                                    [err.to_compact_string()].into(),
-                                                ),
+                                                )
+                                                .arg(err.to_compact_string())
+                                                .build(),
                                             )
                                             .await;
                                         }
@@ -281,7 +284,7 @@ pub async fn handle_ws(
                                             }
                                         };
 
-                                        if let Err(err) = socket_jwt.base.validate(&state.config.jwt).await {
+                                        if let Err(err) = socket_jwt.base.validate(&state.config.jwt, Some("websocket")).await {
                                             tracing::debug!(
                                                 server = %server.uuid,
                                                 "invalid jwt when receiving targeted websocket message: {}",
@@ -328,7 +331,7 @@ pub async fn handle_ws(
                             continue;
                         }
 
-                        if let Some(mut stdout) = server.container_stdout().await {
+                        if let Some(mut stdout) = server.get_stdout_lines_ratelimited().await {
                             loop {
                                 match stdout.recv().await {
                                     Ok(stdout) => {
@@ -342,10 +345,11 @@ pub async fn handle_ws(
                                         }
 
                                         websocket_handler.send_message(
-                                            websocket::WebsocketMessage::new(
+                                            websocket::WebsocketMessage::builder(
                                                 websocket::WebsocketEvent::ServerConsoleOutput,
-                                                [stdout.to_compact_string()].into(),
-                                            ),
+                                            )
+                                            .arg(stdout.to_compact_string())
+                                            .build(),
                                         )
                                         .await;
                                     }

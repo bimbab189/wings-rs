@@ -105,7 +105,7 @@ pub(crate) mod post {
             }
         };
 
-        if let Err(err) = payload.validate(&state.config.jwt).await {
+        if let Err(err) = payload.validate(&state.config.jwt, Some("transfer")).await {
             return ApiResponse::error(&format!("invalid token: {err}"))
                 .with_status(StatusCode::UNAUTHORIZED)
                 .ok();
@@ -207,56 +207,196 @@ pub(crate) mod post {
                                 let reader = AbortReader::new(reader, listener.clone());
                                 let reader = LimitedReader::new_with_bytes_per_second(
                                     reader,
-                                    state.config.system.transfers.download_limit.as_bytes(),
+                                    state
+                                        .config
+                                        .load()
+                                        .system
+                                        .transfers
+                                        .download_limit
+                                        .as_bytes(),
                                 );
                                 let reader =
                                     HashReader::new_with_hasher(reader, sha2::Sha256::new());
-                                let reader = CompressionReader::new(
+                                let mut reader = CompressionReader::new(
                                     reader,
                                     TransferArchiveFormat::from_str(&file_name)
                                         .map_or(CompressionType::Gz, |f| f.compression_format()),
                                 )?;
 
-                                let mut archive = tar::Archive::new(reader);
-                                let mut directory_entries = chunked_vec::ChunkedVec::new();
-                                let mut entries = archive.entries()?;
+                                if TransferArchiveFormat::from_str(&file_name)
+                                    .is_ok_and(|f| f.is_itaf())
+                                {
+                                    let archive = itaf::decoder::ItafDecoder::new(&mut reader)?;
+                                    let mut directory_entries = chunked_vec::ChunkedVec::new();
+                                    let mut entries = archive.entries();
 
-                                let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
-                                while let Some(Ok(mut entry)) = entries.next() {
-                                    let path = entry.path()?;
+                                    let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
+                                    while let Some(Ok(mut entry)) = entries.next() {
+                                        let destination_path = entry.enclosed_path();
+                                        if destination_path.as_os_str().is_empty()
+                                            || destination_path.is_absolute()
+                                        {
+                                            continue;
+                                        }
 
-                                    if path.is_absolute() {
-                                        continue;
-                                    }
+                                        match &mut entry {
+                                            itaf::decoder::ArchiveEntry::Directory(dir) => {
+                                                server
+                                                    .filesystem
+                                                    .create_dir_all(&destination_path)?;
 
-                                    let destination_path = path.as_ref();
-                                    let header = entry.header();
-
-                                    match header.entry_type() {
-                                        tar::EntryType::Directory => {
-                                            server.filesystem.create_dir_all(destination_path)?;
-                                            if let Ok(permissions) =
-                                                header.mode().map(PortablePermissions::from_mode)
-                                            {
+                                                let meta = dir.metadata();
                                                 server.filesystem.set_permissions(
-                                                    destination_path,
-                                                    permissions,
+                                                    &destination_path,
+                                                    PortablePermissions::from_mode(meta.mode),
                                                 )?;
-                                            }
 
-                                            if let Ok(modified_time) = header.mtime() {
-                                                directory_entries.push((
-                                                    destination_path.to_path_buf(),
-                                                    modified_time,
-                                                ));
+                                                directory_entries
+                                                    .push((destination_path, meta.modified));
+                                            }
+                                            itaf::decoder::ArchiveEntry::File(file_entry) => {
+                                                if let Some(parent) = destination_path.parent() {
+                                                    server.filesystem.create_dir_all(parent)?;
+                                                }
+
+                                                let meta = file_entry.metadata().clone();
+                                                let mut writer =
+                                                    crate::server::filesystem::writer::FileSystemWriter::new(
+                                                        server.clone(),
+                                                        &destination_path,
+                                                        Some(PortablePermissions::from_mode(meta.mode)),
+                                                        Some(cap_std::time::SystemTime::from_std(meta.modified)),
+                                                    )?
+                                                    .ignorant();
+
+                                                crate::io::copy_shared(
+                                                    &mut read_buffer,
+                                                    file_entry,
+                                                    &mut writer,
+                                                )?;
+                                                writer.flush()?;
+                                            }
+                                            itaf::decoder::ArchiveEntry::Symlink(sym) => {
+                                                let target = sym.target().to_path_buf();
+                                                let meta_modified = sym.metadata().modified;
+
+                                                if let Some(parent) = destination_path.parent()
+                                                    && !parent.as_os_str().is_empty()
+                                                {
+                                                    server.filesystem.create_dir_all(parent)?;
+                                                }
+
+                                                if let Err(err) = server
+                                                    .filesystem
+                                                    .symlink(target, &destination_path)
+                                                {
+                                                    tracing::debug!(
+                                                        path = %destination_path.display(),
+                                                        "failed to create symlink from itaf archive: {:#?}",
+                                                        err
+                                                    );
+                                                } else {
+                                                    server.filesystem.set_times(
+                                                        &destination_path,
+                                                        meta_modified,
+                                                        None,
+                                                    )?;
+                                                }
+                                            }
+                                            itaf::decoder::ArchiveEntry::Hardlink(link) => {
+                                                let target_path = link.enclosed_target();
+                                                if target_path.as_os_str().is_empty()
+                                                    || target_path.is_absolute()
+                                                {
+                                                    tracing::debug!(
+                                                        path = %destination_path.display(),
+                                                        "skipping hardlink with invalid target: {}",
+                                                        target_path.display()
+                                                    );
+                                                    continue;
+                                                }
+
+                                                if let Some(parent) = destination_path.parent()
+                                                    && !parent.as_os_str().is_empty()
+                                                {
+                                                    server.filesystem.create_dir_all(parent)?;
+                                                }
+
+                                                if let Err(err) = server.filesystem.hard_link(
+                                                    &target_path,
+                                                    &server.filesystem,
+                                                    &destination_path,
+                                                ) {
+                                                    tracing::debug!(
+                                                        path = %destination_path.display(),
+                                                        target = %target_path.display(),
+                                                        "failed to create hardlink from itaf archive: {:#?}",
+                                                        err
+                                                    );
+                                                }
                                             }
                                         }
-                                        tar::EntryType::Regular => {
-                                            if let Some(parent) = destination_path.parent() {
-                                                server.filesystem.create_dir_all(parent)?;
-                                            }
+                                    }
 
-                                            let mut writer =
+                                    for (destination_path, modified_time) in directory_entries {
+                                        server.filesystem.set_times(
+                                            &destination_path,
+                                            modified_time,
+                                            None,
+                                        )?;
+                                    }
+
+                                    let mut inner = reader.into_inner();
+                                    crate::io::copy_shared(
+                                        &mut read_buffer,
+                                        &mut inner,
+                                        &mut std::io::sink(),
+                                    )?;
+                                    archive_checksum = Some(inner.finish());
+                                } else {
+                                    let mut archive = tar::Archive::new(reader);
+                                    let mut directory_entries = chunked_vec::ChunkedVec::new();
+                                    let mut entries = archive.entries()?;
+
+                                    let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
+                                    while let Some(Ok(mut entry)) = entries.next() {
+                                        let path = entry.path()?;
+
+                                        if path.is_absolute() {
+                                            continue;
+                                        }
+
+                                        let destination_path = path.as_ref();
+                                        let header = entry.header();
+
+                                        match header.entry_type() {
+                                            tar::EntryType::Directory => {
+                                                server
+                                                    .filesystem
+                                                    .create_dir_all(destination_path)?;
+                                                if let Ok(permissions) = header
+                                                    .mode()
+                                                    .map(PortablePermissions::from_mode)
+                                                {
+                                                    server.filesystem.set_permissions(
+                                                        destination_path,
+                                                        permissions,
+                                                    )?;
+                                                }
+
+                                                if let Ok(modified_time) = header.mtime() {
+                                                    directory_entries.push((
+                                                        destination_path.to_path_buf(),
+                                                        modified_time,
+                                                    ));
+                                                }
+                                            }
+                                            tar::EntryType::Regular => {
+                                                if let Some(parent) = destination_path.parent() {
+                                                    server.filesystem.create_dir_all(parent)?;
+                                                }
+
+                                                let mut writer =
                                                 crate::server::filesystem::writer::FileSystemWriter::new(
                                                     server.clone(),
                                                     destination_path,
@@ -273,58 +413,60 @@ pub(crate) mod post {
                                                 )?
                                                 .ignorant();
 
-                                            crate::io::copy_shared(
-                                                &mut read_buffer,
-                                                &mut entry,
-                                                &mut writer,
-                                            )?;
-                                            writer.flush()?;
-                                        }
-                                        tar::EntryType::Symlink => {
-                                            let link = entry
-                                                .link_name()
-                                                .unwrap_or_default()
-                                                .unwrap_or_default();
-
-                                            if let Err(err) =
-                                                server.filesystem.symlink(link, destination_path)
-                                            {
-                                                tracing::debug!(
-                                                    path = %destination_path.display(),
-                                                    "failed to create symlink from archive: {:#?}",
-                                                    err
-                                                );
-                                            } else if let Ok(modified_time) = header.mtime() {
-                                                server.filesystem.set_times(
-                                                    destination_path,
-                                                    std::time::UNIX_EPOCH
-                                                        + std::time::Duration::from_secs(
-                                                            modified_time,
-                                                        ),
-                                                    None,
+                                                crate::io::copy_shared(
+                                                    &mut read_buffer,
+                                                    &mut entry,
+                                                    &mut writer,
                                                 )?;
+                                                writer.flush()?;
                                             }
+                                            tar::EntryType::Symlink => {
+                                                let link = entry
+                                                    .link_name()
+                                                    .unwrap_or_default()
+                                                    .unwrap_or_default();
+
+                                                if let Err(err) = server
+                                                    .filesystem
+                                                    .symlink(link, destination_path)
+                                                {
+                                                    tracing::debug!(
+                                                        path = %destination_path.display(),
+                                                        "failed to create symlink from archive: {:#?}",
+                                                        err
+                                                    );
+                                                } else if let Ok(modified_time) = header.mtime() {
+                                                    server.filesystem.set_times(
+                                                        destination_path,
+                                                        std::time::UNIX_EPOCH
+                                                            + std::time::Duration::from_secs(
+                                                                modified_time,
+                                                            ),
+                                                        None,
+                                                    )?;
+                                                }
+                                            }
+                                            _ => {}
                                         }
-                                        _ => {}
                                     }
-                                }
 
-                                for (destination_path, modified_time) in directory_entries {
-                                    server.filesystem.set_times(
-                                        &destination_path,
-                                        std::time::UNIX_EPOCH
-                                            + std::time::Duration::from_secs(modified_time),
-                                        None,
+                                    for (destination_path, modified_time) in directory_entries {
+                                        server.filesystem.set_times(
+                                            &destination_path,
+                                            std::time::UNIX_EPOCH
+                                                + std::time::Duration::from_secs(modified_time),
+                                            None,
+                                        )?;
+                                    }
+
+                                    let mut inner = archive.into_inner().into_inner();
+                                    crate::io::copy_shared(
+                                        &mut read_buffer,
+                                        &mut inner,
+                                        &mut std::io::sink(),
                                     )?;
+                                    archive_checksum = Some(inner.finish());
                                 }
-
-                                let mut inner = archive.into_inner().into_inner();
-                                crate::io::copy_shared(
-                                    &mut read_buffer,
-                                    &mut inner,
-                                    &mut std::io::sink(),
-                                )?;
-                                archive_checksum = Some(inner.finish());
                             } else if field.name() == Some("checksum") {
                                 let archive_checksum = match archive_checksum.take() {
                                     Some(checksum) => hex::encode(checksum),
@@ -423,8 +565,19 @@ pub(crate) mod post {
 
                                 match field.content_type() {
                                     Some("backup/wings") => {
+                                        if file_name.contains("..")
+                                            || file_name.contains('/')
+                                            || file_name.contains('\\')
+                                        {
+                                            tracing::warn!(
+                                                "invalid backup file name: {}",
+                                                file_name
+                                            );
+                                            continue;
+                                        }
+
                                         let file_name =
-                                            Path::new(&state.config.system.backup_directory)
+                                            Path::new(&state.config.load().system.backup_directory)
                                                 .join(file_name);
                                         let reader = tokio_util::io::StreamReader::new(
                                             field.into_stream().map_err(|err| {
@@ -437,7 +590,13 @@ pub(crate) mod post {
                                         let reader = AbortReader::new(reader, listener.clone());
                                         let reader = LimitedReader::new_with_bytes_per_second(
                                             reader,
-                                            state.config.system.transfers.download_limit.as_bytes(),
+                                            state
+                                                .config
+                                                .load()
+                                                .system
+                                                .transfers
+                                                .download_limit
+                                                .as_bytes(),
                                         );
                                         let mut reader = HashReader::new_with_hasher(
                                             reader,
@@ -578,140 +737,185 @@ pub(crate) mod post {
                 },
             );
 
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel::<bool>();
+
             if multiplex_stream_count > 0 {
-                let mut tries = 0;
+                tokio::spawn({
+                    let server = server.clone();
+                    let state = state.clone();
+                    async move {
+                        let mut tries = 0;
 
-                loop {
-                    let mut server_transfer = server.incoming_transfer.write().await;
+                        loop {
+                            {
+                                let guard = server.incoming_transfer.read().await;
+                                if guard.as_ref().is_some_and(|t| {
+                                    t.multiplex_handles.len() >= multiplex_stream_count
+                                }) {
+                                    break;
+                                }
+                            }
+                            tries += 1;
+                            if tries > 10 {
+                                tracing::error!(
+                                    server = %server.uuid,
+                                    "timed out waiting for multiplex streams to connect"
+                                );
+                                state
+                                    .config
+                                    .client
+                                    .set_server_transfer(subject, false, vec![])
+                                    .await
+                                    .ok();
 
-                    tries += 1;
-
-                    let incoming_transfer = match &mut *server_transfer {
-                        Some(transfer) => transfer,
-                        None => {
-                            return ApiResponse::error(
-                                "unable to get incoming transfer for multiplex",
-                            )
-                            .with_status(StatusCode::CONFLICT)
-                            .ok();
-                        }
-                    };
-
-                    if incoming_transfer.multiplex_handles.len() != multiplex_stream_count {
-                        if tries > 10 {
-                            return ApiResponse::error(
-                                "unable to get incoming transfer for multiplex join",
-                            )
-                            .with_status(StatusCode::CONFLICT)
-                            .ok();
-                        } else {
+                                result_tx.send(false).ok();
+                                return;
+                            }
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            continue;
+                        }
+
+                        let mut incoming = match server.incoming_transfer.write().await.take() {
+                            Some(t) => t,
+                            None => {
+                                result_tx.send(false).ok();
+                                return;
+                            }
+                        };
+
+                        match incoming.try_join_handles(handle).await {
+                            Ok(backups) => {
+                                tracing::info!(
+                                    server = %server.uuid,
+                                    "server transfer completed successfully"
+                                );
+                                if state
+                                    .config
+                                    .client
+                                    .set_server_transfer(subject, true, backups)
+                                    .await
+                                    .is_ok()
+                                {
+                                    server.transferring.store(false, Ordering::SeqCst);
+                                    server
+                                        .websocket
+                                        .send(
+                                            crate::server::websocket::WebsocketMessage::builder(
+                                                crate::server::websocket::WebsocketEvent::ServerTransferStatus,
+                                            )
+                                            .arg("completed")
+                                            .build(),
+                                        )
+                                        .ok();
+                                    result_tx.send(true).ok();
+                                } else {
+                                    state
+                                        .config
+                                        .client
+                                        .set_server_transfer(subject, false, vec![])
+                                        .await
+                                        .ok();
+
+                                    result_tx.send(false).ok();
+                                }
+                            }
+                            Err(err) => {
+                                tracing::error!(
+                                    server = %server.uuid,
+                                    "failed to complete server transfer: {:#?}",
+                                    err
+                                );
+                                state
+                                    .config
+                                    .client
+                                    .set_server_transfer(subject, false, vec![])
+                                    .await
+                                    .ok();
+
+                                result_tx.send(false).ok();
+                            }
                         }
                     }
-
-                    match incoming_transfer.try_join_handles(handle).await {
-                        Ok(backups) => {
-                            tracing::info!(
-                                server = %server.uuid,
-                                "server transfer completed successfully"
-                            );
-
-                            state
-                                .config
-                                .client
-                                .set_server_transfer(subject, true, backups)
-                                .await?;
-                            server.transferring.store(false, Ordering::SeqCst);
-                            server
-                                .websocket
-                                .send(crate::server::websocket::WebsocketMessage::new(
-                                    crate::server::websocket::WebsocketEvent::ServerTransferStatus,
-                                    ["completed".into()].into(),
-                                ))
-                                .ok();
-                        }
-                        Err(err) => {
-                            tracing::error!(
-                                server = %server.uuid,
-                                "failed to complete server transfer: {:#?}",
-                                err
-                            );
-
-                            state
-                                .config
-                                .client
-                                .set_server_transfer(subject, false, vec![])
-                                .await
-                                .unwrap_or_default();
-
-                            return ApiResponse::error("failed to complete server transfer")
-                                .with_status(StatusCode::EXPECTATION_FAILED)
-                                .ok();
-                        }
-                    }
-
-                    break;
-                }
+                });
             } else {
-                match handle.await {
-                    Ok(Ok(backups)) => {
-                        tracing::info!(
-                            server = %server.uuid,
-                            "server transfer completed successfully"
-                        );
+                tokio::spawn({
+                    let server = server.clone();
+                    let state = state.clone();
+                    async move {
+                        match handle.await {
+                            Ok(Ok(backups)) => {
+                                tracing::info!(
+                                    server = %server.uuid,
+                                    "server transfer completed successfully"
+                                );
+                                if state
+                                    .config
+                                    .client
+                                    .set_server_transfer(subject, true, backups)
+                                    .await
+                                    .is_ok()
+                                {
+                                    server.transferring.store(false, Ordering::SeqCst);
+                                    server
+                                        .websocket
+                                        .send(
+                                            crate::server::websocket::WebsocketMessage::builder(
+                                                crate::server::websocket::WebsocketEvent::ServerTransferStatus,
+                                            )
+                                            .arg("completed")
+                                            .build(),
+                                        )
+                                        .ok();
+                                    result_tx.send(true).ok();
+                                } else {
+                                    state
+                                        .config
+                                        .client
+                                        .set_server_transfer(subject, false, vec![])
+                                        .await
+                                        .ok();
 
-                        state
-                            .config
-                            .client
-                            .set_server_transfer(subject, true, backups)
-                            .await?;
-                        server.transferring.store(false, Ordering::SeqCst);
-                        server
-                            .websocket
-                            .send(crate::server::websocket::WebsocketMessage::new(
-                                crate::server::websocket::WebsocketEvent::ServerTransferStatus,
-                                ["completed".into()].into(),
-                            ))
-                            .ok();
+                                    result_tx.send(false).ok();
+                                }
+                            }
+                            Ok(Err(err)) => {
+                                tracing::error!(
+                                    server = %server.uuid,
+                                    "failed to complete server transfer: {:#?}",
+                                    err
+                                );
+                                state
+                                    .config
+                                    .client
+                                    .set_server_transfer(subject, false, vec![])
+                                    .await
+                                    .ok();
+
+                                result_tx.send(false).ok();
+                            }
+                            Err(err) => {
+                                tracing::error!(
+                                    server = %server.uuid,
+                                    "failed to complete server transfer: {:#?}",
+                                    err
+                                );
+                                state
+                                    .config
+                                    .client
+                                    .set_server_transfer(subject, false, vec![])
+                                    .await
+                                    .ok();
+
+                                result_tx.send(false).ok();
+                            }
+                        }
                     }
-                    Ok(Err(err)) => {
-                        tracing::error!(
-                            server = %server.uuid,
-                            "failed to complete server transfer: {:#?}",
-                            err
-                        );
+                });
+            }
 
-                        state
-                            .config
-                            .client
-                            .set_server_transfer(subject, false, vec![])
-                            .await
-                            .unwrap_or_default();
-
-                        return ApiResponse::error("failed to complete server transfer")
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            server = %server.uuid,
-                            "failed to complete server transfer: {:#?}",
-                            err
-                        );
-
-                        state
-                            .config
-                            .client
-                            .set_server_transfer(subject, false, vec![])
-                            .await
-                            .unwrap_or_default();
-
-                        return ApiResponse::error("failed to complete server transfer")
-                            .with_status(StatusCode::EXPECTATION_FAILED)
-                            .ok();
-                    }
-                }
+            if !result_rx.await.unwrap_or(false) {
+                return ApiResponse::error("failed to complete server transfer")
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
             }
         }
 

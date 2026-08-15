@@ -1,5 +1,6 @@
 use super::ServerHandle;
 use crate::{
+    io::{SafeDigest, SafeSlice, SafeWrite},
     server::{
         activity::{Activity, ActivityEvent},
         permissions::Permission,
@@ -16,6 +17,13 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::bytes::BufMut;
+
+fn map_ser_err(err: impl Into<russh_sftp::client::error::Error>) -> StatusCode {
+    let err = err.into();
+    tracing::error!("russh serialization error: {}", err);
+
+    StatusCode::Failure
+}
 
 pub async fn handle_extended(
     sftp_session: &mut super::SftpSession,
@@ -108,150 +116,158 @@ pub async fn handle_extended(
                     }
                 }
 
-                let mut buffer = vec![0; crate::BUFFER_SIZE];
+                let mut run_hash = async || -> Result<Vec<u8>, std::io::Error> {
+                    let mut buffer = vec![0; crate::BUFFER_SIZE];
 
-                let hash: Vec<u8> = match hash_algorithm {
-                    "md5" => {
-                        let mut hasher = md5::Context::new();
+                    Ok(match hash_algorithm {
+                        "md5" => {
+                            let mut hasher = md5::Context::new();
 
-                        loop {
-                            let bytes_read = file
-                                .read(&mut buffer)
-                                .await
-                                .map_err(|_| StatusCode::Failure)?;
-                            total_bytes_read += bytes_read as u64;
+                            loop {
+                                let bytes_read = file.read(&mut buffer).await?;
+                                total_bytes_read += bytes_read as u64;
 
-                            if bytes_read == 0 {
-                                break;
+                                if bytes_read == 0 {
+                                    break;
+                                }
+
+                                let bytes_read =
+                                    bytes(request.length, bytes_read, total_bytes_read);
+                                hasher.safe_write_all(&buffer, bytes_read)?;
                             }
 
-                            let bytes_read = bytes(request.length, bytes_read, total_bytes_read);
-                            hasher.consume(&buffer[..bytes_read]);
+                            (*hasher.finalize()).into()
                         }
+                        "crc32" => {
+                            let mut hasher = crc32fast::Hasher::new();
 
-                        (*hasher.finalize()).into()
-                    }
-                    "crc32" => {
-                        let mut hasher = crc32fast::Hasher::new();
+                            loop {
+                                let bytes_read = file.read(&mut buffer).await?;
+                                total_bytes_read += bytes_read as u64;
 
-                        loop {
-                            let bytes_read = file
-                                .read(&mut buffer)
-                                .await
-                                .map_err(|_| StatusCode::Failure)?;
-                            total_bytes_read += bytes_read as u64;
+                                if bytes_read == 0 {
+                                    break;
+                                }
 
-                            if bytes_read == 0 {
-                                break;
+                                let bytes_read =
+                                    bytes(request.length, bytes_read, total_bytes_read);
+                                hasher.update(buffer.get_slice(..bytes_read)?);
                             }
 
-                            let bytes_read = bytes(request.length, bytes_read, total_bytes_read);
-                            hasher.update(&buffer[..bytes_read]);
+                            hasher.finalize().to_be_bytes().to_vec()
                         }
+                        "sha1" => {
+                            let mut hasher = sha1::Sha1::new();
 
-                        hasher.finalize().to_be_bytes().to_vec()
-                    }
-                    "sha1" => {
-                        let mut hasher = sha1::Sha1::new();
+                            loop {
+                                let bytes_read = file.read(&mut buffer).await?;
+                                total_bytes_read += bytes_read as u64;
 
-                        loop {
-                            let bytes_read = file
-                                .read(&mut buffer)
-                                .await
-                                .map_err(|_| StatusCode::Failure)?;
-                            total_bytes_read += bytes_read as u64;
+                                if bytes_read == 0 {
+                                    break;
+                                }
 
-                            if bytes_read == 0 {
-                                break;
+                                let bytes_read =
+                                    bytes(request.length, bytes_read, total_bytes_read);
+                                hasher.safe_update(&buffer, bytes_read)?;
                             }
 
-                            let bytes_read = bytes(request.length, bytes_read, total_bytes_read);
-                            hasher.update(&buffer[..bytes_read]);
+                            (*hasher.finalize()).into()
                         }
+                        "sha224" => {
+                            let mut hasher = sha2::Sha224::new();
 
-                        (*hasher.finalize()).into()
-                    }
-                    "sha224" => {
-                        let mut hasher = sha2::Sha224::new();
+                            loop {
+                                let bytes_read = file.read(&mut buffer).await?;
+                                total_bytes_read += bytes_read as u64;
 
-                        loop {
-                            let bytes_read = file
-                                .read(&mut buffer)
-                                .await
-                                .map_err(|_| StatusCode::Failure)?;
-                            total_bytes_read += bytes_read as u64;
+                                if bytes_read == 0 {
+                                    break;
+                                }
 
-                            if bytes_read == 0 {
-                                break;
+                                let bytes_read =
+                                    bytes(request.length, bytes_read, total_bytes_read);
+                                hasher.safe_update(&buffer, bytes_read)?;
                             }
 
-                            let bytes_read = bytes(request.length, bytes_read, total_bytes_read);
-                            hasher.update(&buffer[..bytes_read]);
+                            (*hasher.finalize()).into()
                         }
+                        "sha256" => {
+                            let mut hasher = sha2::Sha256::new();
 
-                        (*hasher.finalize()).into()
-                    }
-                    "sha256" => {
-                        let mut hasher = sha2::Sha256::new();
+                            loop {
+                                let bytes_read = file.read(&mut buffer).await?;
+                                total_bytes_read += bytes_read as u64;
 
-                        loop {
-                            let bytes_read = file
-                                .read(&mut buffer)
-                                .await
-                                .map_err(|_| StatusCode::Failure)?;
-                            total_bytes_read += bytes_read as u64;
+                                if bytes_read == 0 {
+                                    break;
+                                }
 
-                            if bytes_read == 0 {
-                                break;
+                                let bytes_read =
+                                    bytes(request.length, bytes_read, total_bytes_read);
+                                hasher.safe_update(&buffer, bytes_read)?;
                             }
 
-                            let bytes_read = bytes(request.length, bytes_read, total_bytes_read);
-                            hasher.update(&buffer[..bytes_read]);
+                            (*hasher.finalize()).into()
                         }
+                        "sha384" => {
+                            let mut hasher = sha2::Sha384::new();
 
-                        (*hasher.finalize()).into()
-                    }
-                    "sha384" => {
-                        let mut hasher = sha2::Sha384::new();
+                            loop {
+                                let bytes_read = file.read(&mut buffer).await?;
+                                total_bytes_read += bytes_read as u64;
 
-                        loop {
-                            let bytes_read = file
-                                .read(&mut buffer)
-                                .await
-                                .map_err(|_| StatusCode::Failure)?;
-                            total_bytes_read += bytes_read as u64;
+                                if bytes_read == 0 {
+                                    break;
+                                }
 
-                            if bytes_read == 0 {
-                                break;
+                                let bytes_read =
+                                    bytes(request.length, bytes_read, total_bytes_read);
+                                hasher.safe_update(&buffer, bytes_read)?;
                             }
 
-                            let bytes_read = bytes(request.length, bytes_read, total_bytes_read);
-                            hasher.update(&buffer[..bytes_read]);
+                            (*hasher.finalize()).into()
                         }
+                        "sha512" => {
+                            let mut hasher = sha2::Sha512::new();
 
-                        (*hasher.finalize()).into()
-                    }
-                    "sha512" => {
-                        let mut hasher = sha2::Sha512::new();
+                            loop {
+                                let bytes_read = file.read(&mut buffer).await?;
+                                total_bytes_read += bytes_read as u64;
 
-                        loop {
-                            let bytes_read = file
-                                .read(&mut buffer)
-                                .await
-                                .map_err(|_| StatusCode::Failure)?;
-                            total_bytes_read += bytes_read as u64;
+                                if bytes_read == 0 {
+                                    break;
+                                }
 
-                            if bytes_read == 0 {
-                                break;
+                                let bytes_read =
+                                    bytes(request.length, bytes_read, total_bytes_read);
+                                hasher.safe_update(&buffer, bytes_read)?;
                             }
 
-                            let bytes_read = bytes(request.length, bytes_read, total_bytes_read);
-                            hasher.update(&buffer[..bytes_read]);
+                            (*hasher.finalize()).into()
                         }
+                        _ => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "unsupported hash algorithm",
+                            ));
+                        }
+                    })
+                };
 
-                        (*hasher.finalize()).into()
+                let hash = match run_hash().await {
+                    Ok(hash) => hash,
+                    Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                        return Err(StatusCode::BadMessage);
                     }
-                    _ => return Err(StatusCode::BadMessage),
+                    Err(err) => {
+                        tracing::error!(
+                            "failed to compute hash for file {}: {}",
+                            path.display(),
+                            err
+                        );
+                        return Err(StatusCode::Failure);
+                    }
                 };
 
                 #[derive(Serialize)]
@@ -269,7 +285,7 @@ pub async fn handle_extended(
                             hash_algorithm,
                             hash,
                         })
-                        .unwrap()
+                        .map_err(map_ser_err)?
                         .into(),
                     },
                 ))
@@ -403,19 +419,21 @@ pub async fn handle_extended(
                     let disk;
                     loop {
                         if let Some(d) = disks.iter().find(|d| d.mount_point() == path) {
-                            disk = Some(d);
+                            disk = d;
                             break;
                         }
 
-                        path.pop();
+                        if !path.pop() {
+                            disk = match disks.first() {
+                                Some(d) => d,
+                                None => return Err(StatusCode::Failure),
+                            };
+                            break;
+                        }
                     }
 
-                    let total_space = disk
-                        .map(|d| d.total_space())
-                        .unwrap_or(disks[0].total_space());
-                    let free_space = disk
-                        .map(|d| d.available_space())
-                        .unwrap_or(disks[0].available_space());
+                    let total_space = disk.total_space();
+                    let free_space = disk.available_space();
 
                     (total_space, free_space)
                 }
@@ -435,7 +453,7 @@ pub async fn handle_extended(
                         total_user_space: total_space,
                         available_user_space: free_space,
                     })
-                    .unwrap()
+                    .map_err(map_ser_err)?
                     .into(),
                 },
             ))
@@ -458,7 +476,7 @@ pub async fn handle_extended(
                         max_write_length: 128 * 1024,
                         max_handle_count: super::HANDLE_LIMIT as u64,
                     })
-                    .unwrap()
+                    .map_err(map_ser_err)?
                     .into(),
                 },
             ))
@@ -487,19 +505,21 @@ pub async fn handle_extended(
                     let disk;
                     loop {
                         if let Some(d) = disks.iter().find(|d| d.mount_point() == path) {
-                            disk = Some(d);
+                            disk = d;
                             break;
                         }
 
-                        path.pop();
+                        if !path.pop() {
+                            disk = match disks.first() {
+                                Some(d) => d,
+                                None => return Err(StatusCode::Failure),
+                            };
+                            break;
+                        }
                     }
 
-                    let total_space = disk
-                        .map(|d| d.total_space())
-                        .unwrap_or(disks[0].total_space());
-                    let free_space = disk
-                        .map(|d| d.available_space())
-                        .unwrap_or(disks[0].available_space());
+                    let total_space = disk.total_space();
+                    let free_space = disk.available_space();
 
                     (total_space, free_space)
                 }
@@ -522,10 +542,10 @@ pub async fn handle_extended(
                         free_file_nodes: 0,
                         available_file_nodes: 0,
                         filesystem_id: 0,
-                        mount_flags: sftp_session.state.config.system.sftp.read_only as u64,
+                        mount_flags: sftp_session.state.config.load().system.sftp.read_only as u64,
                         max_filename_length: 255,
                     })
-                    .unwrap()
+                    .map_err(map_ser_err)?
                     .into(),
                 },
             ))
@@ -542,7 +562,7 @@ pub async fn handle_extended(
                 Err(_) => return Err(StatusCode::BadMessage),
             };
 
-            if sftp_session.state.config.system.sftp.read_only {
+            if sftp_session.state.config.load().system.sftp.read_only {
                 return Err(StatusCode::PermissionDenied);
             }
 
@@ -629,7 +649,7 @@ pub async fn handle_extended(
                 Err(_) => return Err(StatusCode::BadMessage),
             };
 
-            if sftp_session.state.config.system.sftp.read_only {
+            if sftp_session.state.config.load().system.sftp.read_only {
                 return Err(StatusCode::PermissionDenied);
             }
 
@@ -645,7 +665,7 @@ pub async fn handle_extended(
             tokio::task::spawn_blocking({
                 let file = Arc::clone(&handle.file);
 
-                move || file.read().unwrap().sync_all()
+                move || file.lock().sync_all()
             })
             .await
             .map_err(|_| StatusCode::Failure)?
@@ -670,7 +690,7 @@ pub async fn handle_extended(
                 Err(_) => return Err(StatusCode::BadMessage),
             };
 
-            if sftp_session.state.config.system.sftp.read_only {
+            if sftp_session.state.config.load().system.sftp.read_only {
                 return Err(StatusCode::PermissionDenied);
             }
 
@@ -733,7 +753,8 @@ pub async fn handle_extended(
                 };
 
                 if uid == 0 {
-                    let username = &sftp_session.state.config.system.username;
+                    let config = sftp_session.state.config.load();
+                    let username = &config.system.username;
 
                     users.put_u32(username.len() as u32);
                     users.extend(username.as_bytes());
@@ -750,7 +771,8 @@ pub async fn handle_extended(
                 };
 
                 if gid == 0 {
-                    let username = &sftp_session.state.config.system.username;
+                    let config = sftp_session.state.config.load();
+                    let username = &config.system.username;
 
                     groups.put_u32(username.len() as u32);
                     groups.extend(username.as_bytes());
@@ -766,7 +788,7 @@ pub async fn handle_extended(
                         users: users.into(),
                         groups: groups.into(),
                     })
-                    .unwrap()
+                    .map_err(map_ser_err)?
                     .into(),
                 },
             ))

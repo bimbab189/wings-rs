@@ -65,7 +65,11 @@ pub async fn handle_jwt(
                 .verify::<WebsocketJwtPayload>(message.args.first().map_or("", |v| v.as_str()))
             {
                 Ok(jwt) => {
-                    if let Err(err) = jwt.base.validate(&state.config.jwt).await {
+                    if let Err(err) = jwt
+                        .base
+                        .validate(&state.config.jwt, Some("websocket"))
+                        .await
+                    {
                         return Err(JwtError::MiscStr(format!("invalid token: {err}")));
                     }
 
@@ -80,10 +84,9 @@ pub async fn handle_jwt(
 
                         if jwt.permissions.has_permission(Permission::WebsocketConnect) {
                             websocket_handler
-                                .send_message(WebsocketMessage::new(
-                                    WebsocketEvent::TokenExpired,
-                                    [].into(),
-                                ))
+                                .send_message(
+                                    WebsocketMessage::builder(WebsocketEvent::TokenExpired).build(),
+                                )
                                 .await;
 
                             return Err(JwtError::Expired);
@@ -94,19 +97,15 @@ pub async fn handle_jwt(
 
                     let mut permissions = Vec::new();
                     for permission in jwt.permissions.iter() {
-                        permissions.push(
-                            serde_json::to_value(permission)?
-                                .as_str()
-                                .unwrap()
-                                .to_compact_string(),
-                        );
+                        permissions.push(permission.to_str().to_compact_string());
                     }
 
                     websocket_handler
-                        .send_message(WebsocketMessage::new(
-                            WebsocketEvent::AuthenticationSuccess,
-                            permissions.into(),
-                        ))
+                        .send_message(
+                            WebsocketMessage::builder(WebsocketEvent::AuthenticationSuccess)
+                                .args(permissions)
+                                .build(),
+                        )
                         .await;
 
                     let has_console_read = jwt
@@ -129,10 +128,11 @@ pub async fn handle_jwt(
                         .is_none()
                     {
                         websocket_handler
-                            .send_message(WebsocketMessage::new(
-                                WebsocketEvent::ServerStatus,
-                                [server.state.get_state().to_str().into()].into(),
-                            ))
+                            .send_message(
+                                WebsocketMessage::builder(WebsocketEvent::ServerStatus)
+                                    .arg(server.state.get_state().to_str())
+                                    .build(),
+                            )
                             .await;
 
                         if !has_console_read {
@@ -157,7 +157,11 @@ pub async fn handle_jwt(
         }
         _ => {
             if let Some(jwt) = websocket_handler.socket_jwt.read().await.as_ref() {
-                if let Err(err) = jwt.base.validate(&state.config.jwt).await {
+                if let Err(err) = jwt
+                    .base
+                    .validate(&state.config.jwt, Some("websocket"))
+                    .await
+                {
                     return Err(JwtError::MiscStr(format!("invalid token: {err}")));
                 }
 
@@ -193,10 +197,9 @@ pub async fn listen_jwt(websocket_handler: &ServerWebsocketHandler) {
             if let Some(expiration) = jwt.base.expiration_time {
                 if expiration < chrono::Utc::now().timestamp() {
                     websocket_handler
-                        .send_message(WebsocketMessage::new(
-                            WebsocketEvent::TokenExpired,
-                            [].into(),
-                        ))
+                        .send_message(
+                            WebsocketMessage::builder(WebsocketEvent::TokenExpired).build(),
+                        )
                         .await;
 
                     drop(socket_jwt_guard);
@@ -205,10 +208,9 @@ pub async fn listen_jwt(websocket_handler: &ServerWebsocketHandler) {
                     tracing::debug!("jwt expired for websocket connection, removing jwt");
                 } else if expiration - 60 < chrono::Utc::now().timestamp() {
                     websocket_handler
-                        .send_message(WebsocketMessage::new(
-                            WebsocketEvent::TokenExpiring,
-                            [].into(),
-                        ))
+                        .send_message(
+                            WebsocketMessage::builder(WebsocketEvent::TokenExpiring).build(),
+                        )
                         .await;
 
                     tracing::debug!(

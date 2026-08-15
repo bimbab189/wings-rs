@@ -1,19 +1,23 @@
 use anyhow::Context;
+use arc_swap::ArcSwap;
 use axum::{extract::ConnectInfo, http::HeaderMap};
 use compact_str::ToCompactString;
 use serde::{Deserialize, Serialize};
 use serde_default::DefaultFromSerde;
 use std::{
-    cell::UnsafeCell,
     collections::{BTreeMap, HashMap},
     fs::File,
     io::BufRead,
-    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
 };
-use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::{
+    fmt::writer::MakeWriterExt,
+    layer::{Layered, SubscriberExt},
+    util::SubscriberInitExt,
+};
 use utoipa::ToSchema;
 
 fn app_name() -> String {
@@ -36,16 +40,18 @@ fn api_server_remote_download_limit() -> usize {
     3
 }
 fn api_remote_download_blocked_cidrs() -> Vec<cidr::IpCidr> {
-    Vec::from([
-        cidr::IpCidr::from_str("127.0.0.0/8").unwrap(),
-        cidr::IpCidr::from_str("10.0.0.0/8").unwrap(),
-        cidr::IpCidr::from_str("172.16.0.0/12").unwrap(),
-        cidr::IpCidr::from_str("192.168.0.0/16").unwrap(),
-        cidr::IpCidr::from_str("169.254.0.0/16").unwrap(),
-        cidr::IpCidr::from_str("::1/128").unwrap(),
-        cidr::IpCidr::from_str("fe80::/10").unwrap(),
-        cidr::IpCidr::from_str("fc00::/7").unwrap(),
-    ])
+    unsafe {
+        Vec::from([
+            cidr::IpCidr::from_str("127.0.0.0/8").unwrap_unchecked(),
+            cidr::IpCidr::from_str("10.0.0.0/8").unwrap_unchecked(),
+            cidr::IpCidr::from_str("172.16.0.0/12").unwrap_unchecked(),
+            cidr::IpCidr::from_str("192.168.0.0/16").unwrap_unchecked(),
+            cidr::IpCidr::from_str("169.254.0.0/16").unwrap_unchecked(),
+            cidr::IpCidr::from_str("::1/128").unwrap_unchecked(),
+            cidr::IpCidr::from_str("fe80::/10").unwrap_unchecked(),
+            cidr::IpCidr::from_str("fc00::/7").unwrap_unchecked(),
+        ])
+    }
 }
 fn api_directory_entry_limit() -> usize {
     10000
@@ -255,11 +261,14 @@ fn system_passwd_directory() -> String {
 fn system_machine_id_enabled() -> bool {
     true
 }
+fn system_disk_check_concurrency() -> usize {
+    2
+}
 fn system_disk_check_interval() -> u64 {
     150
 }
 fn system_full_disk_check_every() -> u64 {
-    6
+    4
 }
 fn system_disk_check_use_inotify() -> bool {
     true
@@ -325,6 +334,31 @@ fn system_crash_detection_detect_clean_exit_as_crash() -> bool {
 }
 fn system_crash_detection_timeout() -> u64 {
     60
+}
+
+fn system_file_history_enabled() -> bool {
+    true
+}
+fn system_file_history_zstd_level() -> i32 {
+    19
+}
+fn system_file_history_anchor_interval() -> u64 {
+    4
+}
+fn system_file_history_keep_chains() -> u64 {
+    2
+}
+fn system_file_history_file_size_cap() -> u64 {
+    1024 * 1024
+}
+fn system_file_history_per_file_disk_budget() -> u64 {
+    5 * 1024 * 1024
+}
+fn system_file_history_per_server_disk_budget() -> u64 {
+    200 * 1024 * 1024
+}
+fn system_file_history_maintenance_interval() -> u64 {
+    3600
 }
 
 fn system_backup_mounting_enabled() -> bool {
@@ -458,6 +492,9 @@ fn docker_tmpfs_size() -> u64 {
 }
 fn docker_container_pid_limit() -> u64 {
     5120
+}
+fn docker_container_apply_seccomp() -> bool {
+    true
 }
 
 fn docker_installer_limits_timeout() -> u64 {
@@ -768,6 +805,8 @@ nestify::nest! {
                 pub enabled: bool,
             },
 
+            #[serde(default = "system_disk_check_concurrency")]
+            pub disk_check_concurrency: usize,
             #[serde(default = "system_disk_check_interval")]
             pub disk_check_interval: u64,
             #[serde(default = "system_full_disk_check_every")]
@@ -854,6 +893,32 @@ nestify::nest! {
                 pub detect_clean_exit_as_crash: bool,
                 #[serde(default = "system_crash_detection_timeout")]
                 pub timeout: u64,
+            },
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub file_history: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemFileHistory {
+                #[serde(default = "system_file_history_enabled")]
+                pub enabled: bool,
+
+                #[serde(default = "system_file_history_zstd_level")]
+                pub zstd_level: i32,
+                #[serde(default = "system_file_history_anchor_interval")]
+                pub anchor_interval: u64,
+
+                #[serde(default = "system_file_history_keep_chains")]
+                pub keep_chains: u64,
+
+                #[serde(default = "system_file_history_file_size_cap")]
+                pub file_size_cap: u64,
+
+                #[serde(default = "system_file_history_per_file_disk_budget")]
+                pub per_file_disk_budget: u64,
+                #[serde(default = "system_file_history_per_server_disk_budget")]
+                pub per_server_disk_budget: u64,
+
+                #[serde(default = "system_file_history_maintenance_interval")]
+                pub maintenance_interval: u64,
             },
 
             #[serde(default)]
@@ -1018,6 +1083,8 @@ nestify::nest! {
             pub tmpfs_size: u64,
             #[serde(default = "docker_container_pid_limit")]
             pub container_pid_limit: u64,
+            #[serde(default = "docker_container_apply_seccomp")]
+            pub container_apply_seccomp: bool,
 
             #[serde(default)]
             #[schema(inline)]
@@ -1120,12 +1187,12 @@ impl DockerOverhead {
             return 1.05;
         }
 
-        for m in self.multipliers.keys().copied().rev() {
-            if memory > m {
+        for (m, v) in self.multipliers.iter().rev() {
+            if memory > *m {
                 continue;
             }
 
-            return self.multipliers[&m];
+            return *v;
         }
 
         self.default_multiplier
@@ -1139,22 +1206,52 @@ impl DockerOverhead {
     }
 }
 
+pub const FORBIDDEN_PATHS: &[&str] = &[
+    "uuid",
+    "token",
+    "token_id",
+    "remote",
+    "remote_headers",
+    "system.root_directory",
+    "system.log_directory",
+    "system.vmount_directory",
+    "system.data",
+    "system.archive_directory",
+    "system.backup_directory",
+    "system.tmp_directory",
+    "system.passwd.directory",
+    "system.backups.restic.repository",
+    "system.backups.restic.password_file",
+    "system.backups.mounting.path",
+    "system.username",
+    "system.user",
+    "system.passwd",
+    "docker.socket",
+    "allowed_mounts",
+];
+
+#[allow(dead_code)]
 pub struct ConfigGuard(
-    pub tracing_appender::non_blocking::WorkerGuard,
-    pub tracing_appender::non_blocking::WorkerGuard,
+    tracing_appender::non_blocking::WorkerGuard,
+    tracing_appender::non_blocking::WorkerGuard,
 );
 
+pub type ConfigSnapshot = arc_swap::Guard<Arc<InnerConfig>>;
+type ReloadHandle = tracing_subscriber::reload::Handle<
+    LevelFilter,
+    Layered<LevelFilter, tracing_subscriber::Registry>,
+>;
+
 pub struct Config {
-    inner: UnsafeCell<InnerConfig>,
+    inner: ArcSwap<InnerConfig>,
+    log_reload_handle: ReloadHandle,
 
     pub path: String,
     pub ignore_certificate_errors: bool,
+    pub disk_check_concurrency_semaphore: tokio::sync::Semaphore,
     pub client: crate::remote::client::Client,
     pub jwt: crate::remote::jwt::JwtClient,
 }
-
-unsafe impl Send for Config {}
-unsafe impl Sync for Config {}
 
 impl Config {
     pub fn open(
@@ -1165,25 +1262,14 @@ impl Config {
     ) -> Result<(Arc<Self>, ConfigGuard), anyhow::Error> {
         let file = File::open(path).context(format!("failed to open config file {path}"))?;
         let reader = std::io::BufReader::new(file);
-        let config: InnerConfig = serde_norway::from_reader(reader)
+        let mut inner: InnerConfig = serde_norway::from_reader(reader)
             .context(format!("failed to parse config file {path}"))?;
 
-        let client = crate::remote::client::Client::new(&config, ignore_certificate_errors);
-        let jwt = crate::remote::jwt::JwtClient::new(&config);
-        let mut config = Self {
-            inner: UnsafeCell::new(config),
-
-            path: path.to_string(),
-            ignore_certificate_errors,
-            client,
-            jwt,
-        };
-
-        config.ensure_directories()?;
+        Self::ensure_directories(&inner)?;
 
         let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
 
-        let latest_log_path = std::path::Path::new(&config.system.log_directory).join("wings.log");
+        let latest_log_path = Path::new(&inner.system.log_directory).join("wings.log");
         let latest_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1195,7 +1281,7 @@ impl Config {
             .filename_suffix("log")
             .max_log_files(30)
             .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .build(&config.system.log_directory)
+            .build(&inner.system.log_directory)
             .context("failed to create rolling log file appender")?;
 
         let (file_appender, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
@@ -1204,63 +1290,126 @@ impl Config {
 
         #[cfg(unix)]
         {
-            config.ensure_user()?;
-            config.ensure_passwd()?;
+            Self::ensure_user(&mut inner)?;
+            Self::ensure_passwd(&inner)?;
         }
-        config.save()?;
 
         if debug {
-            config.debug = true;
+            inner.debug = true;
         }
 
-        tracing::subscriber::set_global_default(
-            tracing_subscriber::fmt()
-                .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
-                    "%Y-%m-%d %H:%M:%S %z".to_string(),
-                ))
-                .with_writer(stdout_writer.and(file_appender))
-                .with_target(false)
-                .with_level(true)
-                .with_file(true)
-                .with_line_number(true)
-                .with_max_level(if config.debug && !ignore_debug {
-                    tracing::Level::DEBUG
-                } else {
-                    tracing::Level::INFO
-                })
-                .finish(),
-        )?;
+        Self::validate_inner(&inner)?;
+        Self::save_to(path, &inner)?;
 
-        Ok((Arc::new(config), ConfigGuard(guard, stdout_guard)))
+        let initial_level = if inner.debug && !ignore_debug {
+            LevelFilter::DEBUG
+        } else {
+            LevelFilter::INFO
+        };
+        let (reload_layer, log_reload_handle) =
+            tracing_subscriber::reload::Layer::new(initial_level);
+
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+                "%Y-%m-%d %H:%M:%S %z".to_string(),
+            ))
+            .with_writer(stdout_writer.and(file_appender))
+            .with_target(false)
+            .with_level(true)
+            .with_file(true)
+            .with_line_number(true);
+
+        tracing_subscriber::registry()
+            .with(LevelFilter::DEBUG)
+            .with(reload_layer)
+            .with(fmt_layer)
+            .try_init()
+            .context("failed to install tracing subscriber")?;
+
+        let disk_check_concurrency_semaphore =
+            tokio::sync::Semaphore::new(inner.system.disk_check_concurrency);
+        let client = crate::remote::client::Client::new(&inner, ignore_certificate_errors);
+        let jwt = crate::remote::jwt::JwtClient::new(&inner);
+
+        let config = Arc::new(Self {
+            inner: ArcSwap::new(Arc::new(inner)),
+            log_reload_handle,
+
+            path: path.to_string(),
+            ignore_certificate_errors,
+            disk_check_concurrency_semaphore,
+            client,
+            jwt,
+        });
+
+        Ok((config, ConfigGuard(guard, stdout_guard)))
+    }
+
+    #[inline]
+    pub fn load(&self) -> ConfigSnapshot {
+        self.inner.load()
+    }
+
+    pub fn replace(&self, new: InnerConfig) -> Result<(), anyhow::Error> {
+        Self::validate_inner(&new)?;
+        Self::save_to(&self.path, &new)?;
+
+        let old_debug = self.load().debug;
+        let new_debug = new.debug;
+
+        self.inner.store(Arc::new(new));
+
+        if old_debug != new_debug {
+            let new_level = if new_debug {
+                LevelFilter::DEBUG
+            } else {
+                LevelFilter::INFO
+            };
+
+            self.log_reload_handle
+                .modify(|filter| *filter = new_level)
+                .context("failed to reload tracing level filter")?;
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn mutate_in_place(&self) -> &mut InnerConfig {
+        let arc = self.inner.load();
+        let ptr = Arc::as_ptr(&arc) as *mut InnerConfig;
+        unsafe { &mut *ptr }
+    }
+
+    fn save_to(path: &str, inner: &InnerConfig) -> Result<(), anyhow::Error> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
+            .open(path)
+            .context(format!("failed to create config file {path}"))?;
+        let writer = std::io::BufWriter::new(file);
+        serde_norway::to_writer(writer, inner)
+            .context(format!("failed to write config file {path}"))?;
+        Ok(())
     }
 
     pub fn save_new(path: &str, config: InnerConfig) -> Result<(), anyhow::Error> {
-        if let Some(parent) = std::path::Path::new(path).parent() {
+        if let Some(parent) = Path::new(path).parent() {
             std::fs::create_dir_all(parent)
                 .context(format!("failed to create config directory {path}"))?;
         }
-        let file = File::create(path).context(format!("failed to create config file {path}"))?;
-        #[cfg(unix)]
-        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-        let writer = std::io::BufWriter::new(file);
-        serde_norway::to_writer(writer, &config)
-            .context(format!("failed to write config file {path}"))?;
-
-        Ok(())
+        Self::save_to(path, &config)
     }
 
     pub fn save(&self) -> Result<(), anyhow::Error> {
-        self.validate()?;
-
-        let file = File::create(&self.path)
-            .context(format!("failed to create config file {}", self.path))?;
-        #[cfg(unix)]
-        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-        let writer = std::io::BufWriter::new(file);
-        serde_norway::to_writer(writer, unsafe { &*self.inner.get() })
-            .context(format!("failed to write config file {}", self.path))?;
-
-        Ok(())
+        let snap = self.load();
+        Self::validate_inner(&snap)?;
+        Self::save_to(&self.path, &snap)
     }
 
     #[inline]
@@ -1269,19 +1418,23 @@ impl Config {
         headers: &HeaderMap,
         connect_info: ConnectInfo<std::net::SocketAddr>,
     ) -> std::net::IpAddr {
-        for cidr in &self.api.trusted_proxies {
+        let cfg = self.load();
+        for cidr in &cfg.api.trusted_proxies {
             if cidr.contains(&connect_info.ip()) {
                 if let Some(forwarded) = headers.get("X-Forwarded-For")
                     && let Ok(forwarded) = forwarded.to_str()
                     && let Some(ip) = forwarded.split(',').next()
                 {
-                    return ip.parse().unwrap_or_else(|_| connect_info.ip());
+                    return ip.trim().parse().unwrap_or_else(|_| connect_info.ip());
                 }
 
                 if let Some(forwarded) = headers.get("X-Real-IP")
                     && let Ok(forwarded) = forwarded.to_str()
                 {
-                    return forwarded.parse().unwrap_or_else(|_| connect_info.ip());
+                    return forwarded
+                        .trim()
+                        .parse()
+                        .unwrap_or_else(|_| connect_info.ip());
                 }
             }
         }
@@ -1289,17 +1442,17 @@ impl Config {
         connect_info.ip()
     }
 
-    pub fn validate(&self) -> Result<(), anyhow::Error> {
-        if self.api.send_offline_server_logs && self.docker.delete_container_on_stop {
+    fn validate_inner(cfg: &InnerConfig) -> Result<(), anyhow::Error> {
+        if cfg.api.send_offline_server_logs && cfg.docker.delete_container_on_stop {
             tracing::warn!(
                 "you have enabled sending offline server logs, but also deleting containers on stop. This will result in no logs being sent for stopped servers."
             );
         }
         #[cfg(unix)]
         if matches!(
-            self.system.disk_limiter_mode,
+            cfg.system.disk_limiter_mode,
             crate::server::filesystem::limiter::DiskLimiterMode::FuseQuota
-        ) && !self.docker.delete_container_on_stop
+        ) && !cfg.docker.delete_container_on_stop
         {
             tracing::warn!(
                 "you have enabled FUSEquota disk limiting, but also disabled deleting containers on stop. This can cause issues if you try manually starting things. this setup is not recommended."
@@ -1307,7 +1460,7 @@ impl Config {
         }
         #[cfg(unix)]
         if matches!(
-            self.system.disk_limiter_mode,
+            cfg.system.disk_limiter_mode,
             crate::server::filesystem::limiter::DiskLimiterMode::FuseQuota
         ) && std::env::var("OCI_CONTAINER").is_ok()
         {
@@ -1324,30 +1477,30 @@ impl Config {
             tracing::warn!("you are treading on thin ice. proceed at your own risk.");
         }
 
-        if self.remote.is_empty() {
+        if cfg.remote.is_empty() {
             return Err(anyhow::anyhow!(
                 "invalid remote configuration, cannot connect to panel without a remote"
             ));
         }
 
-        if !self.remote.starts_with("http://") && !self.remote.starts_with("https://") {
+        if !cfg.remote.starts_with("http://") && !cfg.remote.starts_with("https://") {
             return Err(anyhow::anyhow!(
                 "invalid remote configuration, cannot connect to panel without http:// or https:// protocol"
             ));
         }
 
-        if self.web_ide.enabled {
-            if !self.web_ide.public_url.starts_with("https://") {
+        if cfg.web_ide.enabled {
+            if !cfg.web_ide.public_url.starts_with("https://") {
                 return Err(anyhow::anyhow!(
                     "web_ide.public_url must be an https:// origin"
                 ));
             }
-            let immutable_image = self
+            let immutable_image = cfg
                 .web_ide
                 .image
                 .strip_prefix("sha256:")
                 .or_else(|| {
-                    self.web_ide
+                    cfg.web_ide
                         .image
                         .split_once("@sha256:")
                         .filter(|(name, _)| !name.is_empty())
@@ -1361,40 +1514,39 @@ impl Config {
                     "web_ide.image must be pinned by immutable image ID or repository digest"
                 ));
             }
-            if !self.web_ide.terminal_network_isolation_verified {
+            if !cfg.web_ide.terminal_network_isolation_verified {
                 return Err(anyhow::anyhow!(
                     "web_ide requires terminal_network_isolation_verified after applying the documented node firewall profile"
                 ));
             }
-            if self.web_ide.allow_public_network && !self.web_ide.public_network_isolation_verified
-            {
+            if cfg.web_ide.allow_public_network && !cfg.web_ide.public_network_isolation_verified {
                 return Err(anyhow::anyhow!(
                     "web_ide public egress requires public_network_isolation_verified after applying the documented node firewall profile"
                 ));
             }
-            if self.docker.network.driver != "bridge"
-                || self.docker.network.mode != self.docker.network.name
+            if cfg.docker.network.driver != "bridge"
+                || cfg.docker.network.mode != cfg.docker.network.name
             {
                 return Err(anyhow::anyhow!(
                     "web_ide terminal isolation requires the managed Docker bridge network"
                 ));
             }
-            if !(256..=8192).contains(&self.web_ide.memory_mib)
-                || !(1..=800).contains(&self.web_ide.cpu_percent)
-                || !(32..=4096).contains(&self.web_ide.pid_limit)
-                || !(32..=2048).contains(&self.web_ide.tmpfs_mib)
-                || self.web_ide.max_request_bytes == 0
-                || self.web_ide.max_request_bytes > 64 * 1024 * 1024
-                || self.web_ide.max_collaboration_document_bytes == 0
-                || self.web_ide.max_collaboration_document_bytes > 8 * 1024 * 1024
-                || self.web_ide.max_collaboration_rooms == 0
-                || self.web_ide.max_collaboration_rooms > 2048
-                || self.web_ide.max_sessions == 0
-                || self.web_ide.max_sessions > 1024
-                || self.web_ide.max_sessions_per_server == 0
-                || self.web_ide.max_sessions_per_server > self.web_ide.max_sessions
-                || self.web_ide.max_persistent_state_bytes < 16 * 1024 * 1024
-                || self.web_ide.max_persistent_state_bytes > 4 * 1024 * 1024 * 1024
+            if !(256..=8192).contains(&cfg.web_ide.memory_mib)
+                || !(1..=800).contains(&cfg.web_ide.cpu_percent)
+                || !(32..=4096).contains(&cfg.web_ide.pid_limit)
+                || !(32..=2048).contains(&cfg.web_ide.tmpfs_mib)
+                || cfg.web_ide.max_request_bytes == 0
+                || cfg.web_ide.max_request_bytes > 64 * 1024 * 1024
+                || cfg.web_ide.max_collaboration_document_bytes == 0
+                || cfg.web_ide.max_collaboration_document_bytes > 8 * 1024 * 1024
+                || cfg.web_ide.max_collaboration_rooms == 0
+                || cfg.web_ide.max_collaboration_rooms > 2048
+                || cfg.web_ide.max_sessions == 0
+                || cfg.web_ide.max_sessions > 1024
+                || cfg.web_ide.max_sessions_per_server == 0
+                || cfg.web_ide.max_sessions_per_server > cfg.web_ide.max_sessions
+                || cfg.web_ide.max_persistent_state_bytes < 16 * 1024 * 1024
+                || cfg.web_ide.max_persistent_state_bytes > 4 * 1024 * 1024 * 1024
             {
                 return Err(anyhow::anyhow!(
                     "invalid web_ide resource or request limits"
@@ -1403,15 +1555,15 @@ impl Config {
 
             let web_ide_directories = [
                 (
-                    std::path::Path::new(&self.web_ide.runtime_directory),
+                    std::path::Path::new(&cfg.web_ide.runtime_directory),
                     "web_ide.runtime_directory",
                 ),
                 (
-                    std::path::Path::new(&self.web_ide.memory_directory),
+                    std::path::Path::new(&cfg.web_ide.memory_directory),
                     "web_ide.memory_directory",
                 ),
                 (
-                    std::path::Path::new(&self.web_ide.persistent_data_directory),
+                    std::path::Path::new(&cfg.web_ide.persistent_data_directory),
                     "web_ide.persistent_data_directory",
                 ),
             ];
@@ -1438,7 +1590,7 @@ impl Config {
                 }
             }
 
-            let key_file = std::path::Path::new(&self.web_ide.encryption_key_file);
+            let key_file = std::path::Path::new(&cfg.web_ide.encryption_key_file);
             if !key_file.is_absolute()
                 || key_file.components().any(|component| {
                     !matches!(
@@ -1465,23 +1617,23 @@ impl Config {
         // Do not allow directory paths with less than 1 segment (e.g. "/")
         const MIN_DIRECTORY_SEGMENTS: usize = 1;
         let directories = &[
-            (&self.system.root_directory, "root_directory"),
-            (&self.system.log_directory, "log_directory"),
-            (&self.system.vmount_directory, "vmount_directory"),
-            (&self.system.data_directory, "data_directory"),
-            (&self.system.archive_directory, "archive_directory"),
-            (&self.system.backup_directory, "backup_directory"),
-            (&self.system.tmp_directory, "tmp_directory"),
-            (&self.web_ide.runtime_directory, "web_ide.runtime_directory"),
-            (&self.web_ide.memory_directory, "web_ide.memory_directory"),
+            (&cfg.system.root_directory, "root_directory"),
+            (&cfg.system.log_directory, "log_directory"),
+            (&cfg.system.vmount_directory, "vmount_directory"),
+            (&cfg.system.data_directory, "data_directory"),
+            (&cfg.system.archive_directory, "archive_directory"),
+            (&cfg.system.backup_directory, "backup_directory"),
+            (&cfg.system.tmp_directory, "tmp_directory"),
+            (&cfg.web_ide.runtime_directory, "web_ide.runtime_directory"),
+            (&cfg.web_ide.memory_directory, "web_ide.memory_directory"),
             (
-                &self.web_ide.persistent_data_directory,
+                &cfg.web_ide.persistent_data_directory,
                 "web_ide.persistent_data_directory",
             ),
         ];
 
         for (dir, name) in directories {
-            let path = std::path::Path::new(dir);
+            let path = Path::new(dir);
             let segments = path
                 .components()
                 .filter(|c| matches!(c, std::path::Component::Normal(_)))
@@ -1499,24 +1651,19 @@ impl Config {
         Ok(())
     }
 
-    #[allow(clippy::mut_from_ref)]
-    pub fn unsafe_mut(&self) -> &mut InnerConfig {
-        unsafe { &mut *self.inner.get() }
-    }
-
-    fn ensure_directories(&self) -> std::io::Result<()> {
+    fn ensure_directories(cfg: &InnerConfig) -> std::io::Result<()> {
         let directories = vec![
-            &self.system.root_directory,
-            &self.system.log_directory,
-            &self.system.vmount_directory,
-            &self.system.data_directory,
-            &self.system.archive_directory,
-            &self.system.backup_directory,
-            &self.system.tmp_directory,
+            &cfg.system.root_directory,
+            &cfg.system.log_directory,
+            &cfg.system.vmount_directory,
+            &cfg.system.data_directory,
+            &cfg.system.archive_directory,
+            &cfg.system.backup_directory,
+            &cfg.system.tmp_directory,
         ];
 
         for dir in directories {
-            if !std::path::Path::new(dir).exists() {
+            if !Path::new(dir).exists() {
                 std::fs::create_dir_all(dir)?;
                 #[cfg(unix)]
                 {
@@ -1527,13 +1674,11 @@ impl Config {
         }
 
         #[cfg(unix)]
-        if self.system.passwd.enabled
-            && !std::path::Path::new(&self.system.passwd.directory).exists()
-        {
+        if cfg.system.passwd.enabled && !Path::new(&cfg.system.passwd.directory).exists() {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::create_dir_all(&self.system.passwd.directory)?;
+            std::fs::create_dir_all(&cfg.system.passwd.directory)?;
             std::fs::set_permissions(
-                &self.system.passwd.directory,
+                &cfg.system.passwd.directory,
                 std::fs::Permissions::from_mode(0o755),
             )?;
         }
@@ -1542,17 +1687,17 @@ impl Config {
     }
 
     #[cfg(unix)]
-    fn ensure_user(&mut self) -> Result<(), anyhow::Error> {
+    fn ensure_user(cfg: &mut InnerConfig) -> Result<(), anyhow::Error> {
         let release =
             std::fs::read_to_string("/etc/os-release").unwrap_or_else(|_| "unknown".to_string());
 
         if release.contains("distroless") || std::env::var("OCI_CONTAINER").is_ok() {
-            self.system.username =
+            cfg.system.username =
                 std::env::var("WINGS_USERNAME").map_or_else(|_| system_username(), |u| u.into());
-            self.system.user.uid = std::env::var("WINGS_UID")
+            cfg.system.user.uid = std::env::var("WINGS_UID")
                 .unwrap_or_else(|_| "988".to_string())
                 .parse()?;
-            self.system.user.gid = std::env::var("WINGS_GID")
+            cfg.system.user.gid = std::env::var("WINGS_GID")
                 .unwrap_or_else(|_| "988".to_string())
                 .parse()?;
 
@@ -1561,7 +1706,7 @@ impl Config {
 
         let users = sysinfo::Users::new_with_refreshed_list();
 
-        if self.system.user.rootless.enabled
+        if cfg.system.user.rootless.enabled
             && let Ok(current_pid) = sysinfo::get_current_pid()
         {
             let mut sys = sysinfo::System::new_all();
@@ -1574,26 +1719,31 @@ impl Config {
             if let Some(process) = sys.process(current_pid) {
                 if let Some(user) = process.user_id() {
                     if let Some(user) = users.get_user_by_id(user) {
-                        self.system.username = user.name().to_compact_string();
+                        cfg.system.username = user.name().to_compact_string();
                     }
 
-                    self.system.user.uid = **user;
-                    if self.system.user.rootless.container_uid == 0 {
-                        self.system.user.rootless.container_uid = self.system.user.uid;
+                    cfg.system.user.uid = **user;
+                    if cfg.system.user.rootless.container_uid == 0 {
+                        cfg.system.user.rootless.container_uid = cfg.system.user.uid;
                     }
                 }
                 if let Some(group) = process.group_id() {
-                    self.system.user.gid = *group;
-                    if self.system.user.rootless.container_gid == 0 {
-                        self.system.user.rootless.container_gid = self.system.user.gid;
+                    cfg.system.user.gid = *group;
+                    if cfg.system.user.rootless.container_gid == 0 {
+                        cfg.system.user.rootless.container_gid = cfg.system.user.gid;
                     }
                 }
 
-                if self.system.user.uid == 0 || self.system.user.gid == 0 {
+                if cfg.system.user.uid == 0 || cfg.system.user.gid == 0 {
                     return Err(anyhow::anyhow!(
                         "refusing to use user with UID or GID of 0 (root), please check your wings config and change system.username to a non-root user or disable rootless mode"
                     ));
                 }
+
+                cfg.docker.userns_mode = format!(
+                    "keep-id:uid={},gid={}",
+                    cfg.system.user.rootless.container_uid, cfg.system.user.rootless.container_gid
+                );
 
                 return Ok(());
             }
@@ -1601,11 +1751,11 @@ impl Config {
 
         let mut found_user = false;
         for user in users.list() {
-            if user.name() == self.system.username {
-                self.system.user.uid = **user.id();
-                self.system.user.gid = *user.group_id();
+            if user.name() == cfg.system.username {
+                cfg.system.user.uid = **user.id();
+                cfg.system.user.gid = *user.group_id();
 
-                if self.system.user.uid == 0 || self.system.user.gid == 0 {
+                if cfg.system.user.uid == 0 || cfg.system.user.gid == 0 {
                     return Err(anyhow::anyhow!(
                         "refusing to use user with UID or GID of 0 (root), please check your wings config and change system.username to a non-root user"
                     ));
@@ -1623,7 +1773,7 @@ impl Config {
         let output = if release.contains("alpine") {
             std::process::Command::new("addgroup")
                 .arg("-S")
-                .arg(&self.system.username)
+                .arg(cfg.system.username.as_str())
                 .output()
                 .context("failed to create group")?;
 
@@ -1632,28 +1782,28 @@ impl Config {
                 .arg("-D")
                 .arg("-H")
                 .arg("-G")
-                .arg(&self.system.username)
+                .arg(cfg.system.username.as_str())
                 .arg("-s")
                 .arg("/sbin/nologin")
-                .arg(&self.system.username)
+                .arg(cfg.system.username.as_str())
                 .output()
-                .context(format!("failed to create user {}", self.system.username))?
+                .context(format!("failed to create user {}", cfg.system.username))?
         } else {
             std::process::Command::new("useradd")
                 .arg("--system")
                 .arg("--no-create-home")
                 .arg("--shell")
                 .arg("/usr/sbin/nologin")
-                .arg(&self.system.username)
+                .arg(cfg.system.username.as_str())
                 .output()
-                .context(format!("failed to create user {}", self.system.username))?
+                .context(format!("failed to create user {}", cfg.system.username))?
         };
 
         if !output.status.success() {
             return Err(
-                anyhow::anyhow!("failed to create user {}", self.system.username).context(format!(
+                anyhow::anyhow!("failed to create user {}", cfg.system.username).context(format!(
                     "failed to create user {}: {}",
-                    self.system.username,
+                    cfg.system.username,
                     String::from_utf8_lossy(&output.stderr)
                 )),
             );
@@ -1664,18 +1814,18 @@ impl Config {
         let Some(user) = users
             .list()
             .iter()
-            .find(|u| u.name() == self.system.username)
+            .find(|u| u.name() == cfg.system.username)
         else {
             return Err(anyhow::anyhow!(
                 "failed to find user {} after creating it",
-                self.system.username
+                cfg.system.username
             ));
         };
 
-        self.system.user.uid = **user.id();
-        self.system.user.gid = *user.group_id();
+        cfg.system.user.uid = **user.id();
+        cfg.system.user.gid = *user.group_id();
 
-        if self.system.user.uid == 0 || self.system.user.gid == 0 {
+        if cfg.system.user.uid == 0 || cfg.system.user.gid == 0 {
             return Err(anyhow::anyhow!(
                 "refusing to use user with UID or GID of 0 (root), please check your wings config and change system.username to a non-root user"
             ));
@@ -1685,54 +1835,52 @@ impl Config {
     }
 
     #[cfg(unix)]
-    fn ensure_passwd(&self) -> Result<(), anyhow::Error> {
+    fn ensure_passwd(cfg: &InnerConfig) -> Result<(), anyhow::Error> {
         use std::os::unix::fs::PermissionsExt;
 
-        if self.system.passwd.enabled {
+        if cfg.system.passwd.enabled {
             std::fs::write(
-                std::path::Path::new(&self.system.passwd.directory).join("group"),
+                Path::new(&cfg.system.passwd.directory).join("group"),
                 format!(
                     "root:x:0:\ncontainer:x:{}:\nnogroup:x:65534:",
-                    self.system.user.gid
+                    cfg.system.user.gid
                 ),
             )
             .context(format!(
                 "failed to write group file {}",
-                std::path::Path::new(&self.system.passwd.directory)
+                Path::new(&cfg.system.passwd.directory)
                     .join("group")
                     .display()
             ))?;
             std::fs::set_permissions(
-                std::path::Path::new(&self.system.passwd.directory).join("group"),
+                Path::new(&cfg.system.passwd.directory).join("group"),
                 std::fs::Permissions::from_mode(0o644),
             )
             .context(format!(
                 "failed to set permissions for group file {}",
-                std::path::Path::new(&self.system.passwd.directory)
+                Path::new(&cfg.system.passwd.directory)
                     .join("group")
                     .display()
             ))?;
 
             std::fs::write(
-                std::path::Path::new(&self.system.passwd.directory).join("passwd"),
+                Path::new(&cfg.system.passwd.directory).join("passwd"),
                 format!(
                     "root:x:0:0::/root:/bin/sh\ncontainer:x:{}:{}::/home/container:/bin/sh\nnobody:x:65534:65534::/var/empty:/bin/sh\n",
-                    self.system.user.uid, self.system.user.gid
+                    cfg.system.user.uid, cfg.system.user.gid
                 ),
             )
             .context(format!(
                 "failed to write passwd file {}",
-                std::path::Path::new(&self.system.passwd.directory)
-                    .join("passwd")
-                    .display()
+                Path::new(&cfg.system.passwd.directory).join("passwd").display()
             ))?;
             std::fs::set_permissions(
-                std::path::Path::new(&self.system.passwd.directory).join("passwd"),
+                Path::new(&cfg.system.passwd.directory).join("passwd"),
                 std::fs::Permissions::from_mode(0o644),
             )
             .context(format!(
                 "failed to set permissions for passwd file {}",
-                std::path::Path::new(&self.system.passwd.directory)
+                Path::new(&cfg.system.passwd.directory)
                     .join("passwd")
                     .display()
             ))?;
@@ -1742,77 +1890,80 @@ impl Config {
     }
 
     pub fn vmount_path(&self, server_uuid: uuid::Uuid) -> PathBuf {
-        Path::new(&self.system.vmount_directory).join(server_uuid.to_compact_string())
+        Path::new(&self.load().system.vmount_directory).join(server_uuid.to_compact_string())
     }
 
     pub fn data_path(&self, server_uuid: uuid::Uuid) -> PathBuf {
-        Path::new(&self.system.data_directory).join(server_uuid.to_compact_string())
+        Path::new(&self.load().system.data_directory).join(server_uuid.to_compact_string())
     }
 
     pub fn daemon_prelude(&self) -> compact_str::CompactString {
-        ansi_term::Color::Yellow
+        nu_ansi_term::Color::Yellow
             .bold()
-            .paint(format!("[{} Daemon]:", self.app_name))
+            .paint(format!("[{} Daemon]:", self.load().app_name))
             .to_compact_string()
     }
 
-    pub async fn ensure_network(&self, client: &bollard::Docker) -> Result<(), anyhow::Error> {
-        let network = client
-            .inspect_network::<String>(&self.docker.network.name, None)
-            .await;
+    pub async fn ensure_docker_network(
+        &self,
+        client: &bollard::Docker,
+    ) -> Result<(), anyhow::Error> {
+        let network_name = self.load().docker.network.name.clone();
+        let network = client.inspect_network(&network_name, None).await;
 
         if network.is_err() {
             async fn create_network(
                 client: &bollard::Docker,
-                config: &Config,
+                cfg: &InnerConfig,
             ) -> Result<(), bollard::errors::Error> {
                 client
-                    .create_network(bollard::network::CreateNetworkOptions {
-                        name: config.docker.network.name.as_str(),
-                        driver: config.docker.network.driver.as_str(),
-                        enable_ipv6: true,
-                        internal: config.docker.network.is_internal,
-                        ipam: bollard::models::Ipam {
+                    .create_network(bollard::plugin::NetworkCreateRequest {
+                        name: cfg.docker.network.name.to_string(),
+                        driver: Some(cfg.docker.network.driver.to_string()),
+                        enable_ipv6: Some(true),
+                        internal: Some(cfg.docker.network.is_internal),
+                        ipam: Some(bollard::models::Ipam {
                             config: Some(vec![
                                 bollard::models::IpamConfig {
-                                    subnet: Some(
-                                        config.docker.network.interfaces.v4.subnet.clone(),
-                                    ),
-                                    gateway: Some(
-                                        config.docker.network.interfaces.v4.gateway.clone(),
-                                    ),
+                                    subnet: Some(cfg.docker.network.interfaces.v4.subnet.clone()),
+                                    gateway: Some(cfg.docker.network.interfaces.v4.gateway.clone()),
                                     ..Default::default()
                                 },
                                 bollard::models::IpamConfig {
-                                    subnet: Some(
-                                        config.docker.network.interfaces.v6.subnet.clone(),
-                                    ),
-                                    gateway: Some(
-                                        config.docker.network.interfaces.v6.gateway.clone(),
-                                    ),
+                                    subnet: Some(cfg.docker.network.interfaces.v6.subnet.clone()),
+                                    gateway: Some(cfg.docker.network.interfaces.v6.gateway.clone()),
                                     ..Default::default()
                                 },
                             ]),
                             ..Default::default()
-                        },
-                        options: HashMap::from([
-                            ("encryption", "false"),
-                            ("com.docker.network.bridge.default_bridge", "false"),
+                        }),
+                        options: Some(HashMap::from([
+                            ("encryption".to_string(), "false".to_string()),
                             (
-                                "com.docker.network.bridge.enable_icc",
-                                &config.docker.network.enable_icc.to_string(),
-                            ),
-                            ("com.docker.network.bridge.enable_ip_masquerade", "true"),
-                            ("com.docker.network.bridge.host_binding_ipv4", "0.0.0.0"),
-                            (
-                                "com.docker.network.bridge.name",
-                                &config.docker.network.name,
+                                "com.docker.network.bridge.default_bridge".to_string(),
+                                "false".to_string(),
                             ),
                             (
-                                "com.docker.network.driver.mtu",
-                                &config.docker.network.network_mtu.to_string(),
+                                "com.docker.network.bridge.enable_icc".to_string(),
+                                cfg.docker.network.enable_icc.to_string(),
                             ),
-                        ]),
+                            (
+                                "com.docker.network.bridge.enable_ip_masquerade".to_string(),
+                                "true".to_string(),
+                            ),
+                            (
+                                "com.docker.network.bridge.host_binding_ipv4".to_string(),
+                                "0.0.0.0".to_string(),
+                            ),
+                            (
+                                "com.docker.network.bridge.name".to_string(),
+                                cfg.docker.network.name.to_string(),
+                            ),
+                            (
+                                "com.docker.network.driver.mtu".to_string(),
+                                cfg.docker.network.network_mtu.to_string(),
+                            ),
+                        ])),
                         ..Default::default()
                     })
                     .await?;
@@ -1820,9 +1971,10 @@ impl Config {
                 Ok(())
             }
 
-            match create_network(client, self).await {
+            let initial_result = create_network(client, &self.load()).await;
+            match initial_result {
                 Ok(_) => {
-                    tracing::info!("created docker network {}", self.docker.network.name);
+                    tracing::info!("created docker network {}", self.load().docker.network.name);
                 }
                 Err(bollard::errors::Error::DockerResponseServerError {
                     status_code,
@@ -1835,12 +1987,9 @@ impl Config {
                     let mut attempts = 0;
                     loop {
                         fn increment_ip_or_cidr(ip: &str) -> String {
-                            let network_mask = if let Some(slash) = ip.find('/') {
-                                &ip[slash..]
-                            } else {
-                                ""
-                            };
-                            let ip = ip.trim_end_matches(network_mask);
+                            let (ip, network_mask) = ip
+                                .split_once('/')
+                                .unwrap_or((ip, if ip.contains(':') { "128" } else { "32" }));
 
                             if let Ok(ip) = ip.parse::<std::net::Ipv4Addr>() {
                                 let octets = ip.octets();
@@ -1850,7 +1999,7 @@ impl Config {
                                     octets[2],
                                     octets[3],
                                 );
-                                format!("{}{}", incremented, network_mask)
+                                format!("{incremented}/{network_mask}")
                             } else if let Ok(ip) = ip.parse::<std::net::Ipv6Addr>() {
                                 let segments = ip.segments();
                                 let incremented = std::net::Ipv6Addr::new(
@@ -1863,28 +2012,34 @@ impl Config {
                                     segments[6],
                                     segments[7],
                                 );
-                                format!("{}{}", incremented, network_mask)
+                                format!("{incremented}/{network_mask}")
                             } else {
                                 ip.into()
                             }
                         }
 
-                        self.unsafe_mut().docker.network.interface =
-                            increment_ip_or_cidr(&self.docker.network.interface);
-                        self.unsafe_mut().docker.network.interfaces.v4.subnet =
-                            increment_ip_or_cidr(&self.docker.network.interfaces.v4.subnet);
-                        self.unsafe_mut().docker.network.interfaces.v4.gateway =
-                            increment_ip_or_cidr(&self.docker.network.interfaces.v4.gateway);
-                        self.unsafe_mut().docker.network.interfaces.v6.subnet =
-                            increment_ip_or_cidr(&self.docker.network.interfaces.v6.subnet);
-                        self.unsafe_mut().docker.network.interfaces.v6.gateway =
-                            increment_ip_or_cidr(&self.docker.network.interfaces.v6.gateway);
+                        unsafe {
+                            let m = self.mutate_in_place();
+                            m.docker.network.interface =
+                                increment_ip_or_cidr(&m.docker.network.interface);
+                            m.docker.network.interfaces.v4.subnet =
+                                increment_ip_or_cidr(&m.docker.network.interfaces.v4.subnet);
+                            m.docker.network.interfaces.v4.gateway =
+                                increment_ip_or_cidr(&m.docker.network.interfaces.v4.gateway);
+                            m.docker.network.interfaces.v6.subnet =
+                                increment_ip_or_cidr(&m.docker.network.interfaces.v6.subnet);
+                            m.docker.network.interfaces.v6.gateway =
+                                increment_ip_or_cidr(&m.docker.network.interfaces.v6.gateway);
+                        }
 
-                        if let Err(err) = create_network(client, self).await {
+                        if let Err(err) = create_network(client, &self.load()).await {
                             tracing::warn!("failed to create docker network, trying again...");
                             tracing::error!("failed to create docker network: {:?}", err);
                         } else {
-                            tracing::info!("created docker network {}", self.docker.network.name);
+                            tracing::info!(
+                                "created docker network {}",
+                                self.load().docker.network.name
+                            );
                             break;
                         }
 
@@ -1900,42 +2055,36 @@ impl Config {
                 Err(err) => return Err(err.into()),
             }
 
-            let driver = &self.docker.network.driver;
-            if !matches!(driver.as_str(), "host" | "overlay" | "weavemesh") {
-                self.unsafe_mut().docker.network.interface =
-                    self.docker.network.interfaces.v4.gateway.clone();
+            let driver_is_routed = !matches!(
+                self.load().docker.network.driver.as_str(),
+                "host" | "overlay" | "weavemesh"
+            );
+            if driver_is_routed {
+                unsafe {
+                    let m = self.mutate_in_place();
+                    m.docker.network.interface = m.docker.network.interfaces.v4.gateway.clone();
+                }
             }
         }
 
-        match self.docker.network.driver.as_str() {
-            "host" => {
-                self.unsafe_mut().docker.network.interface = "127.0.0.1".to_string();
-            }
-            "overlay" | "weavemesh" => {
-                self.unsafe_mut().docker.network.interface = "".to_string();
-                self.unsafe_mut().docker.network.ispn = true;
-            }
-            _ => {
-                self.unsafe_mut().docker.network.ispn = false;
+        unsafe {
+            let m = self.mutate_in_place();
+            match m.docker.network.driver.as_str() {
+                "host" => {
+                    m.docker.network.interface = "127.0.0.1".to_string();
+                }
+                "overlay" | "weavemesh" => {
+                    m.docker.network.interface = String::new();
+                    m.docker.network.ispn = true;
+                }
+                _ => {
+                    m.docker.network.ispn = false;
+                }
             }
         }
 
         self.save()?;
 
         Ok(())
-    }
-}
-
-impl Deref for Config {
-    type Target = InnerConfig;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.inner.get() }
-    }
-}
-
-impl DerefMut for Config {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.inner.get() }
     }
 }

@@ -52,49 +52,6 @@ impl BackupAdapter {
 }
 
 impl BackupAdapter {
-    pub async fn exists_any(
-        state: &crate::routes::State,
-        uuid: uuid::Uuid,
-    ) -> Result<bool, anyhow::Error> {
-        for adapter in Self::variants() {
-            if match adapter {
-                BackupAdapter::Wings => {
-                    <wings::WingsBackup as BackupFindExt>::exists(state, uuid).await
-                }
-                BackupAdapter::S3 => <s3::S3Backup as BackupFindExt>::exists(state, uuid).await,
-                BackupAdapter::DdupBak => {
-                    <ddup_bak::DdupBakBackup as BackupFindExt>::exists(state, uuid).await
-                }
-                BackupAdapter::Btrfs => {
-                    <btrfs::BtrfsBackup as BackupFindExt>::exists(state, uuid).await
-                }
-                BackupAdapter::Zfs => <zfs::ZfsBackup as BackupFindExt>::exists(state, uuid).await,
-                BackupAdapter::Restic => {
-                    <restic::ResticBackup as BackupFindExt>::exists(state, uuid).await
-                }
-            }? {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
-    }
-
-    pub async fn exists(
-        self,
-        state: &crate::routes::State,
-        uuid: uuid::Uuid,
-    ) -> Result<bool, anyhow::Error> {
-        match self {
-            BackupAdapter::Wings => wings::WingsBackup::exists(state, uuid).await,
-            BackupAdapter::S3 => s3::S3Backup::exists(state, uuid).await,
-            BackupAdapter::DdupBak => ddup_bak::DdupBakBackup::exists(state, uuid).await,
-            BackupAdapter::Btrfs => btrfs::BtrfsBackup::exists(state, uuid).await,
-            BackupAdapter::Zfs => zfs::ZfsBackup::exists(state, uuid).await,
-            BackupAdapter::Restic => restic::ResticBackup::exists(state, uuid).await,
-        }
-    }
-
     pub async fn find_all(
         state: &crate::routes::State,
         uuid: uuid::Uuid,

@@ -24,7 +24,7 @@ pub struct RawServerBackup {
     pub parts: Vec<RawServerBackupPart>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, ToSchema, Deserialize)]
 pub struct ResticBackupConfiguration {
     pub repository: String,
     pub password_file: Option<String>,
@@ -88,6 +88,34 @@ pub async fn backup_upload_urls(
         client
             .client
             .get(format!("{}/backups/{}?size={}", client.url, uuid, size))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?,
+    )?;
+
+    #[derive(Deserialize)]
+    struct Response {
+        parts: Vec<String>,
+        part_size: u64,
+    }
+
+    Ok((response.part_size, response.parts))
+}
+
+pub async fn backup_s3_part_urls(
+    client: &Client,
+    uuid: uuid::Uuid,
+    from_part: usize,
+) -> Result<(u64, Vec<String>), anyhow::Error> {
+    let response: Response = super::into_json(
+        client
+            .client
+            .get(format!(
+                "{}/backups/{}/s3/parts?from_part={}",
+                client.url, uuid, from_part
+            ))
             .send()
             .await?
             .error_for_status()?

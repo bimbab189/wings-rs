@@ -1,3 +1,4 @@
+use crate::io::SafeSliceMut;
 use std::{
     io::Read,
     pin::Pin,
@@ -22,7 +23,7 @@ impl<R: Read> FixedReader<R> {
 }
 
 impl<R: Read> Read for FixedReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, mut buf: &mut [u8]) -> std::io::Result<usize> {
         if self.bytes_read >= self.size {
             return Ok(0);
         }
@@ -30,10 +31,10 @@ impl<R: Read> Read for FixedReader<R> {
         let remaining = self.size - self.bytes_read;
         let to_read = std::cmp::min(buf.len(), remaining);
 
-        let n = self.inner.read(&mut buf[..to_read])?;
+        let n = self.inner.read(buf.get_slice_mut(..to_read)?)?;
 
         if crate::unlikely(n == 0) {
-            buf[..to_read].fill(0);
+            buf.get_slice_mut(..to_read)?.fill(0);
 
             self.bytes_read += to_read;
             return Ok(to_read);
@@ -73,17 +74,19 @@ impl<R: AsyncRead + Unpin> AsyncRead for AsyncFixedReader<R> {
         let remaining = self.size - self.bytes_read;
         let to_read = std::cmp::min(buf.remaining(), remaining);
 
-        let raw_slice = buf.initialize_unfilled_to(to_read);
-        let mut sub_read_buf = ReadBuf::new(raw_slice);
+        if crate::unlikely(to_read == 0) {
+            return Poll::Ready(Ok(()));
+        }
 
-        match Pin::new(&mut self.inner).poll_read(cx, &mut sub_read_buf) {
+        let mut unfilled = buf.initialize_unfilled_to(to_read);
+        let mut tmp = ReadBuf::new(unfilled.get_slice_mut(..to_read)?);
+
+        match Pin::new(&mut self.inner).poll_read(cx, &mut tmp) {
             Poll::Ready(Ok(())) => {
-                let n = sub_read_buf.filled().len();
+                let n = tmp.filled().len();
 
                 if crate::unlikely(n == 0) {
-                    let dest = buf.initialize_unfilled_to(to_read);
-                    dest.fill(0);
-
+                    unfilled.get_slice_mut(..to_read)?.fill(0);
                     buf.advance(to_read);
                     self.bytes_read += to_read;
                 } else {
@@ -93,7 +96,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for AsyncFixedReader<R> {
 
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
     }

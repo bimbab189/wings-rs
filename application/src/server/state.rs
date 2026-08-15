@@ -1,3 +1,4 @@
+use compact_str::ToCompactString;
 use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc,
@@ -32,6 +33,7 @@ impl ServerState {
 pub struct ServerStateLock {
     state: AtomicU8,
     locked: AtomicBool,
+    pending_restart: AtomicBool,
     sender: tokio::sync::broadcast::Sender<super::websocket::WebsocketMessage>,
     schedule_manager: Arc<super::schedule::manager::ScheduleManager>,
 }
@@ -44,6 +46,7 @@ impl ServerStateLock {
         Self {
             state: AtomicU8::new(0),
             locked: AtomicBool::new(false),
+            pending_restart: AtomicBool::new(false),
             sender,
             schedule_manager,
         }
@@ -61,11 +64,36 @@ impl ServerStateLock {
             .await;
 
         self.sender
-            .send(super::websocket::WebsocketMessage::new(
-                super::websocket::WebsocketEvent::ServerStatus,
-                [state.to_str().into()].into(),
-            ))
+            .send(
+                super::websocket::WebsocketMessage::builder(
+                    super::websocket::WebsocketEvent::ServerStatus,
+                )
+                .arg(state.to_str())
+                .build(),
+            )
             .unwrap_or_default();
+        if (state == ServerState::Offline || state == ServerState::Starting)
+            && self.get_pending_restart()
+        {
+            self.set_pending_restart(false);
+        }
+    }
+
+    pub fn set_pending_restart(&self, pending: bool) {
+        if pending && (self.get_pending_restart() || self.get_state() == ServerState::Offline) {
+            return;
+        }
+
+        self.pending_restart.store(pending, Ordering::Relaxed);
+        self.sender
+            .send(
+                super::websocket::WebsocketMessage::builder(
+                    super::websocket::WebsocketEvent::ServerPendingRestart,
+                )
+                .arg(pending.to_compact_string())
+                .build(),
+            )
+            .ok();
     }
 
     #[inline]
@@ -79,22 +107,26 @@ impl ServerStateLock {
         }
     }
 
+    #[inline]
+    pub fn get_pending_restart(&self) -> bool {
+        self.pending_restart.load(Ordering::Relaxed)
+    }
+
     /// Executes an action with the server state locked.
     /// If the action fails, the state is reverted to the previous state.
     /// Returns `Ok(true)` if the action was executed successfully, `Ok(false)` if the lock was not acquired,
     /// and `Err` if an error occurred during the action execution.
     /// If `aquire_timeout` is `Some`, it will wait for the specified duration to acquire the lock.
     /// If the lock is not acquired within the timeout, it returns `Ok(false)`.
-    pub async fn execute_action<F, Fut>(
+    pub async fn execute_action<
+        F: FnOnce(bool) -> Fut,
+        Fut: Future<Output = Result<(), anyhow::Error>>,
+    >(
         &self,
         state: ServerState,
         action: F,
         aquire_timeout: Option<std::time::Duration>,
-    ) -> Result<bool, anyhow::Error>
-    where
-        F: FnOnce(bool) -> Fut,
-        Fut: Future<Output = Result<(), anyhow::Error>>,
-    {
+    ) -> Result<bool, anyhow::Error> {
         let old_state = self.get_state();
 
         let mut aquired = false;

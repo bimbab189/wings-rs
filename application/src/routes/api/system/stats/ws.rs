@@ -23,13 +23,18 @@ pub async fn handle_ws(ws: WebSocketUpgrade, state: GetState) -> Response {
                 async move {
                     loop {
                         let stats = state.stats_manager.get_stats().await;
+                        let stats_json = match serde_json::to_string(&*stats) {
+                            Ok(json) => json,
+                            Err(err) => {
+                                tracing::error!("Failed to serialize stats to JSON: {}", err);
+                                continue;
+                            }
+                        };
 
                         socket
                             .lock()
                             .await
-                            .send(Message::Text(
-                                serde_json::to_string(&*stats).unwrap().into(),
-                            ))
+                            .send(Message::Text(stats_json.into()))
                             .await?;
 
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;

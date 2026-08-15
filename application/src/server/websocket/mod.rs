@@ -72,6 +72,8 @@ pub enum WebsocketEvent {
     ServerStats,
     #[serde(rename = "status")]
     ServerStatus,
+    #[serde(rename = "pending restart")]
+    ServerPendingRestart,
     #[serde(rename = "custom event")]
     ServerCustomEvent,
     #[serde(rename = "console output")]
@@ -166,6 +168,55 @@ pub struct WebsocketMessage {
     pub args: Arc<[compact_str::CompactString]>,
 }
 
+impl WebsocketMessage {
+    #[inline]
+    pub fn builder(event: WebsocketEvent) -> WebsocketMessageBuilder {
+        WebsocketMessageBuilder::new(event)
+    }
+}
+
+pub struct WebsocketMessageBuilder {
+    event: WebsocketEvent,
+    args: Vec<compact_str::CompactString>,
+}
+
+impl WebsocketMessageBuilder {
+    pub fn new(event: WebsocketEvent) -> Self {
+        Self {
+            event,
+            args: Vec::new(),
+        }
+    }
+
+    pub fn json_arg(mut self, arg: impl Serialize) -> Self {
+        match serde_json::to_string(&arg) {
+            Ok(arg) => self.args.push(arg.into()),
+            Err(err) => tracing::warn!("failed to serialize websocket message argument: {:?}", err),
+        }
+        self
+    }
+
+    pub fn arg(mut self, arg: impl Into<compact_str::CompactString>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    pub fn args(
+        mut self,
+        args: impl IntoIterator<Item = impl Into<compact_str::CompactString>>,
+    ) -> Self {
+        self.args.extend(args.into_iter().map(|arg| arg.into()));
+        self
+    }
+
+    pub fn build(self) -> WebsocketMessage {
+        WebsocketMessage {
+            event: self.event,
+            args: Arc::from(self.args),
+        }
+    }
+}
+
 fn string_vec_or_empty<'de, D>(
     deserializer: D,
 ) -> Result<Arc<[compact_str::CompactString]>, D::Error>
@@ -217,13 +268,6 @@ where
     seq.end()
 }
 
-impl WebsocketMessage {
-    #[inline]
-    pub fn new(event: WebsocketEvent, args: Arc<[compact_str::CompactString]>) -> Self {
-        Self { event, args }
-    }
-}
-
 pub type SocketJwt = Arc<RwLock<Option<Arc<WebsocketJwtPayload>>>>;
 
 pub struct ServerWebsocketHandler {
@@ -264,7 +308,11 @@ impl ServerWebsocketHandler {
     async fn get_server(&self) -> Result<(uuid::Uuid, crate::server::Server), anyhow::Error> {
         let jwt = self.get_jwt().await?;
 
-        if let Err(err) = jwt.base.validate(&self.state.config.jwt).await {
+        if let Err(err) = jwt
+            .base
+            .validate(&self.state.config.jwt, Some("websocket"))
+            .await
+        {
             return Err(anyhow::anyhow!("invalid token: {err}"));
         }
 
@@ -359,15 +407,15 @@ impl ServerWebsocketHandler {
     }
 
     async fn send_error(&self, message: impl Into<Cow<'_, str>>) {
-        let message = WebsocketMessage::new(
-            WebsocketEvent::ServerDaemonMessage,
-            [ansi_term::Style::new()
-                .bold()
-                .on(ansi_term::Color::Red)
-                .paint(message.into())
-                .to_compact_string()]
-            .into(),
-        );
+        let message = WebsocketMessage::builder(WebsocketEvent::ServerDaemonMessage)
+            .arg(
+                nu_ansi_term::Style::new()
+                    .bold()
+                    .on(nu_ansi_term::Color::Red)
+                    .paint(message.into())
+                    .to_compact_string(),
+            )
+            .build();
 
         let message = if self.binary_mode.load(Ordering::Relaxed) {
             let message = match rmp_serde::to_vec(&message) {
@@ -409,15 +457,15 @@ impl ServerWebsocketHandler {
             "An unexpected error occurred. Please contact an Administrator.".into()
         };
 
-        let message = WebsocketMessage::new(
-            WebsocketEvent::ServerDaemonMessage,
-            [ansi_term::Style::new()
-                .bold()
-                .on(ansi_term::Color::Red)
-                .paint(message)
-                .to_compact_string()]
-            .into(),
-        );
+        let message = WebsocketMessage::builder(WebsocketEvent::ServerDaemonMessage)
+            .arg(
+                nu_ansi_term::Style::new()
+                    .bold()
+                    .on(nu_ansi_term::Color::Red)
+                    .paint(message)
+                    .to_compact_string(),
+            )
+            .build();
         let message = if self.binary_mode.load(Ordering::Relaxed) {
             let message = match rmp_serde::to_vec(&message) {
                 Ok(message) => message,

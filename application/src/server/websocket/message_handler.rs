@@ -56,23 +56,32 @@ pub async fn handle_message(
         }
         WebsocketEvent::SendStats => {
             websocket_handler
-                .send_message(WebsocketMessage::new(
-                    WebsocketEvent::ServerStats,
-                    [serde_json::to_string(&server.resource_usage().await)?.into()].into(),
-                ))
+                .send_message(
+                    WebsocketMessage::builder(WebsocketEvent::ServerStats)
+                        .json_arg(server.resource_usage().await)
+                        .build(),
+                )
+                .await;
+            websocket_handler
+                .send_message(
+                    WebsocketMessage::builder(WebsocketEvent::ServerPendingRestart)
+                        .arg(server.state.get_pending_restart().to_compact_string())
+                        .build(),
+                )
                 .await;
         }
         WebsocketEvent::SendStatus => {
             websocket_handler
-                .send_message(WebsocketMessage::new(
-                    WebsocketEvent::ServerStatus,
-                    [server.state.get_state().to_str().into()].into(),
-                ))
+                .send_message(
+                    WebsocketMessage::builder(WebsocketEvent::ServerStatus)
+                        .arg(server.state.get_state().to_str())
+                        .build(),
+                )
                 .await;
         }
         WebsocketEvent::SendServerLogs => {
             if server.state.get_state() != crate::server::state::ServerState::Offline
-                || state.config.api.send_offline_server_logs
+                || state.config.load().api.send_offline_server_logs
             {
                 let socket_jwt = websocket_handler.get_jwt().await?;
 
@@ -85,15 +94,16 @@ pub async fn handle_message(
                 drop(socket_jwt);
 
                 let mut log_stream = server
-                    .read_log(Some(state.config.system.websocket_log_count))
+                    .logs_lines(Some(state.config.load().system.websocket_log_count))
                     .await;
 
                 while let Some(Ok(line)) = log_stream.next().await {
                     websocket_handler
-                        .send_message(WebsocketMessage::new(
-                            WebsocketEvent::ServerConsoleOutput,
-                            [line.trim().into()].into(),
-                        ))
+                        .send_message(
+                            WebsocketMessage::builder(WebsocketEvent::ServerConsoleOutput)
+                                .arg(line.trim())
+                                .build(),
+                        )
                         .await;
                 }
             }
@@ -361,7 +371,6 @@ pub async fn handle_message(
             let Some(raw_command) = message.args.first() else {
                 return Ok(());
             };
-
             let raw_command = raw_command.to_string();
             if crate::server::helper::is_web_hosting_server(server).await {
                 handle_web_hosting_console_command(
@@ -376,36 +385,38 @@ pub async fn handle_message(
                 return Ok(());
             }
 
-            if let Some(stdin) = server.container_stdin().await {
-                let mut command = raw_command.to_compact_string();
-                command.push('\n');
+            let mut command = raw_command.to_compact_string();
+            command.push('\n');
 
-                if let Err(err) = stdin.send(command).await {
-                    tracing::error!(
-                        server = %server.uuid,
-                        "failed to send command to server: {}",
-                        err
-                    );
-                } else {
-                    server
-                        .activity
-                        .log_activity(Activity {
-                            event: ActivityEvent::ConsoleCommand,
-                            user: Some(user_uuid),
-                            ip: user_ip,
-                            metadata: Some(json!({
-                                "command_length": raw_command.len(),
-                            })),
-                            schedule: None,
-                            timestamp: chrono::Utc::now(),
-                        })
-                        .await;
-                }
+            if let Err(err) = server.send_stdin(command.into()).await {
+                tracing::error!(
+                    server = %server.uuid,
+                    "failed to send command to server: {}",
+                    err
+                );
+            } else {
+                server
+                    .activity
+                    .log_activity(Activity {
+                        event: ActivityEvent::ConsoleCommand,
+                        user: Some(user_uuid),
+                        ip: user_ip,
+                        metadata: Some(json!({
+                            "command_length": raw_command.len(),
+                        })),
+                        schedule: None,
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
             }
         }
         WebsocketEvent::Ping => {
             websocket_handler
-                .send_message(WebsocketMessage::new(WebsocketEvent::Pong, message.args))
+                .send_message(
+                    WebsocketMessage::builder(WebsocketEvent::Pong)
+                        .args(message.args.iter().cloned())
+                        .build(),
+                )
                 .await;
         }
         _ => {
@@ -516,10 +527,11 @@ async fn send_console_output(
     }
 
     websocket_handler
-        .send_message(WebsocketMessage::new(
-            WebsocketEvent::ServerConsoleOutput,
-            [output.to_compact_string()].into(),
-        ))
+        .send_message(
+            WebsocketMessage::builder(WebsocketEvent::ServerConsoleOutput)
+                .arg(output)
+                .build(),
+        )
         .await;
 }
 

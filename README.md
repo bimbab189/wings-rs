@@ -3,9 +3,9 @@
 # Calagopus Wings
 
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg?logo=rust)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/github/license/calagopus/panel?color=blue)](https://github.com/calagopus/panel/blob/main/LICENSE)
-[![GitHub issues](https://img.shields.io/github/issues/calagopus/panel)](https://github.com/calagopus/panel/issues)
-[![GitHub stars](https://img.shields.io/github/stars/calagopus/panel)](https://github.com/calagopus/panel/stargazers)
+[![License](https://img.shields.io/github/license/calagopus/wings?color=blue)](https://github.com/calagopus/wings/blob/main/LICENSE)
+[![GitHub issues](https://img.shields.io/github/issues/calagopus/wings)](https://github.com/calagopus/wings/issues)
+[![GitHub stars](https://img.shields.io/github/stars/calagopus/wings)](https://github.com/calagopus/wings/stargazers)
 [![Discord](https://img.shields.io/discord/1429911351777824892?label=discord&logo=discord&color=5865F2)](https://discord.gg/uSM8tvTxBV)
 
 A rewrite of [Pterodactyl Wings](https://github.com/pterodactyl/wings) in the Rust programming language. This rewrite aims to be 100% API compatible while implementing new features and better performance.
@@ -17,6 +17,8 @@ A rewrite of [Pterodactyl Wings](https://github.com/pterodactyl/wings) in the Ru
 For installation instructions, please refer to the [Docs](https://calagopus.com/docs/wings/installation).
 
 ## Added Config Options
+
+[Read full Config Reference](https://calagopus.com/docs/wings/configuration)
 
 ```yml
 api:
@@ -55,6 +57,9 @@ system:
   # path for temporary mountpoints for servers
   vmount_directory: /var/lib/pterodactyl/vmounts
 
+  # how many concurrent disk checks to allow for all servers globally, this applies to all disk checks - so also partial checks.
+  # 2 means no more than 2 servers will be checked at any given time
+  disk_check_concurrency: 2
   # how often to do a full disk check when inotify is used, this is to prevent gradual desync between the
   # actual disk usage and the inotify events. 6 means that a full disk check will be done every 6 inotify disk checks.
   # so, if disk_check_interval is 150 seconds, then a full disk check will be done every 900 seconds (15 minutes)
@@ -102,6 +107,16 @@ system:
       log_logins: false
       # whether to log file read actions in server activity
       log_file_reads: false
+
+  file_history:
+    enabled: true
+    zstd_level: 19
+    anchor_interval: 4
+    keep_chains: 2
+    file_size_cap: 1048576
+    per_file_disk_budget: 5242880
+    per_server_disk_budget: 209715200
+    maintenance_interval: 3600
 
   backups:
     # what compression level to use? best_speed, good_speed, good_compression, best_compression (higher compression = more CPU usage, better compression)

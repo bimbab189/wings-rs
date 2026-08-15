@@ -84,13 +84,10 @@ pub async fn read_manifest(
 }
 
 pub async fn resolve_container_ip(server: &crate::server::Server) -> Result<String, anyhow::Error> {
-    let docker_id = {
-        let container = server.container.read().await;
-        let container = container
-            .as_ref()
-            .context("server container is not attached")?;
-        container.docker_id.clone()
-    };
+    let docker_id = server
+        .docker_container_id()
+        .await
+        .context("server container is not attached")?;
 
     let details = server
         .app_state
@@ -99,7 +96,7 @@ pub async fn resolve_container_ip(server: &crate::server::Server) -> Result<Stri
         .await
         .context("failed to inspect container")?;
 
-    let preferred_network = server.app_state.config.docker.network.name.clone();
+    let preferred_network = server.app_state.config.load().docker.network.name.clone();
 
     if let Some(networks) = details
         .network_settings
@@ -158,14 +155,10 @@ pub async fn exec_container_shell_command_with_env(
         return Err(anyhow::anyhow!("command cannot be empty"));
     }
 
-    let docker_id = {
-        let container = server.container.read().await;
-        let container = container
-            .as_ref()
-            .context("server container is not attached")?;
-
-        container.docker_id.clone()
-    };
+    let docker_id = server
+        .docker_container_id()
+        .await
+        .context("server container is not attached")?;
 
     let mut environment = vec!["HOME=/home/container".to_string()];
     environment.extend(extra_env.iter().cloned());

@@ -197,10 +197,11 @@ impl ExecSession {
                                     compression_level: self
                                         .state
                                         .config
+                                        .load()
                                         .system
                                         .backups
                                         .compression_level,
-                                    threads: self.state.config.api.file_compression_threads,
+                                    threads: self.state.config.load().api.file_compression_threads,
                                 },
                             )
                             .await?;
@@ -219,10 +220,10 @@ impl ExecSession {
                 }
 
                 if self.has_permission(Permission::ControlConsole).await {
-                    if self.server.state.get_state() != crate::server::state::ServerState::Offline
-                        && let Some(stdin) = self.server.container_stdin().await
-                    {
-                        if let Err(err) = stdin.send(format!("{command}\n").into()).await {
+                    if self.server.state.get_state() != crate::server::state::ServerState::Offline {
+                        if let Err(err) =
+                            self.server.send_stdin(format!("{command}\n").into()).await
+                        {
                             tracing::error!(
                                 server = %self.server.uuid,
                                 "failed to send command to server: {}",

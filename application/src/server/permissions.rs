@@ -71,9 +71,30 @@ impl Permission {
         )
     }
 
-    #[inline]
-    pub fn matches(self, other: Permission) -> bool {
-        self == other || (other == Permission::All && !other.is_admin())
+    pub fn to_str(self) -> &'static str {
+        match self {
+            Permission::All => "*",
+            Permission::MetaCalagopus => "meta.calagopus",
+            Permission::WebsocketConnect => "websocket.connect",
+            Permission::ControlReadConsole => "control.read-console",
+            Permission::ControlConsole => "control.console",
+            Permission::ControlStart => "control.start",
+            Permission::ControlStop => "control.stop",
+            Permission::ControlRestart => "control.restart",
+            Permission::AdminWebsocketErrors => "admin.websocket.errors",
+            Permission::AdminWebsocketInstall => "admin.websocket.install",
+            Permission::AdminWebsocketTransfer => "admin.websocket.transfer",
+            Permission::BackupRead => "backup.read",
+            Permission::ScheduleRead => "schedule.read",
+            Permission::FileRead => "file.read",
+            Permission::FileReadContent => "file.read-content",
+            Permission::FileCreate => "file.create",
+            Permission::FileUpdate => "file.update",
+            Permission::FileDelete => "file.delete",
+            Permission::FileArchive => "file.archive",
+            Permission::FileSftp => "file.sftp",
+            Permission::WebIdeAccess => "webide.access",
+        }
     }
 }
 
@@ -117,9 +138,11 @@ impl UserPermissionsMap {
     pub async fn wait_for_removal(&self, user_uuid: uuid::Uuid) {
         let mut receiver = self.removal_sender.subscribe();
 
-        while let Ok(uuid) = receiver.recv().await {
-            if uuid == user_uuid {
-                break;
+        loop {
+            match receiver.recv().await {
+                Ok(uuid) if uuid == user_uuid => break,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                _ => {}
             }
         }
     }
@@ -238,10 +261,10 @@ impl Permissions {
 
     #[inline]
     pub fn has_permission(&self, permission: Permission) -> bool {
-        for p in self.0.iter().copied() {
-            if permission.matches(p) {
-                return true;
-            }
+        if (self.0.contains(&Permission::All) && !permission.is_admin())
+            || self.0.contains(&permission)
+        {
+            return true;
         }
 
         false

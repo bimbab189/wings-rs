@@ -6,7 +6,6 @@ use crate::{
         websocket::WebsocketEvent,
     },
 };
-use futures::StreamExt;
 use russh::{Channel, ChannelWriteHalf, server::Msg};
 use serde_json::json;
 use std::{pin::Pin, sync::Arc};
@@ -51,7 +50,6 @@ impl ShellSession {
         line: &str,
         writer: &mut Pin<Box<impl tokio::io::AsyncWrite>>,
     ) {
-        let prefix = &self.state.config.system.sftp.shell.cli.name;
         writer.write_all(b"\r\n").await.unwrap_or_default();
 
         let prelude = self.state.config.daemon_prelude();
@@ -263,6 +261,8 @@ impl ShellSession {
                     }
                 }
                 _ => {
+                    let config = self.state.config.load();
+                    let prefix = &config.system.sftp.shell.cli.name;
                     writeln(&format!("Usage: {prefix} power <start|restart|stop|kill>")).await;
                 }
             },
@@ -343,16 +343,16 @@ impl ShellSession {
         let line = line.trim();
         let mut output = Vec::new();
         let mut writer = Box::pin(&mut output);
+        let config = self.state.config.load();
+        let cli_name = config.system.sftp.shell.cli.name.clone();
+        let app_name = config.app_name.clone();
+        drop(config);
 
-        if line.split_whitespace().next()
-            == Some(self.state.config.system.sftp.shell.cli.name.as_str())
-        {
+        if line.split_whitespace().next() == Some(cli_name.as_str()) {
             self.handle_cli_command(line, &mut writer).await;
         } else if self.has_permission(Permission::ControlConsole).await {
-            if self.server.state.get_state() != crate::server::state::ServerState::Offline
-                && let Some(stdin) = self.server.container_stdin().await
-            {
-                if let Err(error) = stdin.send(format!("{line}\n").into()).await {
+            if self.server.state.get_state() != crate::server::state::ServerState::Offline {
+                if let Err(error) = self.server.send_stdin(format!("{line}\n").into()).await {
                     writer.write_all(b"\r\n").await.unwrap_or_default();
                     tracing::error!(server = %self.server.uuid, %error, "failed to send Web IDE shell command");
                 } else {
@@ -373,9 +373,9 @@ impl ShellSession {
                         .await;
                 }
             } else {
-                let prelude = ansi_term::Color::Yellow
+                let prelude = nu_ansi_term::Color::Yellow
                     .bold()
-                    .paint(format!("[{} Daemon]:", self.state.config.app_name));
+                    .paint(format!("[{app_name} Daemon]:"));
                 writer
                     .write_all(
                         format!("\r\n{prelude} The server is currently offline.\r\n\x1b[2K")
@@ -385,9 +385,9 @@ impl ShellSession {
                     .unwrap_or_default();
             }
         } else {
-            let prelude = ansi_term::Color::Yellow
+            let prelude = nu_ansi_term::Color::Yellow
                 .bold()
-                .paint(format!("[{} Daemon]:", self.state.config.app_name));
+                .paint(format!("[{app_name} Daemon]:"));
             writer
                 .write_all(format!("\r\n{prelude} You are missing the `control.console` permission to do this.\r\n\x1b[2K").as_bytes())
                 .await
@@ -433,7 +433,9 @@ impl ShellSession {
                         return;
                     };
 
-                    let history_cmd = &command_history[history_index];
+                    let Some(history_cmd) = command_history.get(history_index) else {
+                        return;
+                    };
 
                     data_writer.write_all(b"\r").await.unwrap_or_default();
                     let mut output = Vec::with_capacity(history_cmd.len() + 3);
@@ -452,9 +454,8 @@ impl ShellSession {
             }
             b'B' => {
                 if let Some(inner_history_index) = history_index {
-                    if *inner_history_index < command_history.len() - 1 {
+                    if let Some(history_cmd) = command_history.get(*inner_history_index + 1) {
                         *inner_history_index += 1;
-                        let history_cmd = &command_history[*inner_history_index];
 
                         data_writer.write_all(b"\r").await.unwrap_or_default();
                         let mut output = Vec::with_capacity(history_cmd.len() + 3);
@@ -547,14 +548,17 @@ impl ShellSession {
 
                     match self.mode {
                         ShellMode::Normal => {
-                            if line.starts_with(&self.state.config.system.sftp.shell.cli.name) {
+                            if line
+                                .starts_with(&self.state.config.load().system.sftp.shell.cli.name)
+                            {
                                 self.handle_cli_command(&line, data_writer).await;
                             } else if self.has_permission(Permission::ControlConsole).await {
                                 if self.server.state.get_state()
                                     != crate::server::state::ServerState::Offline
-                                    && let Some(stdin) = self.server.container_stdin().await
                                 {
-                                    if let Err(err) = stdin.send(format!("{line}\n").into()).await {
+                                    if let Err(err) =
+                                        self.server.send_stdin(format!("{line}\n").into()).await
+                                    {
                                         data_writer.write_all(b"\r\n").await.unwrap_or_default();
 
                                         tracing::error!(
@@ -632,12 +636,13 @@ impl ShellSession {
                         current_line.remove(*cursor_pos - 1);
                         *cursor_pos -= 1;
 
+                        let Some(line_slice) = current_line.get(*cursor_pos..) else {
+                            return;
+                        };
+
                         data_writer.write_all(b"\x08").await.unwrap_or_default();
                         data_writer.write_all(b"\x1b[K").await.unwrap_or_default();
-                        data_writer
-                            .write_all(&current_line[*cursor_pos..])
-                            .await
-                            .unwrap_or_default();
+                        data_writer.write_all(line_slice).await.unwrap_or_default();
 
                         if *cursor_pos < current_line.len() {
                             let move_back = current_line.len() - *cursor_pos;
@@ -667,11 +672,12 @@ impl ShellSession {
                         current_line.insert(*cursor_pos, byte);
                         *cursor_pos += 1;
 
+                        let Some(line_slice) = current_line.get(*cursor_pos..) else {
+                            return;
+                        };
+
                         data_writer.write_all(&[byte]).await.unwrap_or_default();
-                        data_writer
-                            .write_all(&current_line[*cursor_pos..])
-                            .await
-                            .unwrap_or_default();
+                        data_writer.write_all(line_slice).await.unwrap_or_default();
 
                         if *cursor_pos < current_line.len() {
                             let move_back = current_line.len() - *cursor_pos;
@@ -704,7 +710,7 @@ impl ShellSession {
                 .write_all(
                     format!(
                         "\x1b]0;{} - {}\x07",
-                        self.state.config.app_name,
+                        self.state.config.load().app_name,
                         self.server.configuration.read().await.meta.name
                     )
                     .as_bytes(),
@@ -720,7 +726,7 @@ impl ShellSession {
             {
                 let mut log_stream = self
                     .server
-                    .read_log(Some(self.state.config.system.websocket_log_count))
+                    .logs(Some(self.state.config.load().system.websocket_log_count))
                     .await;
 
                 {
@@ -740,15 +746,11 @@ impl ShellSession {
                 }
 
                 if self.server.state.get_state() != crate::server::state::ServerState::Offline
-                    || self.state.config.api.send_offline_server_logs
+                    || self.state.config.load().api.send_offline_server_logs
                 {
-                    while let Some(Ok(line)) = log_stream.next().await {
-                        writer
-                            .make_writer()
-                            .write_all(line.as_bytes())
-                            .await
-                            .unwrap_or_default();
-                    }
+                    tokio::io::copy(&mut log_stream, &mut writer.make_writer())
+                        .await
+                        .unwrap_or_default();
                 }
             } else {
                 let prelude = self.state.config.daemon_prelude();
@@ -831,12 +833,15 @@ impl ShellSession {
                                     }
                                     WebsocketEvent::ServerStatus => {
                                         let prelude = state.config.daemon_prelude();
+                                        let Some(status) = message.args.first() else {
+                                            return;
+                                        };
 
                                         writer
                                             .write_all(
                                                 format!(
                                                     "{prelude} Server marked as {}...\r\n\x1b[2K",
-                                                    message.args[0]
+                                                    status
                                                 )
                                                 .as_bytes(),
                                             )
@@ -883,7 +888,7 @@ impl ShellSession {
                                 continue;
                             }
 
-                            if let Some(mut stdout) = server.container_stdout().await {
+                            if let Some(mut stdout) = server.get_stdout_lines_ratelimited().await {
                                 loop {
                                     if !server
                                         .user_permissions
@@ -955,8 +960,12 @@ impl ShellSession {
                     loop {
                         match reader.read(&mut buffer).await {
                             Ok(0) => break,
-                            Ok(n) => {
-                                for &byte in &buffer[..n] {
+                            Ok(bytes_read) => {
+                                let Some(buffer_slice) = buffer.get(..bytes_read) else {
+                                    continue;
+                                };
+
+                                for &byte in buffer_slice {
                                     if escape_sequence {
                                         sequence_buffer.push(byte);
 

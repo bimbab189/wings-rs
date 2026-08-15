@@ -31,7 +31,7 @@ async fn get_download_client(
     let mut write_lock = DOWNLOAD_CLIENT.write().await;
 
     let new_client = reqwest::Client::builder()
-        .user_agent("Pterodactyl Panel (https://pterodactyl.io)")
+        .user_agent("Calagopus Wings (https://github.com/calagopus/wings)")
         .connect_timeout(std::time::Duration::from_secs(30))
         .dns_resolver(Arc::new(resolver::DnsResolver::new(config)))
         .build()
@@ -62,7 +62,7 @@ impl PullQueryResponse {
         if let Some(host) = url.host_str()
             && let Ok(ip) = std::net::IpAddr::from_str(host)
         {
-            for cidr in config.api.remote_download_blocked_cidrs.iter() {
+            for cidr in config.load().api.remote_download_blocked_cidrs.iter() {
                 if cidr.contains(&ip) {
                     tracing::warn!("blocking internal IP address in pull: {}", ip);
                     return Err(anyhow::anyhow!("IP address {} is blocked", ip));
@@ -142,6 +142,7 @@ impl Download {
             for cidr in server
                 .app_state
                 .config
+                .load()
                 .api
                 .remote_download_blocked_cidrs
                 .iter()

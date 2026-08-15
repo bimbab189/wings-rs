@@ -9,11 +9,6 @@ pub struct UsedSpace {
 
 impl UsedSpace {
     #[inline]
-    pub fn new(logical: u64, physical: u64) -> Self {
-        Self { logical, physical }
-    }
-
-    #[inline]
     pub fn get_logical(&self) -> u64 {
         self.logical
     }
@@ -89,26 +84,10 @@ impl SpaceDelta {
     }
 
     #[inline]
-    pub fn zero() -> Self {
-        Self {
-            logical: 0,
-            physical: 0,
-        }
-    }
-
-    #[inline]
     pub fn only_logical(logical: i64) -> Self {
         Self {
             logical,
             physical: 0,
-        }
-    }
-
-    #[inline]
-    pub fn only_physical(physical: i64) -> Self {
-        Self {
-            logical: 0,
-            physical,
         }
     }
 }
@@ -138,18 +117,20 @@ pub struct DiskUsage {
 impl DiskUsage {
     fn upsert_entry(&mut self, key: &str) -> &mut DiskUsage {
         match self.entries.binary_search_by(|a| a.0.as_str().cmp(key)) {
-            Ok(idx) => &mut self.entries[idx].1,
+            // SAFETY: The binary search guarantees that the index is within bounds, and the entry at that index has the same key as the provided key.
+            Ok(idx) => unsafe { &mut self.entries.get_unchecked_mut(idx).1 },
             Err(idx) => {
                 self.entries
                     .insert(idx, (key.to_compact_string(), DiskUsage::default()));
-                &mut self.entries[idx].1
+                // SAFETY: We just inserted an entry at the index, so it is guaranteed to be within bounds, and the entry at that index has the same key as the provided key.
+                unsafe { &mut self.entries.get_unchecked_mut(idx).1 }
             }
         }
     }
 
     fn get_mut_entry(&mut self, key: &str) -> Option<&mut DiskUsage> {
         if let Ok(idx) = self.entries.binary_search_by(|a| a.0.as_str().cmp(key)) {
-            Some(&mut self.entries[idx].1)
+            Some(&mut self.entries.get_mut(idx)?.1)
         } else {
             None
         }
@@ -180,7 +161,7 @@ impl DiskUsage {
                 .entries
                 .binary_search_by(|(n, _)| n.as_str().cmp(name))
                 .ok()?;
-            current = &current.entries[idx].1;
+            current = &current.entries.get(idx)?.1;
         }
 
         Some(current.space)
@@ -198,7 +179,7 @@ impl DiskUsage {
                 .entries
                 .binary_search_by(|(n, _)| n.as_str().cmp(name))
                 .ok()?;
-            current = &current.entries[idx].1;
+            current = &current.entries.get(idx)?.1;
         }
 
         Some(current)
@@ -261,7 +242,7 @@ impl DiskUsage {
         for component in path {
             let entry = current.upsert_entry(component.as_ref());
 
-            tracing::debug!(?component, "applying path delta");
+            tracing::trace!(?component, "applying path delta");
 
             if delta.logical >= 0 {
                 entry.space.add_logical(delta.logical as u64);
@@ -294,7 +275,7 @@ impl DiskUsage {
         let component = components.next()?;
         let name = component.as_os_str().to_str().unwrap_or_default();
 
-        tracing::debug!(?component, "applying path delta");
+        tracing::trace!(?component, "applying path delta");
 
         if components.peek().is_none() {
             let removed = self.remove_entry(name)?;
@@ -337,7 +318,7 @@ impl DiskUsage {
 
         let mut current = self;
         for component in parents {
-            tracing::debug!(?component, "applying path delta");
+            tracing::trace!(?component, "applying path delta");
 
             current.space.add_logical(source_dir.space.get_logical());
             current.space.add_physical(source_dir.space.get_physical());

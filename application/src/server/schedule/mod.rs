@@ -198,26 +198,6 @@ impl Schedule {
         }
     }
 
-    pub async fn trigger_with_context(
-        &self,
-        skip_condition: bool,
-        execution_context: ScheduleExecutionContext,
-    ) -> Option<ScheduleExecutionContext> {
-        let old_context = self
-            .next_execution_context
-            .lock()
-            .await
-            .replace(execution_context);
-
-        if skip_condition {
-            self.executor_skip_notifier.notify_one();
-        } else {
-            self.executor_notifier.notify_one();
-        }
-
-        old_context
-    }
-
     pub async fn update(&self, raw_schedule: &super::configuration::Schedule) {
         *self.condition.write().await = raw_schedule.condition.clone();
         *self.raw_actions.write().await = Arc::new(raw_schedule.actions.clone());
@@ -304,10 +284,11 @@ impl Schedule {
 
                 server
                     .websocket
-                    .send(WebsocketMessage::new(
-                        WebsocketEvent::ServerScheduleStarted,
-                        [uuid.to_compact_string()].into(),
-                    ))
+                    .send(
+                        WebsocketMessage::builder(WebsocketEvent::ServerScheduleStarted)
+                            .arg(uuid.to_compact_string())
+                            .build(),
+                    )
                     .ok();
 
                 for raw_action in raw_actions.iter() {
@@ -318,14 +299,12 @@ impl Schedule {
 
                     server
                         .websocket
-                        .send(WebsocketMessage::new(
-                            WebsocketEvent::ServerScheduleStepStatus,
-                            [
-                                uuid.to_compact_string(),
-                                raw_action.uuid.to_compact_string(),
-                            ]
-                            .into(),
-                        ))
+                        .send(
+                            WebsocketMessage::builder(WebsocketEvent::ServerScheduleStepStatus)
+                                .arg(uuid.to_compact_string())
+                                .arg(raw_action.uuid.to_compact_string())
+                                .build(),
+                        )
                         .ok();
 
                     match raw_action
@@ -344,15 +323,15 @@ impl Schedule {
 
                             server
                                 .websocket
-                                .send(WebsocketMessage::new(
-                                    WebsocketEvent::ServerScheduleStepError,
-                                    [
-                                        uuid.to_compact_string(),
-                                        raw_action.uuid.to_compact_string(),
-                                        err.to_compact_string(),
-                                    ]
-                                    .into(),
-                                ))
+                                .send(
+                                    WebsocketMessage::builder(
+                                        WebsocketEvent::ServerScheduleStepError,
+                                    )
+                                    .arg(uuid.to_compact_string())
+                                    .arg(raw_action.uuid.to_compact_string())
+                                    .arg(err.to_compact_string())
+                                    .build(),
+                                )
                                 .ok();
 
                             if !raw_action.action.ignore_failure() {
@@ -372,10 +351,11 @@ impl Schedule {
 
                 server
                     .websocket
-                    .send(WebsocketMessage::new(
-                        WebsocketEvent::ServerScheduleCompleted,
-                        [uuid.to_compact_string()].into(),
-                    ))
+                    .send(
+                        WebsocketMessage::builder(WebsocketEvent::ServerScheduleCompleted)
+                            .arg(uuid.to_compact_string())
+                            .build(),
+                    )
                     .ok();
 
                 *completion_status.lock().await = Some(ApiScheduleCompletionStatus {
@@ -422,10 +402,16 @@ impl Schedule {
                                 let timezone = timezone_lock
                                     .container
                                     .timezone
-                                    .as_ref()
-                                    .unwrap_or(&server.app_state.config.system.timezone);
-                                let timezone =
-                                    chrono_tz::Tz::from_str(timezone).unwrap_or(chrono_tz::UTC);
+                                    .as_deref()
+                                    .map_or_else(
+                                        || {
+                                            chrono_tz::Tz::from_str(
+                                                &server.app_state.config.load().system.timezone,
+                                            )
+                                        },
+                                        chrono_tz::Tz::from_str,
+                                    )
+                                    .unwrap_or(chrono_tz::UTC);
                                 drop(timezone_lock);
 
                                 let now_datetime = chrono::Utc::now().with_timezone(&timezone);
@@ -463,7 +449,7 @@ impl Schedule {
 
                         async move {
                             loop {
-                                let mut stdout = match server.container_stdout().await {
+                                let mut stdout = match server.get_stdout_lines().await {
                                     Some(stdout) => stdout,
                                     None => {
                                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;

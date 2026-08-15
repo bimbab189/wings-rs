@@ -4,6 +4,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 pub(crate) mod config;
 pub(crate) mod logs;
 pub(crate) mod overview;
+pub(crate) mod restic;
 pub(crate) mod ssh_sessions;
 pub(crate) mod stats;
 pub(crate) mod upgrade;
@@ -51,5 +52,6 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/stats", stats::router(state))
         .nest("/ssh-sessions", ssh_sessions::router(state))
         .nest("/web-hosting", web_hosting::router(state))
+        .nest("/restic", restic::router(state))
         .with_state(state.clone())
 }

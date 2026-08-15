@@ -42,7 +42,7 @@ User=root
 KillMode=process
 WorkingDirectory=/etc/pterodactyl
 LimitNOFILE=4096
-PIDFile=/var/run/wings/daemon.pid
+PIDFile=/run/calagopus-wings/daemon.pid
 ExecStart={}
 Restart=on-failure
 StartLimitInterval=180
@@ -64,12 +64,13 @@ description="Calagopus Wings Daemon"
 
 command="{}"
 supervisor="supervise-daemon"
-pidfile="/var/run/wings/daemon.pid"
+pidfile="/run/calagopus-wings.pid"
 directory="/etc/pterodactyl"
 rc_ulimit="-n 4096"
 
 respawn_delay=5
 respawn_max=30
+respawn_period=180
 
 depend() {{
     need net docker
@@ -244,7 +245,10 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
                             }
                         }
                     }
-                    InitSystem::Auto => unreachable!(),
+                    InitSystem::Auto => {
+                        eprintln!("{}", "failed to detect init system".red());
+                        return Ok(1);
+                    }
                 }
 
                 Ok(0)

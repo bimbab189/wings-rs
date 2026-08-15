@@ -3,7 +3,10 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 pub(crate) mod post {
     use crate::{
-        io::{compression::CompressionLevel, counting_reader::AsyncCountingReader},
+        io::{
+            SafeAsyncWrite, SafeDigest, compression::CompressionLevel,
+            counting_reader::AsyncCountingReader,
+        },
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
         server::{
@@ -172,7 +175,7 @@ pub(crate) mod post {
 
                                 walker
                                     .run_multithreaded(
-                                        state.config.api.file_copy_threads,
+                                        state.config.load().api.file_copy_threads,
                                         DirectoryStreamWalkFn::from({
                                             let server = server.clone();
                                             let filesystem = filesystem.clone();
@@ -378,15 +381,16 @@ pub(crate) mod post {
                                         &root,
                                         files.into_iter().map(PathBuf::from).collect(),
                                         data.archive_format.into(),
-                                        data.compression_level.unwrap_or(
-                                            state.config.system.backups.compression_level,
-                                        ),
+                                        data.compression_level.unwrap_or_else(|| {
+                                            state.config.load().system.backups.compression_level
+                                        }),
                                         Some(progress),
                                         is_ignored,
                                     )
                                     .await?;
 
                                 tokio::io::copy(&mut reader, &mut checksummed_writer).await?;
+                                checksummed_writer.shutdown().await?;
 
                                 Ok::<_, anyhow::Error>(())
                             };
@@ -401,8 +405,8 @@ pub(crate) mod post {
                                         break;
                                     }
 
-                                    hasher.update(&buffer[..bytes_read]);
-                                    writer.write_all(&buffer[..bytes_read]).await?;
+                                    hasher.safe_update(&buffer, bytes_read)?;
+                                    writer.safe_write_all(&buffer, bytes_read).await?;
                                 }
 
                                 checksum_sender.send(hex::encode(hasher.finalize())).ok();
@@ -424,8 +428,7 @@ pub(crate) mod post {
                                         "archive.{}",
                                         data.archive_format.extension()
                                     ))
-                                    .mime_str("application/x-tar")
-                                    .unwrap(),
+                                    .mime_str("application/x-tar")?,
                                 )
                                 .part(
                                     "checksum",
@@ -433,16 +436,13 @@ pub(crate) mod post {
                                         checksum_receiver.into_stream(),
                                     ))
                                     .file_name("checksum")
-                                    .mime_str("text/plain")
-                                    .unwrap(),
-                                )
-                                .part("test", reqwest::multipart::Part::text("JOHN PORK"));
+                                    .mime_str("text/plain")?,
+                                );
 
                             let response = reqwest::Client::builder()
                                 .connect_timeout(std::time::Duration::from_secs(15))
                                 .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
-                                .build()
-                                .unwrap()
+                                .build()?
                                 .post(&data.url)
                                 .header("Authorization", &data.token)
                                 .header("Total-Bytes", total.load(Ordering::Relaxed))

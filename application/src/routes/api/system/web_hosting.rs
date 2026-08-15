@@ -69,7 +69,8 @@ pub(crate) mod get {
     }
 
     fn response(state: GetState) -> ApiResponseResult {
-        let config = &state.config.web_hosting;
+        let config_guard = state.config.load();
+        let config = &config_guard.web_hosting;
 
         ApiResponse::new_serialized(Response {
             enabled: config.enabled,

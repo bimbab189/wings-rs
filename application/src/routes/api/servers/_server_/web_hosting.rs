@@ -309,7 +309,8 @@ async fn status_payload(
     config: &crate::config::Config,
     server: &crate::server::Server,
 ) -> serde_json::Value {
-    let web_config = &config.web_hosting;
+    let config_snapshot = config.load();
+    let web_config = &config_snapshot.web_hosting;
     let state_file = state_path(config, server);
     let vhost_file = vhost_path(config, server);
     let saved_state = match tokio::fs::read_to_string(&state_file).await {
@@ -485,6 +486,7 @@ async fn backup_files(
     server: &crate::server::Server,
     payload: &WebHostingPayload,
 ) -> Result<serde_json::Value, anyhow::Error> {
+    let config = config.load();
     let source = document_root_path(server, payload)?;
     let backup_dir = std::path::Path::new(&config.web_hosting.state_dir)
         .join("backups")
@@ -1803,6 +1805,7 @@ fn render_vhost(
     payload: &WebHostingPayload,
     upstream: &serde_json::Value,
 ) -> Result<String, anyhow::Error> {
+    let config = config.load();
     let hostnames = all_hostnames(payload);
     if hostnames.is_empty() {
         return Err(anyhow::anyhow!("at least one hostname is required"));
@@ -1910,6 +1913,7 @@ async fn remove_vhost(
 async fn reload_openresty(
     config: &crate::config::Config,
 ) -> Result<serde_json::Value, anyhow::Error> {
+    let config = config.load();
     let helper = &config.web_hosting.reload_helper;
     if !std::path::Path::new(helper).exists() {
         return Ok(
@@ -2127,7 +2131,7 @@ fn state_path(
     config: &crate::config::Config,
     server: &crate::server::Server,
 ) -> std::path::PathBuf {
-    std::path::Path::new(&config.web_hosting.state_dir)
+    std::path::Path::new(&config.load().web_hosting.state_dir)
         .join("servers")
         .join(format!("{}.json", server.uuid))
 }
@@ -2136,7 +2140,7 @@ fn vhost_path(
     config: &crate::config::Config,
     server: &crate::server::Server,
 ) -> std::path::PathBuf {
-    std::path::Path::new(&config.web_hosting.vhost_dir).join(format!("{}.conf", server.uuid))
+    std::path::Path::new(&config.load().web_hosting.vhost_dir).join(format!("{}.conf", server.uuid))
 }
 
 async fn write_atomic(

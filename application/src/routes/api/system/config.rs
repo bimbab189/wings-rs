@@ -13,7 +13,7 @@ pub(crate) mod get {
         (status = OK, body = serde_json::Value),
     ))]
     pub async fn route(state: GetState) -> ApiResponseResult {
-        let mut config = match serde_json::to_value(&**state.config) {
+        let mut config = match serde_json::to_value(&**state.config.load()) {
             Ok(config) => config,
             Err(error) => return ApiResponse::from(error).ok(),
         };

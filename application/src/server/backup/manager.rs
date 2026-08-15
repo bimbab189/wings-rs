@@ -37,26 +37,6 @@ impl BackupManager {
             || server.configuration.read().await.backups.contains(&uuid)
     }
 
-    pub async fn adapter_contains(&self, state: &crate::routes::State, uuid: uuid::Uuid) -> bool {
-        if let Some(adapter) = self.cached_backup_adapters.get(&uuid).await {
-            match adapter.exists(state, uuid).await {
-                Ok(exists) => exists,
-                Err(err) => {
-                    tracing::error!(adapter = ?adapter, "failed to check if backup {} exists: {:#?}", uuid, err);
-                    false
-                }
-            }
-        } else {
-            match BackupAdapter::exists_any(state, uuid).await {
-                Ok(exists) => exists,
-                Err(err) => {
-                    tracing::error!("failed to check if backup {} exists: {:#?}", uuid, err);
-                    false
-                }
-            }
-        }
-    }
-
     pub async fn create(
         &self,
         adapter: BackupAdapter,
@@ -118,16 +98,14 @@ impl BackupManager {
 
                     server
                         .websocket
-                        .send(crate::server::websocket::WebsocketMessage::new(
-                            crate::server::websocket::WebsocketEvent::ServerBackupProgress,
-                            [
-                                uuid.to_compact_string(),
-                                serde_json::to_string(&crate::models::Progress { progress, total })
-                                    .unwrap()
-                                    .into(),
-                            ]
-                            .into(),
-                        ))
+                        .send(
+                            crate::server::websocket::WebsocketMessage::builder(
+                                crate::server::websocket::WebsocketEvent::ServerBackupProgress,
+                            )
+                            .arg(uuid.to_compact_string())
+                            .json_arg(crate::models::Progress { progress, total })
+                            .build(),
+                        )
                         .ok();
 
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -135,12 +113,13 @@ impl BackupManager {
             }
         });
 
-        server
-            .websocket
-            .send(crate::server::websocket::WebsocketMessage::new(
+        server.websocket.send(
+            crate::server::websocket::WebsocketMessage::builder(
                 crate::server::websocket::WebsocketEvent::ServerBackupStarted,
-                [uuid.to_compact_string()].into(),
-            ))?;
+            )
+            .arg(uuid.to_compact_string())
+            .build(),
+        )?;
         server
             .schedules
             .execute_backup_status_trigger(crate::models::ServerBackupStatus::Starting)
@@ -179,25 +158,22 @@ impl BackupManager {
                     .client
                     .set_backup_status(uuid, &RawServerBackup::default())
                     .await?;
-                server
-                    .websocket
-                    .send(crate::server::websocket::WebsocketMessage::new(
+                server.websocket.send(
+                    crate::server::websocket::WebsocketMessage::builder(
                         crate::server::websocket::WebsocketEvent::ServerBackupCompleted,
-                        [
-                            uuid.to_compact_string(),
-                            serde_json::json!({
-                                "checksum_type": "",
-                                "checksum": "",
-                                "size": 0,
-                                "files": 0,
-                                "successful": false,
-                                "browsable": false,
-                                "streaming": false,
-                            })
-                            .to_compact_string(),
-                        ]
-                        .into(),
-                    ))?;
+                    )
+                    .arg(uuid.to_compact_string())
+                    .json_arg(serde_json::json!({
+                        "checksum_type": "",
+                        "checksum": "",
+                        "size": 0,
+                        "files": 0,
+                        "successful": false,
+                        "browsable": false,
+                        "streaming": false,
+                    }))
+                    .build(),
+                )?;
                 self.cached_backup_adapters.insert(uuid, adapter).await;
 
                 return Err(err);
@@ -214,25 +190,22 @@ impl BackupManager {
             .client
             .set_backup_status(uuid, &backup)
             .await?;
-        server
-            .websocket
-            .send(crate::server::websocket::WebsocketMessage::new(
+        server.websocket.send(
+            crate::server::websocket::WebsocketMessage::builder(
                 crate::server::websocket::WebsocketEvent::ServerBackupCompleted,
-                [
-                    uuid.to_compact_string(),
-                    serde_json::json!({
-                        "checksum_type": backup.checksum_type,
-                        "checksum": backup.checksum,
-                        "size": backup.size,
-                        "files": backup.files,
-                        "successful": backup.successful,
-                        "browsable": backup.browsable,
-                        "streaming": backup.streaming,
-                    })
-                    .to_compact_string(),
-                ]
-                .into(),
-            ))?;
+            )
+            .arg(uuid.to_compact_string())
+            .json_arg(serde_json::json!({
+                "checksum_type": backup.checksum_type,
+                "checksum": backup.checksum,
+                "size": backup.size,
+                "files": backup.files,
+                "successful": backup.successful,
+                "browsable": backup.browsable,
+                "streaming": backup.streaming,
+            }))
+            .build(),
+        )?;
         server.configuration.write().await.backups.push(uuid);
         self.cached_backup_adapters.insert(uuid, adapter).await;
 
@@ -316,16 +289,16 @@ impl BackupManager {
 
                     server
                         .websocket
-                        .send(crate::server::websocket::WebsocketMessage::new(
-                            crate::server::websocket::WebsocketEvent::ServerBackupRestoreProgress,
-                            [serde_json::to_string(&crate::models::Progress {
+                        .send(
+                            crate::server::websocket::WebsocketMessage::builder(
+                                crate::server::websocket::WebsocketEvent::ServerBackupRestoreProgress,
+                            )
+                            .json_arg(crate::models::Progress {
                                 progress: progress_value,
                                 total: total_value,
                             })
-                            .unwrap()
-                            .into()]
-                            .into(),
-                        ))
+                            .build(),
+                        )
                         .ok();
 
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -333,12 +306,12 @@ impl BackupManager {
             }
         });
 
-        server
-            .websocket
-            .send(crate::server::websocket::WebsocketMessage::new(
+        server.websocket.send(
+            crate::server::websocket::WebsocketMessage::builder(
                 crate::server::websocket::WebsocketEvent::ServerBackupRestoreStarted,
-                [].into(),
-            ))?;
+            )
+            .build(),
+        )?;
 
         match backup
             .restore(
@@ -360,18 +333,22 @@ impl BackupManager {
                     )
                     .into(),
                 );
+                if let Err(err) = server.diff.clear().await {
+                    tracing::warn!(server = %server.uuid, "failed to clear file history: {:?}", err);
+                }
+
                 server
                     .app_state
                     .config
                     .client
                     .set_backup_restore_status(server.uuid, backup.uuid(), true)
                     .await?;
-                server
-                    .websocket
-                    .send(crate::server::websocket::WebsocketMessage::new(
+                server.websocket.send(
+                    crate::server::websocket::WebsocketMessage::builder(
                         crate::server::websocket::WebsocketEvent::ServerBackupRestoreCompleted,
-                        [].into(),
-                    ))?;
+                    )
+                    .build(),
+                )?;
 
                 tracing::info!(
                     server = %server.uuid,
@@ -392,12 +369,12 @@ impl BackupManager {
                     .client
                     .set_backup_restore_status(server.uuid, backup.uuid(), false)
                     .await?;
-                server
-                    .websocket
-                    .send(crate::server::websocket::WebsocketMessage::new(
+                server.websocket.send(
+                    crate::server::websocket::WebsocketMessage::builder(
                         crate::server::websocket::WebsocketEvent::ServerBackupRestoreCompleted,
-                        [].into(),
-                    ))?;
+                    )
+                    .build(),
+                )?;
 
                 Err(err)
             }

@@ -4,11 +4,10 @@ use aes_gcm::{
 };
 use anyhow::Context;
 use base64::Engine;
-use bollard::container::{
-    Config as ContainerConfig, CreateContainerOptions, ListContainersOptions,
-    RemoveContainerOptions,
+use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType};
+use bollard::query_parameters::{
+    CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
 };
-use bollard::models::{HostConfig, Mount, MountTypeEnum};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::{
@@ -207,7 +206,7 @@ impl WebIdeManager {
     }
 
     pub fn enabled(&self) -> bool {
-        self.inner.config.web_ide.enabled && self.validate_security_configuration().is_ok()
+        self.inner.config.load().web_ide.enabled && self.validate_security_configuration().is_ok()
     }
 
     pub async fn start(
@@ -248,14 +247,14 @@ impl WebIdeManager {
         }
 
         let sessions = self.inner.sessions.read().await;
-        if sessions.len() >= self.inner.config.web_ide.max_sessions {
+        if sessions.len() >= self.inner.config.load().web_ide.max_sessions {
             anyhow::bail!("node Web IDE session limit reached");
         }
         if sessions
             .values()
             .filter(|session| session.server_uuid == server.uuid)
             .count()
-            >= self.inner.config.web_ide.max_sessions_per_server
+            >= self.inner.config.load().web_ide.max_sessions_per_server
         {
             anyhow::bail!("server Web IDE session limit reached");
         }
@@ -311,22 +310,20 @@ impl WebIdeManager {
             anyhow::bail!("server is not eligible for Web IDE because its egg has a file denylist");
         }
 
-        let (uid, gid) = if self.inner.config.system.user.rootless.enabled {
+        let config = self.inner.config.load();
+        let (uid, gid) = if config.system.user.rootless.enabled {
             (
-                self.inner.config.system.user.rootless.container_uid,
-                self.inner.config.system.user.rootless.container_gid,
+                config.system.user.rootless.container_uid,
+                config.system.user.rootless.container_gid,
             )
         } else {
-            (
-                self.inner.config.system.user.uid,
-                self.inner.config.system.user.gid,
-            )
+            (config.system.user.uid, config.system.user.gid)
         };
         if uid == 0 || gid == 0 {
             anyhow::bail!("Web IDE requires a non-zero container uid and gid");
         }
 
-        let runtime_root = PathBuf::from(&self.inner.config.web_ide.runtime_directory);
+        let runtime_root = PathBuf::from(&config.web_ide.runtime_directory);
         tokio::fs::create_dir_all(&runtime_root)
             .await
             .context("failed to create Web IDE runtime root")?;
@@ -365,7 +362,7 @@ impl WebIdeManager {
         let runtime_memory_path = runtime_path.join("memory");
         let runtime_home_placeholder = runtime_path.join("home");
         let legacy_memory_path = persistent_memory_path(
-            Path::new(&self.inner.config.web_ide.memory_directory),
+            Path::new(&config.web_ide.memory_directory),
             server.uuid,
             request.user_uuid,
         );
@@ -398,8 +395,7 @@ impl WebIdeManager {
         tokio::fs::create_dir_all(&memory_mount_parent).await?;
         let endpoint = format!(
             "{}/api/servers/{}/web-ide/s/{}",
-            self.inner
-                .config
+            config
                 .web_ide
                 .public_url
                 .trim_end_matches('/')
@@ -407,7 +403,7 @@ impl WebIdeManager {
             server.uuid,
             request.session_uuid
         );
-        let public_network_enabled = self.inner.config.web_ide.allow_public_network;
+        let public_network_enabled = config.web_ide.allow_public_network;
         let allowed_network_domains: Vec<&str> = if public_network_enabled {
             vec!["*"]
         } else {
@@ -539,18 +535,18 @@ impl WebIdeManager {
             ),
         ]);
 
-        let memory = (self.inner.config.web_ide.memory_mib * 1024 * 1024) as i64;
-        let cpu_quota = (self.inner.config.web_ide.cpu_percent as i64) * 1000;
+        let memory = (config.web_ide.memory_mib * 1024 * 1024) as i64;
+        let cpu_quota = (config.web_ide.cpu_percent as i64) * 1000;
         let container = match self
             .inner
             .docker
             .create_container(
                 Some(CreateContainerOptions {
-                    name: container_name,
+                    name: Some(container_name),
                     ..Default::default()
                 }),
-                ContainerConfig {
-                    image: Some(self.inner.config.web_ide.image.clone()),
+                ContainerCreateBody {
+                    image: Some(config.web_ide.image.clone()),
                     user: Some(format!("{uid}:{gid}")),
                     working_dir: Some("/home/container".to_string()),
                     env: Some(vec![
@@ -593,17 +589,17 @@ impl WebIdeManager {
                         memory_swap: Some(memory),
                         cpu_period: Some(100_000),
                         cpu_quota: Some(cpu_quota),
-                        pids_limit: Some(self.inner.config.web_ide.pid_limit),
+                        pids_limit: Some(config.web_ide.pid_limit),
                         mounts: Some(vec![
                             Mount {
-                                typ: Some(MountTypeEnum::BIND),
+                                typ: Some(MountType::BIND),
                                 source: Some(workspace.to_string_lossy().into_owned()),
                                 target: Some("/home/container".to_string()),
                                 read_only: Some(false),
                                 ..Default::default()
                             },
                             Mount {
-                                typ: Some(MountTypeEnum::BIND),
+                                typ: Some(MountType::BIND),
                                 source: Some(runtime_path.to_string_lossy().into_owned()),
                                 target: Some("/run/jexactyl-webide".to_string()),
                                 read_only: Some(false),
@@ -614,14 +610,14 @@ impl WebIdeManager {
                             // encrypted together with User, extensions and
                             // HOME when the session stops.
                             Mount {
-                                typ: Some(MountTypeEnum::BIND),
+                                typ: Some(MountType::BIND),
                                 source: Some(runtime_memory_path.to_string_lossy().into_owned()),
                                 target: Some(COPILOT_MEMORY_MOUNT.to_string()),
                                 read_only: Some(false),
                                 ..Default::default()
                             },
                             Mount {
-                                typ: Some(MountTypeEnum::BIND),
+                                typ: Some(MountType::BIND),
                                 source: Some(settings_path.to_string_lossy().into_owned()),
                                 target: Some(
                                     "/run/jexactyl-webide/user-data/User/settings.json".to_string(),
@@ -632,10 +628,7 @@ impl WebIdeManager {
                         ]),
                         tmpfs: Some(HashMap::from([(
                             "/tmp".to_string(),
-                            format!(
-                                "rw,noexec,nosuid,nodev,size={}M",
-                                self.inner.config.web_ide.tmpfs_mib
-                            ),
+                            format!("rw,noexec,nosuid,nodev,size={}M", config.web_ide.tmpfs_mib),
                         )])),
                         ..Default::default()
                     }),
@@ -651,12 +644,7 @@ impl WebIdeManager {
             }
         };
 
-        if let Err(error) = self
-            .inner
-            .docker
-            .start_container::<String>(&container.id, None)
-            .await
-        {
+        if let Err(error) = self.inner.docker.start_container(&container.id, None).await {
             let _ = self
                 .inner
                 .docker
@@ -969,7 +957,7 @@ impl WebIdeManager {
             .persistent_user_state_path
             .join(ENCRYPTED_USER_PROFILE_FILE);
         let user_uuid = session.user_uuid;
-        let max = self.inner.config.web_ide.max_persistent_state_bytes;
+        let max = self.inner.config.load().web_ide.max_persistent_state_bytes;
         let theme = tokio::task::spawn_blocking(move || {
             let value = match fs::read(&profile_path) {
                 Ok(encrypted) => decrypt_user_profile_value(&encrypted, &key, user_uuid, max)?,
@@ -1025,7 +1013,7 @@ impl WebIdeManager {
         let persistent_path = session.persistent_user_state_path.clone();
         let user_uuid = session.user_uuid;
         let published_theme = theme.clone();
-        let max = self.inner.config.web_ide.max_persistent_state_bytes;
+        let max = self.inner.config.load().web_ide.max_persistent_state_bytes;
         tokio::task::spawn_blocking(move || {
             let profile_path = persistent_path.join(ENCRYPTED_USER_PROFILE_FILE);
             let mut value = match fs::read(&profile_path) {
@@ -1114,7 +1102,8 @@ impl WebIdeManager {
         };
         let server_uuid = session.server_uuid;
         let user_uuid = session.user_uuid;
-        let persistent_root = PathBuf::from(&self.inner.config.web_ide.persistent_data_directory);
+        let persistent_root =
+            PathBuf::from(&self.inner.config.load().web_ide.persistent_data_directory);
         let (mut state, migrated) = tokio::task::spawn_blocking(move || {
             if user_scoped {
                 read_persistent_user_browser_state(&path, &persistent_root, &key, user_uuid)
@@ -1327,7 +1316,13 @@ impl WebIdeManager {
         let canonical = server.filesystem.async_canonicalize(&requested).await?;
         let metadata = server.filesystem.async_metadata(&canonical).await?;
         if !metadata.is_file()
-            || metadata.len() as usize > self.inner.config.web_ide.max_collaboration_document_bytes
+            || metadata.len() as usize
+                > self
+                    .inner
+                    .config
+                    .load()
+                    .web_ide
+                    .max_collaboration_document_bytes
         {
             anyhow::bail!("collaboration supports only bounded regular text files");
         }
@@ -1340,7 +1335,7 @@ impl WebIdeManager {
             return Ok(Arc::clone(room));
         }
         if self.inner.collaboration_rooms.read().await.len()
-            >= self.inner.config.web_ide.max_collaboration_rooms
+            >= self.inner.config.load().web_ide.max_collaboration_rooms
         {
             anyhow::bail!("maximum collaboration room count reached");
         }
@@ -1349,10 +1344,21 @@ impl WebIdeManager {
             .filesystem
             .async_read_to_string(
                 &canonical,
-                self.inner.config.web_ide.max_collaboration_document_bytes,
+                self.inner
+                    .config
+                    .load()
+                    .web_ide
+                    .max_collaboration_document_bytes,
             )
             .await?;
-        if content.len() > self.inner.config.web_ide.max_collaboration_document_bytes {
+        if content.len()
+            > self
+                .inner
+                .config
+                .load()
+                .web_ide
+                .max_collaboration_document_bytes
+        {
             anyhow::bail!("collaboration document exceeds the configured limit");
         }
         let doc = yrs::Doc::new();
@@ -1369,7 +1375,12 @@ impl WebIdeManager {
         let limit_notifier = Arc::new(tokio::sync::Notify::new());
         let oversized_for_observer = Arc::clone(&oversized);
         let limit_notifier_for_observer = Arc::clone(&limit_notifier);
-        let max_bytes = self.inner.config.web_ide.max_collaboration_document_bytes;
+        let max_bytes = self
+            .inner
+            .config
+            .load()
+            .web_ide
+            .max_collaboration_document_bytes;
         let save_subscription = awareness
             .read()
             .await
@@ -1446,7 +1457,7 @@ impl WebIdeManager {
         if let Some(existing) = rooms.get(&key) {
             return Ok(Arc::clone(existing));
         }
-        if rooms.len() >= self.inner.config.web_ide.max_collaboration_rooms {
+        if rooms.len() >= self.inner.config.load().web_ide.max_collaboration_rooms {
             anyhow::bail!("maximum collaboration room count reached");
         }
         rooms.insert(key, Arc::clone(&room));
@@ -1505,15 +1516,16 @@ impl WebIdeManager {
     /// destroyed. This is deliberately only reachable with the server UUID
     /// from Wings' authenticated server lifecycle, never from a customer API.
     pub async fn remove_memory_for_server(&self, server_uuid: uuid::Uuid) {
+        let config = self.inner.config.load();
         self.remove_server_state_directory(
-            Path::new(&self.inner.config.web_ide.memory_directory),
+            Path::new(&config.web_ide.memory_directory),
             server_uuid,
             "memory",
             || self.validate_memory_directory(),
         )
         .await;
         self.remove_server_state_directory(
-            Path::new(&self.inner.config.web_ide.persistent_data_directory),
+            Path::new(&config.web_ide.persistent_data_directory),
             server_uuid,
             "persistent user data",
             || self.validate_persistent_data_directory(),
@@ -1555,6 +1567,7 @@ impl WebIdeManager {
     }
 
     pub async fn reconcile_orphans(&self) {
+        let config = self.inner.config.load();
         let mut deferred_runtimes = HashSet::new();
         let filters = HashMap::from([(
             "label".to_string(),
@@ -1565,7 +1578,7 @@ impl WebIdeManager {
             .docker
             .list_containers(Some(ListContainersOptions {
                 all: true,
-                filters,
+                filters: Some(filters),
                 ..Default::default()
             }))
             .await
@@ -1596,18 +1609,15 @@ impl WebIdeManager {
                 if let (Some(session_uuid), Some(server_uuid), Some(user_uuid)) =
                     (session_uuid, server_uuid, user_uuid)
                 {
-                    let (uid, gid) = if self.inner.config.system.user.rootless.enabled {
+                    let (uid, gid) = if config.system.user.rootless.enabled {
                         (
-                            self.inner.config.system.user.rootless.container_uid,
-                            self.inner.config.system.user.rootless.container_gid,
+                            config.system.user.rootless.container_uid,
+                            config.system.user.rootless.container_gid,
                         )
                     } else {
-                        (
-                            self.inner.config.system.user.uid,
-                            self.inner.config.system.user.gid,
-                        )
+                        (config.system.user.uid, config.system.user.gid)
                     };
-                    let runtime = PathBuf::from(&self.inner.config.web_ide.runtime_directory)
+                    let runtime = PathBuf::from(&config.web_ide.runtime_directory)
                         .join(session_uuid.to_string());
                     let persistent = match self
                         .prepare_persistent_directory(server_uuid, user_uuid, uid, gid)
@@ -1672,7 +1682,7 @@ impl WebIdeManager {
             tracing::error!(error = %error, "refusing unsafe Web IDE runtime directory cleanup");
             return;
         }
-        let runtime = PathBuf::from(&self.inner.config.web_ide.runtime_directory);
+        let runtime = PathBuf::from(&config.web_ide.runtime_directory);
         if let Ok(mut entries) = tokio::fs::read_dir(&runtime).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 if entry
@@ -1730,7 +1740,7 @@ impl WebIdeManager {
 
     async fn has_pending_state(&self, session_uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
         self.validate_persistent_data_directory()?;
-        let root = PathBuf::from(&self.inner.config.web_ide.persistent_data_directory);
+        let root = PathBuf::from(&self.inner.config.load().web_ide.persistent_data_directory);
         let mut servers = tokio::fs::read_dir(&root).await?;
         while let Some(server_entry) = servers.next_entry().await? {
             let server_metadata = tokio::fs::symlink_metadata(server_entry.path()).await?;
@@ -1941,10 +1951,11 @@ impl WebIdeManager {
     }
 
     fn validate_security_configuration(&self) -> Result<(), anyhow::Error> {
-        if !self.inner.config.web_ide.enabled {
+        let config = self.inner.config.load();
+        if !config.web_ide.enabled {
             anyhow::bail!("web IDE is disabled");
         }
-        let public_url = reqwest::Url::parse(&self.inner.config.web_ide.public_url)
+        let public_url = reqwest::Url::parse(&config.web_ide.public_url)
             .context("web_ide.public_url is not a valid URL")?;
         if public_url.scheme() != "https"
             || public_url.host_str().is_none()
@@ -1956,7 +1967,7 @@ impl WebIdeManager {
         {
             anyhow::bail!("web_ide.public_url must be an exact HTTPS origin");
         }
-        let image = &self.inner.config.web_ide.image;
+        let image = &config.web_ide.image;
         let digest = image
             .strip_prefix("sha256:")
             .or_else(|| {
@@ -1969,31 +1980,26 @@ impl WebIdeManager {
         if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             anyhow::bail!("web_ide.image has an invalid sha256 digest");
         }
-        if !self
-            .inner
-            .config
-            .web_ide
-            .terminal_network_isolation_verified
-            || self.inner.config.docker.network.driver != "bridge"
-            || self.inner.config.docker.network.mode != self.inner.config.docker.network.name
+        if !config.web_ide.terminal_network_isolation_verified
+            || config.docker.network.driver != "bridge"
+            || config.docker.network.mode != config.docker.network.name
         {
             anyhow::bail!("Web IDE terminal network isolation is not verified");
         }
-        if self.inner.config.web_ide.allow_public_network
-            && !self.inner.config.web_ide.public_network_isolation_verified
+        if config.web_ide.allow_public_network && !config.web_ide.public_network_isolation_verified
         {
             anyhow::bail!("Web IDE public egress isolation is not verified");
         }
-        let config = &self.inner.config.web_ide;
-        if !(256..=8192).contains(&config.memory_mib)
-            || !(1..=800).contains(&config.cpu_percent)
-            || !(32..=4096).contains(&config.pid_limit)
-            || !(32..=2048).contains(&config.tmpfs_mib)
-            || !(1..=64 * 1024 * 1024).contains(&config.max_request_bytes)
-            || !(1..=8 * 1024 * 1024).contains(&config.max_collaboration_document_bytes)
-            || !(1..=2048).contains(&config.max_collaboration_rooms)
-            || !(1..=1024).contains(&config.max_sessions)
-            || !(1..=config.max_sessions).contains(&config.max_sessions_per_server)
+        let web_config = &config.web_ide;
+        if !(256..=8192).contains(&web_config.memory_mib)
+            || !(1..=800).contains(&web_config.cpu_percent)
+            || !(32..=4096).contains(&web_config.pid_limit)
+            || !(32..=2048).contains(&web_config.tmpfs_mib)
+            || !(1..=64 * 1024 * 1024).contains(&web_config.max_request_bytes)
+            || !(1..=8 * 1024 * 1024).contains(&web_config.max_collaboration_document_bytes)
+            || !(1..=2048).contains(&web_config.max_collaboration_rooms)
+            || !(1..=1024).contains(&web_config.max_sessions)
+            || !(1..=web_config.max_sessions).contains(&web_config.max_sessions_per_server)
         {
             anyhow::bail!("invalid Web IDE resource or aggregate limits");
         }
@@ -2010,7 +2016,7 @@ impl WebIdeManager {
         _gid: u32,
     ) -> Result<PathBuf, anyhow::Error> {
         self.validate_persistent_data_directory()?;
-        let root = PathBuf::from(&self.inner.config.web_ide.persistent_data_directory);
+        let root = PathBuf::from(&self.inner.config.load().web_ide.persistent_data_directory);
         tokio::fs::create_dir_all(&root)
             .await
             .context("failed to create Web IDE persistent data root")?;
@@ -2059,7 +2065,7 @@ impl WebIdeManager {
         user_uuid: uuid::Uuid,
     ) -> Result<PathBuf, anyhow::Error> {
         self.validate_persistent_data_directory()?;
-        let root = PathBuf::from(&self.inner.config.web_ide.persistent_data_directory);
+        let root = PathBuf::from(&self.inner.config.load().web_ide.persistent_data_directory);
         let users_root = root.join(USER_STATE_DIRECTORY);
         let user_path = users_root.join(user_uuid.to_string());
         tokio::fs::create_dir_all(&user_path)
@@ -2114,7 +2120,7 @@ impl WebIdeManager {
         let settings_path = settings_path.to_path_buf();
         match tokio::fs::read(&profile_path).await {
             Ok(ciphertext) => {
-                let max = self.inner.config.web_ide.max_persistent_state_bytes;
+                let max = self.inner.config.load().web_ide.max_persistent_state_bytes;
                 tokio::task::spawn_blocking(move || {
                     decrypt_user_profile(
                         &ciphertext,
@@ -2147,7 +2153,7 @@ impl WebIdeManager {
         let key = self.encryption_key().await?;
         let runtime = runtime.to_path_buf();
         let persistent_path = persistent_path.to_path_buf();
-        let max = self.inner.config.web_ide.max_persistent_state_bytes;
+        let max = self.inner.config.load().web_ide.max_persistent_state_bytes;
         tokio::task::spawn_blocking(move || {
             encrypt_user_profile(&runtime, &persistent_path, &key, user_uuid, max)
         })
@@ -2156,7 +2162,7 @@ impl WebIdeManager {
     }
 
     async fn encryption_key(&self) -> Result<[u8; 32], anyhow::Error> {
-        let path = PathBuf::from(&self.inner.config.web_ide.encryption_key_file);
+        let path = PathBuf::from(&self.inner.config.load().web_ide.encryption_key_file);
         let metadata = tokio::fs::symlink_metadata(&path).await;
         if matches!(metadata, Err(ref error) if error.kind() == std::io::ErrorKind::NotFound) {
             let mut key = [0u8; 32];
@@ -2227,7 +2233,7 @@ impl WebIdeManager {
             .await?;
         match tokio::fs::read(&state_path).await {
             Ok(ciphertext) => {
-                let max = self.inner.config.web_ide.max_persistent_state_bytes;
+                let max = self.inner.config.load().web_ide.max_persistent_state_bytes;
                 if ciphertext.len() > max.saturating_add(128) {
                     anyhow::bail!("Web IDE encrypted state exceeds the configured limit");
                 }
@@ -2254,7 +2260,7 @@ impl WebIdeManager {
                 cleanup_legacy_state(
                     persistent_path,
                     &persistent_memory_path(
-                        Path::new(&self.inner.config.web_ide.memory_directory),
+                        Path::new(&self.inner.config.load().web_ide.memory_directory),
                         server_uuid,
                         user_uuid,
                     ),
@@ -2290,9 +2296,9 @@ impl WebIdeManager {
         let key = self.encryption_key().await?;
         let runtime = runtime.to_path_buf();
         let persistent_path = persistent_path.to_path_buf();
-        let max = self.inner.config.web_ide.max_persistent_state_bytes;
+        let max = self.inner.config.load().web_ide.max_persistent_state_bytes;
         let legacy_memory = persistent_memory_path(
-            Path::new(&self.inner.config.web_ide.memory_directory),
+            Path::new(&self.inner.config.load().web_ide.memory_directory),
             server_uuid,
             user_uuid,
         );
@@ -2383,7 +2389,7 @@ impl WebIdeManager {
         let Some((session_uuid, marker)) = pending.pop() else {
             return Ok(());
         };
-        let runtime_root = PathBuf::from(&self.inner.config.web_ide.runtime_directory);
+        let runtime_root = PathBuf::from(&self.inner.config.load().web_ide.runtime_directory);
         self.validate_runtime_directory()?;
         let runtime = runtime_root.join(session_uuid.to_string());
         let metadata = tokio::fs::symlink_metadata(&runtime).await?;
@@ -2415,7 +2421,8 @@ impl WebIdeManager {
                     .create_new(true)
                     .open(&note)
                     .await?;
-                let security_note: &[u8] = if self.inner.config.web_ide.allow_public_network {
+                let security_note: &[u8] = if self.inner.config.load().web_ide.allow_public_network
+                {
                     b"# Jexactyl Web IDE security decisions\n\n\
 Client-side fetch was evaluated, but the built-in web fetch tool delegates to\n\
 an internal VS Code workbench fetcher. This deployment cannot guarantee that\n\
@@ -2449,7 +2456,8 @@ as well.\n"
     }
 
     fn validate_memory_directory(&self) -> Result<(), anyhow::Error> {
-        let memory = std::path::Path::new(&self.inner.config.web_ide.memory_directory);
+        let config = self.inner.config.load();
+        let memory = std::path::Path::new(&config.web_ide.memory_directory);
         let component_count = memory
             .components()
             .filter(|component| matches!(component, std::path::Component::Normal(_)))
@@ -2467,13 +2475,13 @@ as well.\n"
         }
 
         let protected = [
-            &self.inner.config.system.data_directory,
-            &self.inner.config.system.archive_directory,
-            &self.inner.config.system.backup_directory,
-            &self.inner.config.system.vmount_directory,
-            &self.inner.config.system.log_directory,
-            &self.inner.config.system.tmp_directory,
-            &self.inner.config.web_ide.runtime_directory,
+            &config.system.data_directory,
+            &config.system.archive_directory,
+            &config.system.backup_directory,
+            &config.system.vmount_directory,
+            &config.system.log_directory,
+            &config.system.tmp_directory,
+            &config.web_ide.runtime_directory,
         ];
         for protected in protected {
             let protected = std::path::Path::new(protected);
@@ -2492,7 +2500,8 @@ as well.\n"
     }
 
     fn validate_persistent_data_directory(&self) -> Result<(), anyhow::Error> {
-        let persistent = Path::new(&self.inner.config.web_ide.persistent_data_directory);
+        let config = self.inner.config.load();
+        let persistent = Path::new(&config.web_ide.persistent_data_directory);
         let component_count = persistent
             .components()
             .filter(|component| matches!(component, std::path::Component::Normal(_)))
@@ -2510,14 +2519,14 @@ as well.\n"
         }
 
         let protected = [
-            &self.inner.config.system.data_directory,
-            &self.inner.config.system.archive_directory,
-            &self.inner.config.system.backup_directory,
-            &self.inner.config.system.vmount_directory,
-            &self.inner.config.system.log_directory,
-            &self.inner.config.system.tmp_directory,
-            &self.inner.config.web_ide.runtime_directory,
-            &self.inner.config.web_ide.memory_directory,
+            &config.system.data_directory,
+            &config.system.archive_directory,
+            &config.system.backup_directory,
+            &config.system.vmount_directory,
+            &config.system.log_directory,
+            &config.system.tmp_directory,
+            &config.web_ide.runtime_directory,
+            &config.web_ide.memory_directory,
         ];
         for protected in protected {
             let protected = Path::new(protected);
@@ -2542,7 +2551,8 @@ as well.\n"
     }
 
     fn validate_runtime_directory(&self) -> Result<(), anyhow::Error> {
-        let runtime = std::path::Path::new(&self.inner.config.web_ide.runtime_directory);
+        let config = self.inner.config.load();
+        let runtime = std::path::Path::new(&config.web_ide.runtime_directory);
         let component_count = runtime
             .components()
             .filter(|component| matches!(component, std::path::Component::Normal(_)))
@@ -2560,12 +2570,11 @@ as well.\n"
         }
 
         let protected = [
-            &self.inner.config.system.data_directory,
-            &self.inner.config.system.archive_directory,
-            &self.inner.config.system.backup_directory,
-            &self.inner.config.system.vmount_directory,
-            &self.inner.config.system.log_directory,
-            &self.inner.config.system.tmp_directory,
+            &config.system.data_directory,
+            &config.system.archive_directory,
+            &config.system.backup_directory,
+            &config.system.log_directory,
+            &config.system.tmp_directory,
         ];
         for protected in protected {
             let protected = std::path::Path::new(protected);

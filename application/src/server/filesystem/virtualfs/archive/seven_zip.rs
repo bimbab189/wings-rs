@@ -1,5 +1,6 @@
 use crate::{
     io::{
+        SafeAsyncWrite, SafeSlice, SafeWrite,
         compression::{CompressionLevel, writer::CompressionWriter},
         counting_reader::CountingReader,
     },
@@ -19,6 +20,8 @@ use crate::{
     utils::PortablePermissions,
 };
 use chrono::{Datelike, Timelike};
+use compact_str::ToCompactString;
+use itaf::encoder::{EncoderOptions, ItafEncoder, Metadata};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{Read, Write},
@@ -369,14 +372,14 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                     }
                 };
 
-                match archive.stream_map.file_block_index[entry_index] {
-                    Some(block_index)
+                match archive.stream_map.file_block_index.get(entry_index) {
+                    Some(Some(block_index))
                         if !mime_cache.contains_key(&entry_index) && !entry.is_directory() =>
                     {
                         let password = sevenz_rust2::Password::empty();
                         let folder = sevenz_rust2::BlockDecoder::new(
                             1,
-                            block_index,
+                            *block_index,
                             &archive,
                             &password,
                             &mut reader,
@@ -556,11 +559,11 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                 directory_entries.sort_by(|a, b| {
                     let (a_path, a_real) = match a {
                         DirItem::Dir { path, real_entry } => (path, real_entry.as_ref()),
-                        _ => unreachable!(),
+                        _ => return std::cmp::Ordering::Equal,
                     };
                     let (b_path, b_real) = match b {
                         DirItem::Dir { path, real_entry } => (path, real_entry.as_ref()),
-                        _ => unreachable!(),
+                        _ => return std::cmp::Ordering::Equal,
                     };
 
                     match sort {
@@ -583,7 +586,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                                 DirectorySortingMode::PhysicalSizeDesc => {
                                     b_space.get_physical().cmp(&a_space.get_physical())
                                 }
-                                _ => unreachable!(),
+                                _ => std::cmp::Ordering::Equal,
                             }
                         }
                         _ => match (a_real, b_real) {
@@ -646,12 +649,12 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                             let entry_path = Path::new(archive_entry.name());
                             let needs_read = !mime_cache.contains_key(&entry_index);
 
-                            match archive.stream_map.file_block_index[entry_index] {
-                                Some(block_index) if needs_read => {
+                            match archive.stream_map.file_block_index.get(entry_index) {
+                                Some(Some(block_index)) if needs_read => {
                                     let password = sevenz_rust2::Password::empty();
                                     let folder = sevenz_rust2::BlockDecoder::new(
                                         1,
-                                        block_index,
+                                        *block_index,
                                         &archive,
                                         &password,
                                         &mut reader,
@@ -787,9 +790,11 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                 if (is_ignored)(file_type, name_path.to_path_buf()).is_some() {
                     if entry.is_directory() {
                         loose_files.push_back((entry.name().to_string(), file_type));
-                    } else if let Some(block_index) = archive.stream_map.file_block_index[i] {
+                    } else if let Some(Some(block_index)) =
+                        archive.stream_map.file_block_index.get(i)
+                    {
                         target_files_by_block
-                            .entry(block_index)
+                            .entry(*block_index)
                             .or_default()
                             .insert(entry.name().to_string());
                     } else {
@@ -815,7 +820,9 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
             sorted_blocks.sort_unstable();
 
             for block_index in sorted_blocks {
-                let targets = &target_files_by_block[&block_index];
+                let Some(targets) = &target_files_by_block.get(&block_index) else {
+                    continue;
+                };
 
                 let password = sevenz_rust2::Password::empty();
                 let folder = sevenz_rust2::BlockDecoder::new(
@@ -845,9 +852,11 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                         loop {
                             match entry_reader.read(&mut buffer) {
                                 Ok(0) => break,
-                                Ok(n) => {
+                                Ok(bytes_read) => {
                                     if runtime
-                                        .block_on(simplex_writer.write_all(&buffer[..n]))
+                                        .block_on(
+                                            simplex_writer.safe_write_all(&buffer, bytes_read),
+                                        )
                                         .is_err()
                                     {
                                         break;
@@ -910,11 +919,11 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         let (pipe_reader, mut writer) = std::io::pipe()?;
 
         tokio::task::spawn_blocking(move || {
-            if let Some(block_index) = archive.stream_map.file_block_index[entry_index] {
+            if let Some(Some(block_index)) = archive.stream_map.file_block_index.get(entry_index) {
                 let password = sevenz_rust2::Password::empty();
                 let folder = sevenz_rust2::BlockDecoder::new(
                     1,
-                    block_index,
+                    *block_index,
                     &archive,
                     &password,
                     &mut reader,
@@ -931,8 +940,8 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                     loop {
                         match reader.read(&mut buffer) {
                             Ok(0) => break,
-                            Ok(n) => {
-                                if writer.write_all(&buffer[..n]).is_err() {
+                            Ok(bytes_read) => {
+                                if writer.safe_write_all(&buffer, bytes_read).is_err() {
                                     break;
                                 }
                             }
@@ -979,11 +988,11 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         tokio::task::spawn_blocking(move || {
             let runtime = tokio::runtime::Handle::current();
 
-            if let Some(block_index) = archive.stream_map.file_block_index[entry_index] {
+            if let Some(Some(block_index)) = archive.stream_map.file_block_index.get(entry_index) {
                 let password = sevenz_rust2::Password::empty();
                 let folder = sevenz_rust2::BlockDecoder::new(
                     1,
-                    block_index,
+                    *block_index,
                     &archive,
                     &password,
                     &mut reader,
@@ -1000,8 +1009,11 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                     loop {
                         match reader.read(&mut buffer) {
                             Ok(0) => break,
-                            Ok(n) => {
-                                if runtime.block_on(writer.write_all(&buffer[..n])).is_err() {
+                            Ok(bytes_read) => {
+                                if runtime
+                                    .block_on(writer.safe_write_all(&buffer, bytes_read))
+                                    .is_err()
+                                {
                                     break;
                                 }
                             }
@@ -1109,11 +1121,13 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                         } else {
                             zip.start_file(name.to_string_lossy(), zip_options)?;
 
-                            if let Some(block_index) = archive.stream_map.file_block_index[i] {
+                            if let Some(Some(block_index)) =
+                                archive.stream_map.file_block_index.get(i)
+                            {
                                 let password = sevenz_rust2::Password::empty();
                                 let folder = sevenz_rust2::BlockDecoder::new(
                                     1,
-                                    block_index,
+                                    *block_index,
                                     &archive,
                                     &password,
                                     &mut reader,
@@ -1148,12 +1162,17 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                     Ok(())
                 });
             }
-            _ => {
+            f if f.is_tar() => {
                 let writer = CompressionWriter::new(
                     tokio_util::io::SyncIoBridge::new(writer),
-                    archive_format.compression_format(),
+                    f.compression_format(),
                     compression_level,
-                    self.server.app_state.config.api.file_compression_threads,
+                    self.server
+                        .app_state
+                        .config
+                        .load()
+                        .api
+                        .file_compression_threads,
                 )?;
 
                 crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
@@ -1198,11 +1217,13 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                             entry_header.set_entry_type(tar::EntryType::Regular);
                             entry_header.set_size(entry.size);
 
-                            if let Some(block_index) = archive.stream_map.file_block_index[i] {
+                            if let Some(Some(block_index)) =
+                                archive.stream_map.file_block_index.get(i)
+                            {
                                 let password = sevenz_rust2::Password::empty();
                                 let folder = sevenz_rust2::BlockDecoder::new(
                                     1,
-                                    block_index,
+                                    *block_index,
                                     &archive,
                                     &password,
                                     &mut reader,
@@ -1241,6 +1262,166 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
 
                     Ok(())
                 });
+            }
+            f if f.is_itaf() => {
+                let writer = CompressionWriter::new(
+                    tokio_util::io::SyncIoBridge::new(writer),
+                    f.compression_format(),
+                    compression_level,
+                    self.server
+                        .app_state
+                        .config
+                        .load()
+                        .api
+                        .file_compression_threads,
+                )?;
+
+                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                    let mut itaf_enc = ItafEncoder::new(
+                        writer,
+                        EncoderOptions {
+                            base_timestamp: None,
+                            crc_enabled: true,
+                        },
+                    )?;
+
+                    let mut entries: Vec<(PathBuf, usize)> = Vec::new();
+                    for (i, entry) in archive.files.iter().enumerate() {
+                        if entry.is_directory() {
+                            continue;
+                        }
+                        let relative = match Path::new(entry.name()).strip_prefix(&path) {
+                            Ok(r) => r.to_path_buf(),
+                            Err(_) => continue,
+                        };
+                        if relative.components().count() == 0 {
+                            continue;
+                        }
+                        if (is_ignored)(
+                            VirtualSevenZipArchive::seven_zip_entry_to_file_type(entry),
+                            relative.clone(),
+                        )
+                        .is_none()
+                        {
+                            continue;
+                        }
+                        entries.push((relative, i));
+                    }
+                    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+                    let mut dir_stack = Vec::new();
+
+                    for (relative, entry_index) in entries {
+                        let components: Vec<_> = relative
+                            .components()
+                            .filter_map(|c| match c {
+                                std::path::Component::Normal(s) => Some(s.to_string_lossy()),
+                                _ => None,
+                            })
+                            .collect();
+                        let Some(name) = components.last() else {
+                            continue;
+                        };
+
+                        let parent = components.get_slice(..components.len() - 1)?;
+
+                        let shared = dir_stack
+                            .iter()
+                            .zip(parent.iter())
+                            .take_while(|(a, b)| a == b)
+                            .count();
+                        while dir_stack.len() > shared {
+                            itaf_enc.exit_dir()?;
+                            dir_stack.pop();
+                        }
+
+                        for component in parent.get_slice(shared..)? {
+                            itaf_enc.enter_dir(
+                                component,
+                                &Metadata {
+                                    uid: 0,
+                                    gid: 0,
+                                    mode: 0o755,
+                                    modified: std::time::SystemTime::now(),
+                                },
+                            )?;
+                            dir_stack.push(component.to_compact_string());
+                        }
+
+                        let Some(entry) = &archive.files.get(entry_index) else {
+                            continue;
+                        };
+                        let mtime = if entry.has_last_modified_date {
+                            std::time::SystemTime::from(entry.last_modified_date)
+                        } else {
+                            std::time::SystemTime::now()
+                        };
+                        let meta = Metadata {
+                            uid: 0,
+                            gid: 0,
+                            mode: 0o644,
+                            modified: mtime,
+                        };
+                        let size = entry.size;
+
+                        if let Some(Some(block_index)) =
+                            archive.stream_map.file_block_index.get(entry_index)
+                        {
+                            let password = sevenz_rust2::Password::empty();
+                            let folder = sevenz_rust2::BlockDecoder::new(
+                                1,
+                                *block_index,
+                                &archive,
+                                &password,
+                                &mut reader,
+                            );
+
+                            folder
+                                .for_each_entries(&mut |block_entry, block_reader| {
+                                    if block_entry.name() != entry.name() {
+                                        std::io::copy(block_reader, &mut std::io::sink())?;
+                                        return Ok(true);
+                                    }
+
+                                    let src: Box<dyn Read> = match &bytes_archived {
+                                        Some(ba) => Box::new(CountingReader::new_with_bytes_read(
+                                            block_reader,
+                                            Arc::clone(ba),
+                                        )),
+                                        None => Box::new(block_reader),
+                                    };
+                                    let mut src =
+                                        crate::io::fixed_reader::FixedReader::new_with_fixed_bytes(
+                                            src,
+                                            size as usize,
+                                        );
+                                    itaf_enc.add_file(name, &meta, size, &mut { src })?;
+
+                                    Ok(false)
+                                })
+                                .unwrap_or_default();
+                        } else {
+                            itaf_enc.add_file(name, &meta, size, &mut std::io::empty())?;
+                        }
+                    }
+
+                    while !dir_stack.is_empty() {
+                        itaf_enc.exit_dir()?;
+                        dir_stack.pop();
+                    }
+
+                    let mut inner = itaf_enc.finish()?.finish()?;
+                    inner.flush()?;
+                    inner.shutdown()?;
+
+                    Ok(())
+                });
+            }
+            _ => {
+                tracing::error!(
+                    "unsupported archive format for 7z vfs: {}",
+                    archive_format.extension()
+                );
             }
         }
 

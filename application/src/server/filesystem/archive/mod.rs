@@ -2,21 +2,19 @@ use crate::{
     io::{
         ReadSeek,
         abort::{AbortGuard, AbortListener, AbortReader, AbortWriter},
-        compression::{
-            CompressionType,
-            reader::{AsyncCompressionReader, CompressionReaderMt},
-        },
+        compression::{CompressionType, reader::CompressionReaderMt},
         counting_reader::CountingReader,
         counting_writer::CountingWriter,
     },
     utils::PortablePermissions,
 };
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
@@ -128,6 +126,15 @@ pub enum StreamableArchiveFormat {
     TarBz2,
     TarLz4,
     TarZstd,
+
+    Itaf,
+    ItafGz,
+    ItafXz,
+    ItafLzip,
+    ItafBz2,
+    ItafLz4,
+    ItafZstd,
+
     Zip,
 }
 
@@ -135,13 +142,21 @@ impl StreamableArchiveFormat {
     #[inline]
     pub fn compression_format(self) -> CompressionType {
         match self {
-            StreamableArchiveFormat::Tar => CompressionType::None,
-            StreamableArchiveFormat::TarGz => CompressionType::Gz,
-            StreamableArchiveFormat::TarXz => CompressionType::Xz,
-            StreamableArchiveFormat::TarLzip => CompressionType::Lzip,
-            StreamableArchiveFormat::TarBz2 => CompressionType::Bz2,
-            StreamableArchiveFormat::TarLz4 => CompressionType::Lz4,
-            StreamableArchiveFormat::TarZstd => CompressionType::Zstd,
+            StreamableArchiveFormat::Tar | StreamableArchiveFormat::Itaf => CompressionType::None,
+            StreamableArchiveFormat::TarGz | StreamableArchiveFormat::ItafGz => CompressionType::Gz,
+            StreamableArchiveFormat::TarXz | StreamableArchiveFormat::ItafXz => CompressionType::Xz,
+            StreamableArchiveFormat::TarLzip | StreamableArchiveFormat::ItafLzip => {
+                CompressionType::Lzip
+            }
+            StreamableArchiveFormat::TarBz2 | StreamableArchiveFormat::ItafBz2 => {
+                CompressionType::Bz2
+            }
+            StreamableArchiveFormat::TarLz4 | StreamableArchiveFormat::ItafLz4 => {
+                CompressionType::Lz4
+            }
+            StreamableArchiveFormat::TarZstd | StreamableArchiveFormat::ItafZstd => {
+                CompressionType::Zstd
+            }
             StreamableArchiveFormat::Zip => CompressionType::None,
         }
     }
@@ -156,6 +171,13 @@ impl StreamableArchiveFormat {
             StreamableArchiveFormat::TarBz2 => "tar.bz2",
             StreamableArchiveFormat::TarLz4 => "tar.lz4",
             StreamableArchiveFormat::TarZstd => "tar.zst",
+            StreamableArchiveFormat::Itaf => "itaf",
+            StreamableArchiveFormat::ItafGz => "itaf.gz",
+            StreamableArchiveFormat::ItafXz => "itaf.xz",
+            StreamableArchiveFormat::ItafLzip => "itaf.lz",
+            StreamableArchiveFormat::ItafBz2 => "itaf.bz2",
+            StreamableArchiveFormat::ItafLz4 => "itaf.lz4",
+            StreamableArchiveFormat::ItafZstd => "itaf.zst",
             StreamableArchiveFormat::Zip => "zip",
         }
     }
@@ -164,14 +186,51 @@ impl StreamableArchiveFormat {
     pub fn mime_type(self) -> &'static str {
         match self {
             StreamableArchiveFormat::Tar => "application/x-tar",
-            StreamableArchiveFormat::TarGz => "application/gzip",
-            StreamableArchiveFormat::TarXz => "application/x-xz",
-            StreamableArchiveFormat::TarLzip => "application/x-lzip",
-            StreamableArchiveFormat::TarBz2 => "application/x-bzip2",
-            StreamableArchiveFormat::TarLz4 => "application/x-lz4",
-            StreamableArchiveFormat::TarZstd => "application/zstd",
+            StreamableArchiveFormat::TarGz | StreamableArchiveFormat::ItafGz => "application/gzip",
+            StreamableArchiveFormat::TarXz | StreamableArchiveFormat::ItafXz => "application/x-xz",
+            StreamableArchiveFormat::TarLzip | StreamableArchiveFormat::ItafLzip => {
+                "application/x-lzip"
+            }
+            StreamableArchiveFormat::TarBz2 | StreamableArchiveFormat::ItafBz2 => {
+                "application/x-bzip2"
+            }
+            StreamableArchiveFormat::TarLz4 | StreamableArchiveFormat::ItafLz4 => {
+                "application/x-lz4"
+            }
+            StreamableArchiveFormat::TarZstd | StreamableArchiveFormat::ItafZstd => {
+                "application/zstd"
+            }
+            StreamableArchiveFormat::Itaf => "application/octet-stream",
             StreamableArchiveFormat::Zip => "application/zip",
         }
+    }
+
+    #[inline]
+    pub const fn is_tar(self) -> bool {
+        matches!(
+            self,
+            StreamableArchiveFormat::Tar
+                | StreamableArchiveFormat::TarGz
+                | StreamableArchiveFormat::TarXz
+                | StreamableArchiveFormat::TarLzip
+                | StreamableArchiveFormat::TarBz2
+                | StreamableArchiveFormat::TarLz4
+                | StreamableArchiveFormat::TarZstd
+        )
+    }
+
+    #[inline]
+    pub const fn is_itaf(self) -> bool {
+        matches!(
+            self,
+            StreamableArchiveFormat::Itaf
+                | StreamableArchiveFormat::ItafGz
+                | StreamableArchiveFormat::ItafXz
+                | StreamableArchiveFormat::ItafLzip
+                | StreamableArchiveFormat::ItafBz2
+                | StreamableArchiveFormat::ItafLz4
+                | StreamableArchiveFormat::ItafZstd
+        )
     }
 }
 
@@ -250,7 +309,6 @@ pub struct Archive {
     pub archive: ArchiveType,
 
     pub server: crate::server::Server,
-    pub header: [u8; 64],
 
     pub file: File,
     pub path: PathBuf,
@@ -277,7 +335,6 @@ impl Archive {
             compression: compression_format,
             archive: archive_format,
             server,
-            header,
             file,
             path,
         })
@@ -322,94 +379,6 @@ impl Archive {
         }
     }
 
-    pub async fn estimated_size(&mut self) -> Option<u64> {
-        match self.compression {
-            CompressionType::None => Some(self.file.metadata().await.ok()?.len()),
-            CompressionType::Gz => {
-                let file_size = self.file.metadata().await.ok()?.len();
-
-                if file_size < 4 {
-                    return None;
-                }
-
-                if self.file.seek(SeekFrom::End(-4)).await.is_err() {
-                    return None;
-                }
-
-                let mut buffer = [0; 4];
-                if self.file.read_exact(&mut buffer).await.is_err() {
-                    return None;
-                }
-
-                Some(u32::from_le_bytes(buffer) as u64)
-            }
-            CompressionType::Xz => None,
-            CompressionType::Lzip => None,
-            CompressionType::Bz2 => None,
-            CompressionType::Lz4 => {
-                if self.header[0..4] != [0x04, 0x22, 0x4D, 0x18] {
-                    return None;
-                }
-
-                let flags = self.header[4];
-                let has_content_size = (flags & 0x08) != 0;
-
-                if !has_content_size || self.header.len() < 13 {
-                    return None;
-                }
-
-                Some(u64::from_le_bytes(self.header[5..13].try_into().ok()?))
-            }
-            CompressionType::Zstd => {
-                if self.header[0..4] != [0x28, 0xB5, 0x2F, 0xFD] {
-                    return None;
-                }
-
-                let frame_header_descriptor = self.header[4];
-
-                let fcs_flag = frame_header_descriptor & 0x03;
-                let single_segment = (frame_header_descriptor & 0x20) != 0;
-
-                if fcs_flag == 0 && !single_segment {
-                    return None;
-                }
-
-                let size_bytes = match fcs_flag {
-                    0 if single_segment => 1,
-                    1 => 2,
-                    2 => 4,
-                    3 => 8,
-                    _ => return None,
-                };
-
-                let size_buffer = &self.header[5..13];
-
-                match size_bytes {
-                    1 => Some(size_buffer[0] as u64),
-                    2 => Some(u16::from_le_bytes([size_buffer[0], size_buffer[1]]) as u64),
-                    4 => Some(u32::from_le_bytes([
-                        size_buffer[0],
-                        size_buffer[1],
-                        size_buffer[2],
-                        size_buffer[3],
-                    ]) as u64),
-                    8 => Some(u64::from_le_bytes(size_buffer.try_into().ok()?)),
-                    _ => None,
-                }
-            }
-        }
-    }
-
-    pub async fn reader(mut self) -> Result<AsyncCompressionReader, anyhow::Error> {
-        self.file.seek(SeekFrom::Start(0)).await?;
-
-        Ok(AsyncCompressionReader::new_mt(
-            self.file.into_std().await,
-            self.compression,
-            self.server.app_state.config.api.file_decompression_threads,
-        ))
-    }
-
     pub async fn extract(
         mut self,
         destination: PathBuf,
@@ -440,7 +409,12 @@ impl Archive {
                     let reader = CompressionReaderMt::new(
                         reader,
                         self.compression,
-                        self.server.app_state.config.api.file_decompression_threads,
+                        self.server
+                            .app_state
+                            .config
+                            .load()
+                            .api
+                            .file_decompression_threads,
                     )?;
                     let mut reader = AbortReader::new(reader, listener);
 
@@ -474,7 +448,12 @@ impl Archive {
                     let reader = CompressionReaderMt::new(
                         reader,
                         self.compression,
-                        self.server.app_state.config.api.file_decompression_threads,
+                        self.server
+                            .app_state
+                            .config
+                            .load()
+                            .api
+                            .file_decompression_threads,
                     )?;
                     let reader = AbortReader::new(reader, listener);
 
@@ -606,7 +585,14 @@ impl Archive {
                     }
 
                     let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(self.server.app_state.config.api.file_decompression_threads)
+                        .num_threads(
+                            self.server
+                                .app_state
+                                .config
+                                .load()
+                                .api
+                                .file_decompression_threads,
+                        )
                         .build()?;
 
                     let error = Arc::new(RwLock::new(None));
@@ -629,7 +615,7 @@ impl Archive {
                                 let mut read_buffer = vec![0; crate::BUFFER_SIZE];
 
                                 loop {
-                                    if error_clone2.read().unwrap().is_some() {
+                                    if error_clone2.read().is_some() {
                                         return Ok(());
                                     }
 
@@ -725,12 +711,12 @@ impl Archive {
                             };
 
                             if let Err(err) = run() {
-                                error_clone.write().unwrap().replace(err);
+                                error_clone.write().replace(err);
                             }
                         });
                     });
 
-                    if let Some(err) = error.write().unwrap().take() {
+                    if let Some(err) = error.write().take() {
                         Err(err)
                     } else {
                         for i in 0..archive.len() {
@@ -805,7 +791,10 @@ impl Archive {
                     if let Some(total) = total {
                         let mut entry_total = 0;
                         let archive = unrar::Archive::new_owned(
-                            self.server.filesystem.base_path.join(&self.path),
+                            self.server
+                                .filesystem
+                                .base_path
+                                .join(self.server.filesystem.relative_path(&self.path)),
                         )
                         .open_for_listing()?;
                         for entry in archive.flatten() {
@@ -815,9 +804,13 @@ impl Archive {
                         total.store(entry_total, Ordering::Relaxed);
                     }
 
-                    let mut archive =
-                        unrar::Archive::new_owned(self.server.filesystem.base_path.join(self.path))
-                            .open_for_processing()?;
+                    let mut archive = unrar::Archive::new_owned(
+                        self.server
+                            .filesystem
+                            .base_path
+                            .join(self.server.filesystem.relative_path(&self.path)),
+                    )
+                    .open_for_processing()?;
                     let mut directory_entries = chunked_vec::ChunkedVec::new();
 
                     loop {
@@ -927,7 +920,14 @@ impl Archive {
                     }
 
                     let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(self.server.app_state.config.api.file_decompression_threads)
+                        .num_threads(
+                            self.server
+                                .app_state
+                                .config
+                                .load()
+                                .api
+                                .file_decompression_threads,
+                        )
                         .build()?;
 
                     let error = Arc::new(RwLock::new(None));
@@ -942,7 +942,7 @@ impl Archive {
                             let error_clone = Arc::clone(&error);
 
                             scope.spawn(move |_| {
-                                if error_clone.read().unwrap().is_some() {
+                                if error_clone.read().is_some() {
                                     return;
                                 }
 
@@ -1023,13 +1023,13 @@ impl Archive {
 
                                     Ok(true)
                                 }) {
-                                    error_clone.write().unwrap().replace(err);
+                                    error_clone.write().replace(err);
                                 }
                             });
                         }
                     });
 
-                    if let Some(err) = error.write().unwrap().take() {
+                    if let Some(err) = error.write().take() {
                         Err(err.into())
                     } else {
                         for entry in archive.files {
@@ -1090,7 +1090,14 @@ impl Archive {
                     }
 
                     let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(self.server.app_state.config.api.file_decompression_threads)
+                        .num_threads(
+                            self.server
+                                .app_state
+                                .config
+                                .load()
+                                .api
+                                .file_decompression_threads,
+                        )
                         .build()?;
 
                     fn recursive_traverse(
@@ -1156,8 +1163,20 @@ impl Archive {
                                 };
 
                                 scope.spawn(move |_| {
-                                    crate::io::copy(&mut reader, &mut writer).unwrap();
-                                    writer.flush().unwrap();
+                                    let mut run = || -> Result<(), std::io::Error> {
+                                        crate::io::copy(&mut reader, &mut writer)?;
+                                        writer.flush()?;
+
+                                        Ok(())
+                                    };
+
+                                    if let Err(err) = run() {
+                                        tracing::debug!(
+                                            path = %destination_path.display(),
+                                            "failed to extract file from archive: {:#?}",
+                                            err
+                                        );
+                                    }
                                 });
                             }
                             ddup_bak::archive::entries::Entry::Symlink(link) => {

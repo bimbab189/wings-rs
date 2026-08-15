@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::{
     io::{
         compression::CompressionLevel,
@@ -36,29 +38,29 @@ impl ByteRange {
         let range_header = headers.get(axum::http::header::RANGE)?;
 
         let range_str = range_header.to_str().ok()?;
-        if !range_str.starts_with("bytes=") {
+        let range_values = range_str.strip_prefix("bytes=")?;
+
+        let mut range_split = range_values.split('-');
+        let (Some(start_str), Some(end_str)) = (range_split.next(), range_split.next()) else {
+            return None;
+        };
+        if range_split.next().is_some() {
             return None;
         }
 
-        let range_values = &range_str[6..];
-        let parts: Vec<&str> = range_values.split('-').collect();
-        if parts.len() != 2 {
-            return None;
-        }
-
-        let start = if parts[0].is_empty() {
+        let start = if start_str.is_empty() {
             Bound::Unbounded
         } else {
-            match parts[0].parse::<u64>() {
+            match start_str.parse::<u64>() {
                 Ok(val) => Bound::Included(val),
                 Err(_) => return None,
             }
         };
 
-        let end = if parts[1].is_empty() {
+        let end = if end_str.is_empty() {
             Bound::Unbounded
         } else {
-            match parts[1].parse::<u64>() {
+            match end_str.parse::<u64>() {
                 Ok(val) => Bound::Included(val),
                 Err(_) => return None,
             }
@@ -87,7 +89,7 @@ impl ByteRange {
         matches!((&self.0, &self.1), (Bound::Unbounded, Bound::Unbounded))
     }
 
-    pub fn to_header_value(&self, total: u64) -> HeaderValue {
+    pub fn get_header_value(&self, total: u64) -> HeaderValue {
         let range_header_value = match (&self.0, &self.1) {
             (Bound::Included(s), Bound::Included(e)) => format!("bytes {}-{}/{}", s, e, total),
             (Bound::Included(s), Bound::Excluded(e)) => format!("bytes {}-{}/{}", s, e - 1, total),
@@ -106,7 +108,7 @@ impl ByteRange {
             (Bound::Unbounded, Bound::Unbounded) => format!("bytes 0-{}/{}", total - 1, total),
         };
 
-        HeaderValue::from_str(&range_header_value).unwrap()
+        unsafe { HeaderValue::from_str(&range_header_value).unwrap_unchecked() }
     }
 }
 
@@ -210,7 +212,7 @@ impl AsyncFileRead {
             );
             headers.insert(
                 axum::http::header::CONTENT_RANGE,
-                reader_range.to_header_value(self.total_size),
+                reader_range.get_header_value(self.total_size),
             );
         }
 

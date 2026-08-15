@@ -5,7 +5,7 @@ pub(crate) mod get {
     use std::path::Path;
 
     use crate::{
-        io::compression::reader::AsyncCompressionReader,
+        io::{compression::reader::AsyncCompressionReader, fixed_reader::AsyncFixedReader},
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
     };
@@ -127,6 +127,7 @@ pub(crate) mod get {
         ) {
             headers.insert("Content-Length", metadata.size.into());
         }
+
         if data.download {
             headers.insert(
                 "Content-Disposition",
@@ -143,9 +144,14 @@ pub(crate) mod get {
             compression_type,
             crate::io::compression::CompressionType::None
         ) {
-            Box::new(reader)
+            Box::new(AsyncFixedReader::new_with_fixed_bytes(
+                reader,
+                metadata.size as usize,
+            ))
+        } else if let Some(max_size) = data.max_size {
+            Box::new(reader.take(max_size))
         } else {
-            Box::new(reader.take(metadata.size))
+            Box::new(reader)
         };
 
         ApiResponse::new_stream(reader).with_headers(headers).ok()

@@ -1,5 +1,6 @@
 use crate::{
     io::{
+        SafeSlice, SafeWrite,
         compression::{CompressionLevel, writer::CompressionWriter},
         counting_reader::CountingReader,
     },
@@ -20,10 +21,11 @@ use crate::{
             },
         },
     },
-    utils::PortablePermissions,
+    utils::{PortablePermissions, StdoutTakeExt, TokioStdoutTakeExt},
 };
 use chrono::{Datelike, Timelike};
 use compact_str::{CompactString, ToCompactString};
+use itaf::encoder::{EncoderOptions, ItafEncoder, Metadata};
 use serde::Deserialize;
 use serde_default::DefaultFromSerde;
 use std::{
@@ -131,7 +133,7 @@ impl ResticTreeNode {
                     file_type: match entry.r#type {
                         ResticEntryType::File => FileType::File,
                         ResticEntryType::Symlink => FileType::Symlink,
-                        ResticEntryType::Dir => unreachable!(),
+                        ResticEntryType::Dir => FileType::Dir,
                     },
                     mode: entry.mode,
                     size: entry.size.unwrap_or(0),
@@ -139,7 +141,8 @@ impl ResticTreeNode {
                 };
                 let leaf_name = leaf.to_compact_string();
                 match parent.files.binary_search_by(|(n, _)| n.as_str().cmp(leaf)) {
-                    Ok(idx) => parent.files[idx].1 = meta,
+                    // SAFETY: `idx` is guaranteed to be a valid index into `parent.files` due to the logic above.
+                    Ok(idx) => unsafe { parent.files.get_unchecked_mut(idx) }.1 = meta,
                     Err(idx) => parent.files.insert(idx, (leaf_name, meta)),
                 }
             }
@@ -158,7 +161,8 @@ impl ResticTreeNode {
                     idx
                 }
             };
-            current = &mut current.dirs[idx].1;
+            // SAFETY: `idx` is guaranteed to be a valid index into `current.dirs` due to the logic above.
+            current = unsafe { &mut current.dirs.get_unchecked_mut(idx).1 };
         }
         current
     }
@@ -183,7 +187,7 @@ impl ResticTreeNode {
                 .dirs
                 .binary_search_by(|(n, _)| n.as_str().cmp(name))
                 .ok()?;
-            current = &current.dirs[idx].1;
+            current = &current.dirs.get(idx)?.1;
         }
         Some(current)
     }
@@ -197,7 +201,7 @@ impl ResticTreeNode {
             .files
             .binary_search_by(|(n, _)| n.as_str().cmp(leaf))
             .ok()?;
-        Some(&parent.files[idx].1)
+        Some(&parent.files.get(idx)?.1)
     }
 }
 
@@ -214,7 +218,7 @@ pub struct ResticBackup {
 fn get_restic_cache_dir(config: &crate::config::Config) -> String {
     format!(
         "{}/.cache/restic",
-        config.system.backup_directory.trim_end_matches('/')
+        config.load().system.backup_directory.trim_end_matches('/')
     )
 }
 
@@ -225,18 +229,19 @@ impl BackupFindExt for ResticBackup {
             return Ok(true);
         }
 
-        if tokio::fs::metadata(&state.config.system.backups.restic.password_file)
+        if tokio::fs::metadata(&state.config.load().system.backups.restic.password_file)
             .await
             .is_ok()
         {
+            let config = state.config.load();
             let output = match Command::new("restic")
-                .envs(&state.config.system.backups.restic.environment)
+                .envs(&config.system.backups.restic.environment)
                 .arg("--json")
                 .arg("--no-lock")
                 .arg("--repo")
-                .arg(&state.config.system.backups.restic.repository)
+                .arg(&config.system.backups.restic.repository)
                 .arg("--password-file")
-                .arg(&state.config.system.backups.restic.password_file)
+                .arg(&config.system.backups.restic.password_file)
                 .arg("--cache-dir")
                 .arg(get_restic_cache_dir(&state.config))
                 .arg("snapshots")
@@ -255,12 +260,16 @@ impl BackupFindExt for ResticBackup {
             if output.status.success() {
                 let snapshots: Vec<ResticSnapshot> =
                     serde_json::from_slice(&output.stdout).unwrap_or_default();
-                let configuration = Arc::new(ResticBackupConfiguration {
-                    repository: state.config.system.backups.restic.repository.clone(),
-                    password_file: Some(state.config.system.backups.restic.password_file.clone()),
-                    retry_lock_seconds: state.config.system.backups.restic.retry_lock_seconds,
-                    environment: state.config.system.backups.restic.environment.clone(),
-                });
+                let configuration = {
+                    let config = state.config.load();
+
+                    Arc::new(ResticBackupConfiguration {
+                        repository: config.system.backups.restic.repository.clone(),
+                        password_file: Some(config.system.backups.restic.password_file.clone()),
+                        retry_lock_seconds: config.system.backups.restic.retry_lock_seconds,
+                        environment: config.system.backups.restic.environment.clone(),
+                    })
+                };
 
                 let mut found = false;
                 let mut cache = RESTIC_BACKUP_CACHE.write().await;
@@ -365,18 +374,19 @@ impl BackupFindExt for ResticBackup {
             })));
         }
 
-        if tokio::fs::metadata(&state.config.system.backups.restic.password_file)
+        if tokio::fs::metadata(&state.config.load().system.backups.restic.password_file)
             .await
             .is_ok()
         {
+            let config = state.config.load();
             let output = match Command::new("restic")
-                .envs(&state.config.system.backups.restic.environment)
+                .envs(&config.system.backups.restic.environment)
                 .arg("--json")
                 .arg("--no-lock")
                 .arg("--repo")
-                .arg(&state.config.system.backups.restic.repository)
+                .arg(&config.system.backups.restic.repository)
                 .arg("--password-file")
-                .arg(&state.config.system.backups.restic.password_file)
+                .arg(&config.system.backups.restic.password_file)
                 .arg("--cache-dir")
                 .arg(get_restic_cache_dir(&state.config))
                 .arg("snapshots")
@@ -392,12 +402,16 @@ impl BackupFindExt for ResticBackup {
             if output.status.success() {
                 let snapshots: Vec<ResticSnapshot> =
                     serde_json::from_slice(&output.stdout).unwrap_or_default();
-                let configuration = Arc::new(ResticBackupConfiguration {
-                    repository: state.config.system.backups.restic.repository.clone(),
-                    password_file: Some(state.config.system.backups.restic.password_file.clone()),
-                    retry_lock_seconds: state.config.system.backups.restic.retry_lock_seconds,
-                    environment: state.config.system.backups.restic.environment.clone(),
-                });
+                let configuration = {
+                    let config = state.config.load();
+
+                    Arc::new(ResticBackupConfiguration {
+                        repository: config.system.backups.restic.repository.clone(),
+                        password_file: Some(config.system.backups.restic.password_file.clone()),
+                        retry_lock_seconds: config.system.backups.restic.retry_lock_seconds,
+                        environment: config.system.backups.restic.environment.clone(),
+                    })
+                };
 
                 let mut backup = None;
                 let mut cache = RESTIC_BACKUP_CACHE.write().await;
@@ -523,131 +537,114 @@ impl BackupCreateExt for ResticBackup {
             excluded_paths.push(line);
         }
 
-        let (mut child, configuration) =
-            if tokio::fs::metadata(&server.app_state.config.system.backups.restic.password_file)
-                .await
-                .is_ok()
-            {
-                (
-                    Command::new("restic")
-                        .envs(&server.app_state.config.system.backups.restic.environment)
-                        .arg("--json")
-                        .arg("--repo")
-                        .arg(&server.app_state.config.system.backups.restic.repository)
-                        .arg("--password-file")
-                        .arg(&server.app_state.config.system.backups.restic.password_file)
-                        .arg("--cache-dir")
-                        .arg(get_restic_cache_dir(&server.app_state.config))
-                        .arg("--retry-lock")
-                        .arg(format!(
-                            "{}s",
-                            server
-                                .app_state
-                                .config
-                                .system
-                                .backups
-                                .restic
-                                .retry_lock_seconds
-                        ))
-                        .arg("backup")
-                        .arg(&server.filesystem.base_path)
-                        .args(&excluded_paths)
-                        .arg("--tag")
-                        .arg(uuid.to_string())
-                        .arg("--group-by")
-                        .arg("tags")
-                        .arg("--limit-download")
-                        .arg(
-                            (server.app_state.config.system.backups.read_limit.as_kib())
-                                .to_compact_string(),
-                        )
-                        .arg("--limit-upload")
-                        .arg(
-                            (server.app_state.config.system.backups.write_limit.as_kib())
-                                .to_compact_string(),
-                        )
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .spawn()?,
-                    ResticBackupConfiguration {
-                        repository: server
-                            .app_state
-                            .config
-                            .system
-                            .backups
-                            .restic
-                            .repository
-                            .clone(),
-                        password_file: Some(
-                            server
-                                .app_state
-                                .config
-                                .system
-                                .backups
-                                .restic
-                                .password_file
-                                .clone(),
-                        ),
-                        retry_lock_seconds: server
-                            .app_state
-                            .config
-                            .system
-                            .backups
-                            .restic
-                            .retry_lock_seconds,
-                        environment: server
-                            .app_state
-                            .config
-                            .system
-                            .backups
-                            .restic
-                            .environment
-                            .clone(),
-                    },
-                )
-            } else {
-                let configuration = server
-                    .app_state
-                    .config
-                    .client
-                    .backup_restic_configuration(uuid)
-                    .await?;
+        let (mut child, configuration) = if tokio::fs::metadata(
+            &server
+                .app_state
+                .config
+                .load()
+                .system
+                .backups
+                .restic
+                .password_file,
+        )
+        .await
+        .is_ok()
+        {
+            let config = server.app_state.config.load();
 
-                (
-                    Command::new("restic")
-                        .envs(&configuration.environment)
-                        .arg("--json")
-                        .arg("--repo")
-                        .arg(&configuration.repository)
-                        .arg("--cache-dir")
-                        .arg(get_restic_cache_dir(&server.app_state.config))
-                        .arg("--retry-lock")
-                        .arg(format!("{}s", configuration.retry_lock_seconds))
-                        .arg("backup")
-                        .arg(&server.filesystem.base_path)
-                        .args(&excluded_paths)
-                        .arg("--tag")
-                        .arg(uuid.to_string())
-                        .arg("--group-by")
-                        .arg("tags")
-                        .arg("--limit-download")
-                        .arg(
-                            (server.app_state.config.system.backups.read_limit.as_kib())
-                                .to_compact_string(),
-                        )
-                        .arg("--limit-upload")
-                        .arg(
-                            (server.app_state.config.system.backups.write_limit.as_kib())
-                                .to_compact_string(),
-                        )
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .spawn()?,
-                    configuration,
-                )
-            };
+            (
+                Command::new("restic")
+                    .envs(&config.system.backups.restic.environment)
+                    .arg("--json")
+                    .arg("--repo")
+                    .arg(&config.system.backups.restic.repository)
+                    .arg("--password-file")
+                    .arg(&config.system.backups.restic.password_file)
+                    .arg("--cache-dir")
+                    .arg(get_restic_cache_dir(&server.app_state.config))
+                    .arg("--retry-lock")
+                    .arg(format!(
+                        "{}s",
+                        config.system.backups.restic.retry_lock_seconds
+                    ))
+                    .arg("backup")
+                    .arg(&server.filesystem.base_path)
+                    .args(&excluded_paths)
+                    .arg("--tag")
+                    .arg(uuid.to_string())
+                    .arg("--group-by")
+                    .arg("tags")
+                    .arg("--limit-download")
+                    .arg((config.system.backups.read_limit.as_kib()).to_compact_string())
+                    .arg("--limit-upload")
+                    .arg((config.system.backups.write_limit.as_kib()).to_compact_string())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()?,
+                ResticBackupConfiguration {
+                    repository: config.system.backups.restic.repository.clone(),
+                    password_file: Some(config.system.backups.restic.password_file.clone()),
+                    retry_lock_seconds: config.system.backups.restic.retry_lock_seconds,
+                    environment: config.system.backups.restic.environment.clone(),
+                },
+            )
+        } else {
+            let configuration = server
+                .app_state
+                .config
+                .client
+                .backup_restic_configuration(uuid)
+                .await?;
 
-        let mut line_reader = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+            (
+                Command::new("restic")
+                    .envs(&configuration.environment)
+                    .arg("--json")
+                    .arg("--repo")
+                    .arg(&configuration.repository)
+                    .arg("--cache-dir")
+                    .arg(get_restic_cache_dir(&server.app_state.config))
+                    .arg("--retry-lock")
+                    .arg(format!("{}s", configuration.retry_lock_seconds))
+                    .arg("backup")
+                    .arg(&server.filesystem.base_path)
+                    .args(&excluded_paths)
+                    .arg("--tag")
+                    .arg(uuid.to_string())
+                    .arg("--group-by")
+                    .arg("tags")
+                    .arg("--limit-download")
+                    .arg(
+                        (server
+                            .app_state
+                            .config
+                            .load()
+                            .system
+                            .backups
+                            .read_limit
+                            .as_kib())
+                        .to_compact_string(),
+                    )
+                    .arg("--limit-upload")
+                    .arg(
+                        (server
+                            .app_state
+                            .config
+                            .load()
+                            .system
+                            .backups
+                            .write_limit
+                            .as_kib())
+                        .to_compact_string(),
+                    )
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()?,
+                configuration,
+            )
+        };
+
+        let mut line_reader = tokio::io::BufReader::new(child.take_stdout()?).lines();
 
         let mut snapshot_id = None;
         let mut total_bytes_processed = 0;
@@ -735,32 +732,34 @@ impl BackupExt for ResticBackup {
         archive_format: StreamableArchiveFormat,
         _range: Option<ByteRange>,
     ) -> Result<crate::response::ApiResponse, anyhow::Error> {
-        let compression_level = state.config.system.backups.compression_level;
+        let compression_level = state.config.load().system.backups.compression_level;
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
-                let child = std::process::Command::new("restic")
-                    .envs(&self.configuration.environment)
-                    .arg("--json")
-                    .arg("--no-lock")
-                    .arg("--repo")
-                    .arg(&self.configuration.repository)
-                    .args(self.configuration.password())
-                    .arg("--cache-dir")
-                    .arg(get_restic_cache_dir(&state.config))
-                    .arg("dump")
-                    .arg(format!("{}:{}", self.short_id, self.server_path.display()))
-                    .arg("/")
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()?;
+                let child = tokio::task::block_in_place(|| {
+                    std::process::Command::new("restic")
+                        .envs(&self.configuration.environment)
+                        .arg("--json")
+                        .arg("--no-lock")
+                        .arg("--repo")
+                        .arg(&self.configuration.repository)
+                        .args(self.configuration.password())
+                        .arg("--cache-dir")
+                        .arg(get_restic_cache_dir(&state.config))
+                        .arg("dump")
+                        .arg(format!("{}:{}", self.short_id, self.server_path.display()))
+                        .arg("/")
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                })?;
 
                 crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
                     let writer = tokio_util::io::SyncIoBridge::new(writer);
                     let mut archive = zip::ZipWriter::new_stream(writer);
 
-                    let mut subtar = tar::Archive::new(child.stdout.unwrap());
+                    let mut subtar = tar::Archive::new(child.into_stdout()?);
                     let mut entries = subtar.entries()?;
 
                     let mut read_buffer = vec![0; crate::BUFFER_SIZE];
@@ -808,33 +807,35 @@ impl BackupExt for ResticBackup {
                     Ok(())
                 });
             }
-            _ => {
-                let child = std::process::Command::new("restic")
-                    .envs(&self.configuration.environment)
-                    .arg("--json")
-                    .arg("--no-lock")
-                    .arg("--repo")
-                    .arg(&self.configuration.repository)
-                    .args(self.configuration.password())
-                    .arg("--cache-dir")
-                    .arg(get_restic_cache_dir(&self.config))
-                    .arg("dump")
-                    .arg(format!("{}:{}", self.short_id, self.server_path.display()))
-                    .arg("/")
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()?;
+            f if f.is_tar() => {
+                let child = tokio::task::block_in_place(|| {
+                    std::process::Command::new("restic")
+                        .envs(&self.configuration.environment)
+                        .arg("--json")
+                        .arg("--no-lock")
+                        .arg("--repo")
+                        .arg(&self.configuration.repository)
+                        .args(self.configuration.password())
+                        .arg("--cache-dir")
+                        .arg(get_restic_cache_dir(&self.config))
+                        .arg("dump")
+                        .arg(format!("{}:{}", self.short_id, self.server_path.display()))
+                        .arg("/")
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                })?;
 
-                let file_compression_threads = self.config.api.file_compression_threads;
+                let file_compression_threads = self.config.load().api.file_compression_threads;
                 crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
                     let mut writer = CompressionWriter::new(
                         tokio_util::io::SyncIoBridge::new(writer),
-                        archive_format.compression_format(),
+                        f.compression_format(),
                         compression_level,
                         file_compression_threads,
                     )?;
 
-                    if let Err(err) = crate::io::copy(&mut child.stdout.unwrap(), &mut writer) {
+                    if let Err(err) = crate::io::copy(&mut child.into_stdout()?, &mut writer) {
                         tracing::error!(
                             "failed to compress tar archive for restic backup: {}",
                             err
@@ -847,6 +848,147 @@ impl BackupExt for ResticBackup {
 
                     Ok(())
                 });
+            }
+            f if f.is_itaf() => {
+                let child = tokio::task::block_in_place(|| {
+                    std::process::Command::new("restic")
+                        .envs(&self.configuration.environment)
+                        .arg("--json")
+                        .arg("--no-lock")
+                        .arg("--repo")
+                        .arg(&self.configuration.repository)
+                        .args(self.configuration.password())
+                        .arg("--cache-dir")
+                        .arg(get_restic_cache_dir(&self.config))
+                        .arg("dump")
+                        .arg(format!("{}:{}", self.short_id, self.server_path.display()))
+                        .arg("/")
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                })?;
+
+                let file_compression_threads = self.config.load().api.file_compression_threads;
+                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                    let writer = CompressionWriter::new(
+                        tokio_util::io::SyncIoBridge::new(writer),
+                        f.compression_format(),
+                        compression_level,
+                        file_compression_threads,
+                    )?;
+                    let mut itaf_enc = ItafEncoder::new(
+                        writer,
+                        EncoderOptions {
+                            base_timestamp: None,
+                            crc_enabled: true,
+                        },
+                    )?;
+
+                    let mut dir_stack = Vec::new();
+                    let mut restic_tar = tar::Archive::new(child.into_stdout()?);
+                    let mut entries = restic_tar.entries()?;
+
+                    while let Some(Ok(entry)) = entries.next() {
+                        let header = entry.header().clone();
+                        let relative = entry.path()?.to_path_buf();
+
+                        if relative.as_os_str() == "." {
+                            continue;
+                        }
+
+                        let components: Vec<_> = relative
+                            .components()
+                            .filter_map(|c| match c {
+                                std::path::Component::Normal(s) => Some(s.to_string_lossy()),
+                                _ => None,
+                            })
+                            .collect();
+                        let Some(name) = components.last() else {
+                            continue;
+                        };
+
+                        let is_dir = header.entry_type() == tar::EntryType::Directory;
+                        let parent = components.get_slice(..components.len() - 1)?;
+
+                        let mode = header.mode().unwrap_or(if is_dir { 0o755 } else { 0o644 });
+                        let mtime = header
+                            .mtime()
+                            .map(|t| std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
+                            .unwrap_or_else(|_| std::time::SystemTime::now());
+                        let meta = Metadata {
+                            uid: 0,
+                            gid: 0,
+                            mode,
+                            modified: mtime,
+                        };
+
+                        let shared = dir_stack
+                            .iter()
+                            .zip(parent.iter())
+                            .take_while(|(a, b)| a == b)
+                            .count();
+                        while dir_stack.len() > shared {
+                            itaf_enc.exit_dir()?;
+                            dir_stack.pop();
+                        }
+
+                        for component in parent.get_slice(shared..)? {
+                            itaf_enc.enter_dir(
+                                component,
+                                &Metadata {
+                                    uid: 0,
+                                    gid: 0,
+                                    mode: 0o755,
+                                    modified: std::time::SystemTime::now(),
+                                },
+                            )?;
+                            dir_stack.push(component.to_compact_string());
+                        }
+
+                        match header.entry_type() {
+                            tar::EntryType::Directory => {
+                                itaf_enc.enter_dir(name, &meta)?;
+                                dir_stack.push(name.to_compact_string());
+                            }
+                            tar::EntryType::Regular => {
+                                let size = header.size().unwrap_or(0);
+                                let mut reader =
+                                    crate::io::fixed_reader::FixedReader::new_with_fixed_bytes(
+                                        entry,
+                                        size as usize,
+                                    );
+
+                                itaf_enc.add_file(name, &meta, size, &mut reader)?;
+                            }
+                            tar::EntryType::Symlink => {
+                                let link =
+                                    entry.link_name().unwrap_or_default().unwrap_or_default();
+                                let target = link.to_string_lossy();
+                                if itaf::spec::validate_name(name).is_ok() {
+                                    itaf_enc.add_symlink(name, &target, false, &meta)?;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    while !dir_stack.is_empty() {
+                        itaf_enc.exit_dir()?;
+                        dir_stack.pop();
+                    }
+
+                    let mut inner = itaf_enc.finish()?.finish()?;
+                    inner.flush()?;
+                    inner.shutdown()?;
+
+                    Ok(())
+                });
+            }
+            _ => {
+                tracing::error!(
+                    "unsupported archive format for restic backup download: {}",
+                    archive_format.extension()
+                );
             }
         }
 
@@ -885,12 +1027,22 @@ impl BackupExt for ResticBackup {
             .arg("--target")
             .arg(&server.filesystem.base_path)
             .arg("--limit-download")
-            .arg((server.app_state.config.system.backups.read_limit.as_kib()).to_compact_string())
+            .arg(
+                (server
+                    .app_state
+                    .config
+                    .load()
+                    .system
+                    .backups
+                    .read_limit
+                    .as_kib())
+                .to_compact_string(),
+            )
             .arg("-vv")
             .stdout(std::process::Stdio::piped())
             .spawn()?;
 
-        let mut line_reader = tokio::io::BufReader::new(child.stdout.unwrap()).lines();
+        let mut line_reader = tokio::io::BufReader::new(child.into_stdout()?).lines();
 
         while let Ok(Some(line)) = line_reader.next_line().await {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line)
@@ -974,7 +1126,7 @@ impl BackupExt for ResticBackup {
             .stderr(std::process::Stdio::null())
             .spawn()?;
 
-        let mut line_reader = tokio::io::BufReader::new(child.stdout.unwrap()).lines();
+        let mut line_reader = tokio::io::BufReader::new(child.into_stdout()?).lines();
         let mut entries: Vec<ResticDirectoryEntry> = Vec::new();
 
         while let Ok(Some(line)) = line_reader.next_line().await {
@@ -1113,7 +1265,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             };
             return Ok(FileMetadata {
                 file_type: FileType::Dir,
-                permissions: PortablePermissions::from_mode(mode & 0o777),
+                permissions: PortablePermissions::from_mode(mode),
                 size: node.size,
                 modified,
                 created: None,
@@ -1123,7 +1275,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         if let Some(meta) = self.tree.lookup_file(path_ref) {
             return Ok(FileMetadata {
                 file_type: meta.file_type,
-                permissions: PortablePermissions::from_mode(meta.mode & 0o777),
+                permissions: PortablePermissions::from_mode(meta.mode),
                 size: meta.size,
                 modified: Some(meta.mtime.into()),
                 created: None,
@@ -1414,30 +1566,30 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                         let full_path = server_path.join(&entry_path);
 
                         if file_type.is_dir() {
-                            let child = std::process::Command::new("restic")
-                                .envs(&configuration.environment)
-                                .arg("--json")
-                                .arg("--no-lock")
-                                .arg("--repo")
-                                .arg(&configuration.repository)
-                                .args(configuration.password())
-                                .arg("--cache-dir")
-                                .arg(get_restic_cache_dir(&config))
-                                .arg("dump")
-                                .arg(format!("{}:{}", short_id, full_path.display()))
-                                .arg("/")
-                                .stdout(std::process::Stdio::piped())
-                                .stderr(std::process::Stdio::null())
-                                .spawn()?;
-
-                            let stdout = child.stdout.unwrap();
+                            let child = tokio::task::block_in_place(|| {
+                                std::process::Command::new("restic")
+                                    .envs(&configuration.environment)
+                                    .arg("--json")
+                                    .arg("--no-lock")
+                                    .arg("--repo")
+                                    .arg(&configuration.repository)
+                                    .args(configuration.password())
+                                    .arg("--cache-dir")
+                                    .arg(get_restic_cache_dir(&config))
+                                    .arg("dump")
+                                    .arg(format!("{}:{}", short_id, full_path.display()))
+                                    .arg("/")
+                                    .stdout(std::process::Stdio::piped())
+                                    .stderr(std::process::Stdio::null())
+                                    .spawn()
+                            })?;
 
                             let entry_channel_tx = entry_channel_tx.clone();
                             let entry_wanted_notifier = Arc::clone(&entry_wanted_notifier);
                             let is_ignored = is_ignored.clone();
                             tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
                                 let runtime = tokio::runtime::Handle::current();
-                                let mut restic_tar = tar::Archive::new(stdout);
+                                let mut restic_tar = tar::Archive::new(child.into_stdout()?);
                                 let mut entries = restic_tar.entries()?;
 
                                 while let Some(Ok(mut entry)) = entries.next() {
@@ -1491,12 +1643,11 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                 .stderr(std::process::Stdio::null())
                                 .spawn()?;
 
-                            let stdout = child.stdout.unwrap();
                             entry_channel_tx
                                 .send(Ok((
                                     file_type,
                                     path,
-                                    Box::new(stdout) as AsyncReadableFileStream,
+                                    Box::new(child.into_stdout()?) as AsyncReadableFileStream,
                                 )))
                                 .await?;
                         }
@@ -1554,7 +1705,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             size: entry.size,
             total_size: entry.size,
             reader_range: None,
-            reader: Box::new(child.stdout.unwrap()),
+            reader: Box::new(child.into_stdout()?),
         })
     }
     async fn async_read_file(
@@ -1593,7 +1744,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             size: entry.size,
             total_size: entry.size,
             reader_range: None,
-            reader: Box::new(child.stdout.unwrap()),
+            reader: Box::new(child.into_stdout()?),
         })
     }
 
@@ -1637,7 +1788,13 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         let configuration = self.configuration.clone();
         let config = self.server.app_state.config.clone();
         let short_id = self.short_id.clone();
-        let file_compression_threads = self.server.app_state.config.api.file_compression_threads;
+        let file_compression_threads = self
+            .server
+            .app_state
+            .config
+            .load()
+            .api
+            .file_compression_threads;
 
         let spawn_restic = move || {
             std::process::Command::new("restic")
@@ -1665,7 +1822,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                     let writer = tokio_util::io::SyncIoBridge::new(writer);
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
-                    let mut restic_tar = tar::Archive::new(child.stdout.take().unwrap());
+                    let mut restic_tar = tar::Archive::new(child.take_stdout()?);
                     let mut entries = restic_tar.entries()?;
 
                     let mut read_buffer = vec![0; crate::BUFFER_SIZE];
@@ -1715,13 +1872,14 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                 zip.start_file(relative.to_string_lossy(), options)?;
 
                                 loop {
-                                    let n = entry.read(&mut read_buffer)?;
-                                    if n == 0 {
+                                    let bytes_read = entry.read(&mut read_buffer)?;
+                                    if crate::unlikely(bytes_read == 0) {
                                         break;
                                     }
-                                    zip.write_all(&read_buffer[..n])?;
+
+                                    zip.safe_write_all(&read_buffer, bytes_read)?;
                                     if let Some(counter) = &bytes_archived {
-                                        counter.fetch_add(n as u64, Ordering::SeqCst);
+                                        counter.fetch_add(bytes_read as u64, Ordering::SeqCst);
                                     }
                                 }
                             }
@@ -1736,19 +1894,19 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                     Ok(())
                 });
             }
-            _ => {
+            f if f.is_tar() => {
                 crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
                     let mut child = spawn_restic()?;
 
                     let writer = CompressionWriter::new(
                         tokio_util::io::SyncIoBridge::new(writer),
-                        archive_format.compression_format(),
+                        f.compression_format(),
                         compression_level,
                         file_compression_threads,
                     )?;
                     let mut tar = tar::Builder::new(writer);
 
-                    let mut restic_tar = tar::Archive::new(child.stdout.take().unwrap());
+                    let mut restic_tar = tar::Archive::new(child.take_stdout()?);
                     let mut entries = restic_tar.entries()?;
 
                     while let Some(Ok(entry)) = entries.next() {
@@ -1788,6 +1946,149 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                     Ok(())
                 });
             }
+            f if f.is_itaf() => {
+                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                    let mut child = spawn_restic()?;
+
+                    let writer = CompressionWriter::new(
+                        tokio_util::io::SyncIoBridge::new(writer),
+                        f.compression_format(),
+                        compression_level,
+                        file_compression_threads,
+                    )?;
+                    let mut itaf_enc = ItafEncoder::new(
+                        writer,
+                        EncoderOptions {
+                            base_timestamp: None,
+                            crc_enabled: true,
+                        },
+                    )?;
+
+                    let mut dir_stack = Vec::new();
+                    let mut restic_tar = tar::Archive::new(child.take_stdout()?);
+                    let mut entries = restic_tar.entries()?;
+
+                    while let Some(Ok(entry)) = entries.next() {
+                        let header = entry.header().clone();
+                        let relative = entry.path()?.to_path_buf();
+
+                        if relative.as_os_str() == "." {
+                            continue;
+                        }
+
+                        let file_type = match header.entry_type() {
+                            tar::EntryType::Directory => FileType::Dir,
+                            tar::EntryType::Regular => FileType::File,
+                            tar::EntryType::Symlink => FileType::Symlink,
+                            _ => continue,
+                        };
+
+                        let absolute_path = path.join(&relative);
+                        if (is_ignored)(file_type, absolute_path).is_none() {
+                            continue;
+                        }
+
+                        let components: Vec<_> = relative
+                            .components()
+                            .filter_map(|c| match c {
+                                std::path::Component::Normal(s) => Some(s.to_string_lossy()),
+                                _ => None,
+                            })
+                            .collect();
+                        let Some(name) = components.last() else {
+                            continue;
+                        };
+
+                        let is_dir = file_type.is_dir();
+                        let parent = components.get_slice(..components.len() - 1)?;
+
+                        let mode = header.mode().unwrap_or(if is_dir { 0o755 } else { 0o644 });
+                        let mtime = header
+                            .mtime()
+                            .map(|t| std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
+                            .unwrap_or_else(|_| std::time::SystemTime::now());
+                        let meta = Metadata {
+                            uid: 0,
+                            gid: 0,
+                            mode,
+                            modified: mtime,
+                        };
+
+                        let shared = dir_stack
+                            .iter()
+                            .zip(parent.iter())
+                            .take_while(|(a, b)| a == b)
+                            .count();
+                        while dir_stack.len() > shared {
+                            itaf_enc.exit_dir()?;
+                            dir_stack.pop();
+                        }
+
+                        for component in parent.get_slice(shared..)? {
+                            itaf_enc.enter_dir(
+                                component,
+                                &Metadata {
+                                    uid: 0,
+                                    gid: 0,
+                                    mode: 0o755,
+                                    modified: std::time::SystemTime::now(),
+                                },
+                            )?;
+                            dir_stack.push(component.to_compact_string());
+                        }
+
+                        match file_type {
+                            FileType::Dir => {
+                                itaf_enc.enter_dir(name, &meta)?;
+                                dir_stack.push(name.to_compact_string());
+                            }
+                            FileType::File => {
+                                let size = header.size().unwrap_or(0);
+                                let reader: Box<dyn Read> = match &bytes_archived {
+                                    Some(counter) => Box::new(CountingReader::new_with_bytes_read(
+                                        entry,
+                                        counter.clone(),
+                                    )),
+                                    None => Box::new(entry),
+                                };
+                                let mut reader =
+                                    crate::io::fixed_reader::FixedReader::new_with_fixed_bytes(
+                                        reader,
+                                        size as usize,
+                                    );
+
+                                itaf_enc.add_file(name, &meta, size, &mut reader)?;
+                            }
+                            FileType::Symlink => {
+                                let link =
+                                    entry.link_name().unwrap_or_default().unwrap_or_default();
+                                let target = link.to_string_lossy();
+                                if itaf::spec::validate_name(name).is_ok() {
+                                    itaf_enc.add_symlink(name, &target, false, &meta)?;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    while !dir_stack.is_empty() {
+                        itaf_enc.exit_dir()?;
+                        dir_stack.pop();
+                    }
+
+                    let mut inner = itaf_enc.finish()?.finish()?;
+                    inner.flush()?;
+                    inner.shutdown()?;
+
+                    Ok(())
+                });
+            }
+            _ => {
+                tracing::error!(
+                    "unsupported archive format for restic backup archive: {}",
+                    archive_format.extension()
+                );
+            }
         }
 
         Ok(reader)
@@ -1819,7 +2120,13 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         let configuration = self.configuration.clone();
         let config = self.server.app_state.config.clone();
         let short_id = self.short_id.clone();
-        let file_compression_threads = self.server.app_state.config.api.file_compression_threads;
+        let file_compression_threads = self
+            .server
+            .app_state
+            .config
+            .load()
+            .api
+            .file_compression_threads;
 
         let spawn_restic = move |is_dir: bool, path: &Path| {
             std::process::Command::new("restic")
@@ -1888,8 +2195,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                             ResolvedEntry::Dir { path: entry_path } => {
                                 let mut child = spawn_restic(true, &entry_path)?;
 
-                                let mut restic_tar =
-                                    tar::Archive::new(child.stdout.take().unwrap());
+                                let mut restic_tar = tar::Archive::new(child.take_stdout()?);
                                 let mut entries = restic_tar.entries()?;
 
                                 while let Some(Ok(mut entry)) = entries.next() {
@@ -1940,13 +2246,17 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                             zip.start_file(relative.to_string_lossy(), options)?;
 
                                             loop {
-                                                let n = entry.read(&mut read_buffer)?;
-                                                if n == 0 {
+                                                let bytes_read = entry.read(&mut read_buffer)?;
+                                                if crate::unlikely(bytes_read == 0) {
                                                     break;
                                                 }
-                                                zip.write_all(&read_buffer[..n])?;
+
+                                                zip.safe_write_all(&read_buffer, bytes_read)?;
                                                 if let Some(counter) = &bytes_archived {
-                                                    counter.fetch_add(n as u64, Ordering::SeqCst);
+                                                    counter.fetch_add(
+                                                        bytes_read as u64,
+                                                        Ordering::SeqCst,
+                                                    );
                                                 }
                                             }
                                         }
@@ -1980,16 +2290,17 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
 
                                 zip.start_file(entry_path.to_string_lossy(), options)?;
 
-                                let mut restic_file = child.stdout.take().unwrap();
+                                let mut restic_file = child.take_stdout()?;
 
                                 loop {
-                                    let n = restic_file.read(&mut read_buffer)?;
-                                    if n == 0 {
+                                    let bytes_read = restic_file.read(&mut read_buffer)?;
+                                    if crate::unlikely(bytes_read == 0) {
                                         break;
                                     }
-                                    zip.write_all(&read_buffer[..n])?;
+
+                                    zip.safe_write_all(&read_buffer, bytes_read)?;
                                     if let Some(counter) = &bytes_archived {
-                                        counter.fetch_add(n as u64, Ordering::SeqCst);
+                                        counter.fetch_add(bytes_read as u64, Ordering::SeqCst);
                                     }
                                 }
                             }
@@ -2003,11 +2314,11 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                     Ok(())
                 });
             }
-            _ => {
+            f if f.is_tar() => {
                 crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
                     let writer = CompressionWriter::new(
                         tokio_util::io::SyncIoBridge::new(writer),
-                        archive_format.compression_format(),
+                        f.compression_format(),
                         compression_level,
                         file_compression_threads,
                     )?;
@@ -2018,8 +2329,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                             ResolvedEntry::Dir { path: entry_path } => {
                                 let mut child = spawn_restic(true, &entry_path)?;
 
-                                let mut restic_tar =
-                                    tar::Archive::new(child.stdout.take().unwrap());
+                                let mut restic_tar = tar::Archive::new(child.take_stdout()?);
                                 let mut entries = restic_tar.entries()?;
 
                                 while let Some(Ok(entry)) = entries.next() {
@@ -2076,7 +2386,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
 
                                 if let Some(counter) = &bytes_archived {
                                     let counting_reader = CountingReader::new_with_bytes_read(
-                                        child.stdout.take().unwrap(),
+                                        child.take_stdout()?,
                                         counter.clone(),
                                     );
                                     tar.append_data(&mut header, &entry_path, counting_reader)?;
@@ -2084,7 +2394,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                     tar.append_data(
                                         &mut header,
                                         &entry_path,
-                                        child.stdout.take().unwrap(),
+                                        child.take_stdout()?,
                                     )?;
                                 }
                             }
@@ -2098,6 +2408,302 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
 
                     Ok(())
                 });
+            }
+            f if f.is_itaf() => {
+                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                    let writer = CompressionWriter::new(
+                        tokio_util::io::SyncIoBridge::new(writer),
+                        f.compression_format(),
+                        compression_level,
+                        file_compression_threads,
+                    )?;
+                    let mut itaf_enc = ItafEncoder::new(
+                        writer,
+                        EncoderOptions {
+                            base_timestamp: None,
+                            crc_enabled: true,
+                        },
+                    )?;
+
+                    let mut dir_stack = Vec::new();
+
+                    resolved.sort_unstable_by(|a, b| {
+                        let pa = match a {
+                            ResolvedEntry::Dir { path } => path.as_path(),
+                            ResolvedEntry::File { path, .. } => path.as_path(),
+                        };
+                        let pb = match b {
+                            ResolvedEntry::Dir { path } => path.as_path(),
+                            ResolvedEntry::File { path, .. } => path.as_path(),
+                        };
+                        pa.cmp(pb)
+                    });
+
+                    for resolved_entry in resolved {
+                        match resolved_entry {
+                            ResolvedEntry::Dir { path: entry_path } => {
+                                let components: Vec<_> = entry_path
+                                    .components()
+                                    .filter_map(|c| match c {
+                                        std::path::Component::Normal(s) => {
+                                            Some(s.to_string_lossy())
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                let Some(name) = components.last() else {
+                                    continue;
+                                };
+
+                                let parent = components.get_slice(..components.len() - 1)?;
+
+                                let shared = dir_stack
+                                    .iter()
+                                    .zip(parent.iter())
+                                    .take_while(|(a, b)| a == b)
+                                    .count();
+                                while dir_stack.len() > shared {
+                                    itaf_enc.exit_dir()?;
+                                    dir_stack.pop();
+                                }
+
+                                for component in parent.get_slice(shared..)? {
+                                    itaf_enc.enter_dir(
+                                        component,
+                                        &Metadata {
+                                            uid: 0,
+                                            gid: 0,
+                                            mode: 0o755,
+                                            modified: std::time::SystemTime::now(),
+                                        },
+                                    )?;
+                                    dir_stack.push(component.to_compact_string());
+                                }
+
+                                itaf_enc.enter_dir(
+                                    name,
+                                    &Metadata {
+                                        uid: 0,
+                                        gid: 0,
+                                        mode: 0o755,
+                                        modified: std::time::SystemTime::now(),
+                                    },
+                                )?;
+                                dir_stack.push(name.to_compact_string());
+
+                                let base_depth = dir_stack.len();
+                                let mut child = spawn_restic(true, &entry_path)?;
+                                let mut restic_tar = tar::Archive::new(child.take_stdout()?);
+                                let mut entries = restic_tar.entries()?;
+
+                                while let Some(Ok(entry)) = entries.next() {
+                                    let header = entry.header().clone();
+                                    let relative = entry.path()?.to_path_buf();
+
+                                    if relative.as_os_str() == "." {
+                                        continue;
+                                    }
+
+                                    let file_type = match header.entry_type() {
+                                        tar::EntryType::Directory => FileType::Dir,
+                                        tar::EntryType::Regular => FileType::File,
+                                        tar::EntryType::Symlink => FileType::Symlink,
+                                        _ => continue,
+                                    };
+
+                                    let absolute_path = path.join(&entry_path).join(&relative);
+                                    if (is_ignored)(file_type, absolute_path).is_none() {
+                                        continue;
+                                    }
+
+                                    let inner_components: Vec<_> = relative
+                                        .components()
+                                        .filter_map(|c| match c {
+                                            std::path::Component::Normal(s) => {
+                                                Some(s.to_string_lossy())
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    let Some(inner_name) = inner_components.last() else {
+                                        continue;
+                                    };
+
+                                    let inner_parent =
+                                        inner_components.get_slice(..inner_components.len() - 1)?;
+
+                                    let shared = dir_stack
+                                        .get_slice(base_depth..)?
+                                        .iter()
+                                        .zip(inner_parent.iter())
+                                        .take_while(|(a, b)| a == b)
+                                        .count();
+                                    while dir_stack.len() > base_depth + shared {
+                                        itaf_enc.exit_dir()?;
+                                        dir_stack.pop();
+                                    }
+
+                                    for component in inner_parent.get_slice(shared..)? {
+                                        itaf_enc.enter_dir(
+                                            component,
+                                            &Metadata {
+                                                uid: 0,
+                                                gid: 0,
+                                                mode: 0o755,
+                                                modified: std::time::SystemTime::now(),
+                                            },
+                                        )?;
+                                        dir_stack.push(component.to_compact_string());
+                                    }
+
+                                    let is_dir = file_type.is_dir();
+                                    let mode =
+                                        header.mode().unwrap_or(if is_dir { 0o755 } else { 0o644 });
+                                    let mtime = header
+                                        .mtime()
+                                        .map(|t| {
+                                            std::time::UNIX_EPOCH
+                                                + std::time::Duration::from_secs(t)
+                                        })
+                                        .unwrap_or_else(|_| std::time::SystemTime::now());
+                                    let meta = Metadata {
+                                        uid: 0,
+                                        gid: 0,
+                                        mode,
+                                        modified: mtime,
+                                    };
+
+                                    match file_type {
+                                        FileType::Dir => {
+                                            itaf_enc.enter_dir(inner_name, &meta)?;
+                                            dir_stack.push(inner_name.to_compact_string());
+                                        }
+                                        FileType::File => {
+                                            let size = header.size().unwrap_or(0);
+                                            let reader: Box<dyn Read> = match &bytes_archived {
+                                                Some(counter) => {
+                                                    Box::new(CountingReader::new_with_bytes_read(
+                                                        entry,
+                                                        counter.clone(),
+                                                    ))
+                                                }
+                                                None => Box::new(entry),
+                                            };
+                                            let mut reader = crate::io::fixed_reader::FixedReader::new_with_fixed_bytes(
+                                                reader,
+                                                size as usize,
+                                            );
+
+                                            itaf_enc.add_file(
+                                                inner_name,
+                                                &meta,
+                                                size,
+                                                &mut reader,
+                                            )?;
+                                        }
+                                        FileType::Symlink => {
+                                            let link = entry
+                                                .link_name()
+                                                .unwrap_or_default()
+                                                .unwrap_or_default();
+                                            let target = link.to_string_lossy();
+                                            if itaf::spec::validate_name(inner_name).is_ok() {
+                                                itaf_enc.add_symlink(
+                                                    inner_name, &target, false, &meta,
+                                                )?;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            ResolvedEntry::File {
+                                path: entry_path,
+                                mode,
+                                size,
+                                mtime,
+                            } => {
+                                let components: Vec<compact_str::CompactString> = entry_path
+                                    .components()
+                                    .filter_map(|c| match c {
+                                        std::path::Component::Normal(s) => {
+                                            Some(s.to_string_lossy().into())
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                let Some(file_name) = components.last() else {
+                                    continue;
+                                };
+
+                                let parent = components.get_slice(..components.len() - 1)?;
+
+                                let shared = dir_stack
+                                    .iter()
+                                    .zip(parent.iter())
+                                    .take_while(|(a, b)| a == b)
+                                    .count();
+                                while dir_stack.len() > shared {
+                                    itaf_enc.exit_dir()?;
+                                    dir_stack.pop();
+                                }
+
+                                for component in parent.get_slice(shared..)? {
+                                    itaf_enc.enter_dir(
+                                        component,
+                                        &Metadata {
+                                            uid: 0,
+                                            gid: 0,
+                                            mode: 0o755,
+                                            modified: std::time::SystemTime::now(),
+                                        },
+                                    )?;
+                                    dir_stack.push(component.clone());
+                                }
+
+                                let meta = Metadata {
+                                    uid: 0,
+                                    gid: 0,
+                                    mode,
+                                    modified: mtime.into(),
+                                };
+
+                                let mut child = spawn_restic(false, &entry_path)?;
+                                let reader: Box<dyn Read> = match &bytes_archived {
+                                    Some(counter) => Box::new(CountingReader::new_with_bytes_read(
+                                        child.take_stdout()?,
+                                        counter.clone(),
+                                    )),
+                                    None => Box::new(child.take_stdout()?),
+                                };
+                                let mut reader =
+                                    crate::io::fixed_reader::FixedReader::new_with_fixed_bytes(
+                                        reader,
+                                        size as usize,
+                                    );
+
+                                itaf_enc.add_file(file_name, &meta, size, &mut reader)?;
+                            }
+                        }
+                    }
+
+                    while !dir_stack.is_empty() {
+                        itaf_enc.exit_dir()?;
+                        dir_stack.pop();
+                    }
+
+                    let mut inner = itaf_enc.finish()?.finish()?;
+                    inner.flush()?;
+                    inner.shutdown()?;
+
+                    Ok(())
+                });
+            }
+            _ => {
+                tracing::error!(
+                    "unsupported archive format for restic backup files archive: {}",
+                    archive_format.extension()
+                );
             }
         }
 

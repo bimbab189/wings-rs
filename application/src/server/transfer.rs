@@ -1,5 +1,6 @@
 use crate::{
     io::{
+        SafeAsyncWrite, SafeDigest,
         compression::{CompressionLevel, CompressionType},
         counting_reader::AsyncCountingReader,
         hash_reader::AsyncHashReader,
@@ -11,6 +12,7 @@ use human_bytes::human_bytes;
 use serde::Deserialize;
 use sha2::Digest;
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     path::{Path, PathBuf},
     pin::Pin,
@@ -39,19 +41,31 @@ pub enum TransferArchiveFormat {
     TarBz2,
     TarLz4,
     TarZstd,
+
+    Itaf,
+    ItafGz,
+    ItafXz,
+    ItafLzip,
+    ItafBz2,
+    ItafLz4,
+    ItafZstd,
 }
 
 impl TransferArchiveFormat {
     #[inline]
     pub fn compression_format(self) -> CompressionType {
         match self {
-            TransferArchiveFormat::Tar => CompressionType::None,
-            TransferArchiveFormat::TarGz => CompressionType::Gz,
-            TransferArchiveFormat::TarXz => CompressionType::Xz,
-            TransferArchiveFormat::TarLzip => CompressionType::Lzip,
-            TransferArchiveFormat::TarBz2 => CompressionType::Bz2,
-            TransferArchiveFormat::TarLz4 => CompressionType::Lz4,
-            TransferArchiveFormat::TarZstd => CompressionType::Zstd,
+            TransferArchiveFormat::Tar | TransferArchiveFormat::Itaf => CompressionType::None,
+            TransferArchiveFormat::TarGz | TransferArchiveFormat::ItafGz => CompressionType::Gz,
+            TransferArchiveFormat::TarXz | TransferArchiveFormat::ItafXz => CompressionType::Xz,
+            TransferArchiveFormat::TarLzip | TransferArchiveFormat::ItafLzip => {
+                CompressionType::Lzip
+            }
+            TransferArchiveFormat::TarBz2 | TransferArchiveFormat::ItafBz2 => CompressionType::Bz2,
+            TransferArchiveFormat::TarLz4 | TransferArchiveFormat::ItafLz4 => CompressionType::Lz4,
+            TransferArchiveFormat::TarZstd | TransferArchiveFormat::ItafZstd => {
+                CompressionType::Zstd
+            }
         }
     }
 
@@ -64,7 +78,42 @@ impl TransferArchiveFormat {
             TransferArchiveFormat::TarBz2 => "tar.bz2",
             TransferArchiveFormat::TarLz4 => "tar.lz4",
             TransferArchiveFormat::TarZstd => "tar.zst",
+            TransferArchiveFormat::Itaf => "itaf",
+            TransferArchiveFormat::ItafGz => "itaf.gz",
+            TransferArchiveFormat::ItafXz => "itaf.xz",
+            TransferArchiveFormat::ItafLzip => "itaf.lz",
+            TransferArchiveFormat::ItafBz2 => "itaf.bz2",
+            TransferArchiveFormat::ItafLz4 => "itaf.lz4",
+            TransferArchiveFormat::ItafZstd => "itaf.zst",
         }
+    }
+
+    #[inline]
+    pub const fn is_tar(self) -> bool {
+        matches!(
+            self,
+            TransferArchiveFormat::Tar
+                | TransferArchiveFormat::TarGz
+                | TransferArchiveFormat::TarXz
+                | TransferArchiveFormat::TarLzip
+                | TransferArchiveFormat::TarBz2
+                | TransferArchiveFormat::TarLz4
+                | TransferArchiveFormat::TarZstd
+        )
+    }
+
+    #[inline]
+    pub const fn is_itaf(self) -> bool {
+        matches!(
+            self,
+            TransferArchiveFormat::Itaf
+                | TransferArchiveFormat::ItafGz
+                | TransferArchiveFormat::ItafXz
+                | TransferArchiveFormat::ItafLzip
+                | TransferArchiveFormat::ItafBz2
+                | TransferArchiveFormat::ItafLz4
+                | TransferArchiveFormat::ItafZstd
+        )
     }
 }
 
@@ -78,6 +127,13 @@ impl From<TransferArchiveFormat> for StreamableArchiveFormat {
             TransferArchiveFormat::TarBz2 => StreamableArchiveFormat::TarBz2,
             TransferArchiveFormat::TarLz4 => StreamableArchiveFormat::TarLz4,
             TransferArchiveFormat::TarZstd => StreamableArchiveFormat::TarZstd,
+            TransferArchiveFormat::Itaf => StreamableArchiveFormat::Itaf,
+            TransferArchiveFormat::ItafGz => StreamableArchiveFormat::ItafGz,
+            TransferArchiveFormat::ItafXz => StreamableArchiveFormat::ItafXz,
+            TransferArchiveFormat::ItafLzip => StreamableArchiveFormat::ItafLzip,
+            TransferArchiveFormat::ItafBz2 => StreamableArchiveFormat::ItafBz2,
+            TransferArchiveFormat::ItafLz4 => StreamableArchiveFormat::ItafLz4,
+            TransferArchiveFormat::ItafZstd => StreamableArchiveFormat::ItafZstd,
         }
     }
 }
@@ -100,6 +156,20 @@ impl std::str::FromStr for TransferArchiveFormat {
             Ok(TransferArchiveFormat::TarLz4)
         } else if s.ends_with(".tar.zst") {
             Ok(TransferArchiveFormat::TarZstd)
+        } else if s.ends_with(".itaf") {
+            Ok(TransferArchiveFormat::Itaf)
+        } else if s.ends_with(".itaf.gz") {
+            Ok(TransferArchiveFormat::ItafGz)
+        } else if s.ends_with(".itaf.xz") {
+            Ok(TransferArchiveFormat::ItafXz)
+        } else if s.ends_with(".itaf.lz") {
+            Ok(TransferArchiveFormat::ItafLzip)
+        } else if s.ends_with(".itaf.bz2") {
+            Ok(TransferArchiveFormat::ItafBz2)
+        } else if s.ends_with(".itaf.lz4") {
+            Ok(TransferArchiveFormat::ItafLz4)
+        } else if s.ends_with(".itaf.zst") {
+            Ok(TransferArchiveFormat::ItafZstd)
         } else {
             Err("Invalid archive format")
         }
@@ -135,17 +205,20 @@ impl OutgoingServerTransfer {
     }
 
     fn log(server: &super::Server, message: &str) {
-        let prelude = ansi_term::Color::Yellow.bold().paint(format!(
+        let prelude = nu_ansi_term::Color::Yellow.bold().paint(format!(
             "{} [Transfer System] [Source Node]:",
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
         ));
 
         server
             .websocket
-            .send(super::websocket::WebsocketMessage::new(
-                super::websocket::WebsocketEvent::ServerTransferLogs,
-                [compact_str::format_compact!("{prelude} {message}")].into(),
-            ))
+            .send(
+                super::websocket::WebsocketMessage::builder(
+                    super::websocket::WebsocketEvent::ServerTransferLogs,
+                )
+                .arg(compact_str::format_compact!("{prelude} {message}"))
+                .build(),
+            )
             .ok();
     }
 
@@ -162,10 +235,13 @@ impl OutgoingServerTransfer {
         server.transferring.store(false, Ordering::SeqCst);
         server
             .websocket
-            .send(super::websocket::WebsocketMessage::new(
-                super::websocket::WebsocketEvent::ServerTransferStatus,
-                ["failure".into()].into(),
-            ))
+            .send(
+                super::websocket::WebsocketMessage::builder(
+                    super::websocket::WebsocketEvent::ServerTransferStatus,
+                )
+                .arg("failure")
+                .build(),
+            )
             .ok();
     }
 
@@ -210,10 +286,13 @@ impl OutgoingServerTransfer {
             Self::log(&server, "Preparing to stream server data to destination...");
             server
                 .websocket
-                .send(super::websocket::WebsocketMessage::new(
-                    super::websocket::WebsocketEvent::ServerTransferStatus,
-                    ["processing".into()].into(),
-                ))
+                .send(
+                    super::websocket::WebsocketMessage::builder(
+                        super::websocket::WebsocketEvent::ServerTransferStatus,
+                    )
+                    .arg("processing")
+                    .build(),
+                )
                 .ok();
 
             let (files_sender, files_receiver) = async_channel::bounded(512 * (1 + multiplex_streams));
@@ -222,13 +301,13 @@ impl OutgoingServerTransfer {
             let (mut checksummed_reader, checksummed_writer) = tokio::io::simplex(crate::TRANSFER_BUFFER_SIZE);
             let (reader, mut writer) = tokio::io::simplex(crate::TRANSFER_BUFFER_SIZE);
 
-            fn get_archive_task(
+            fn get_tar_archive_task(
                 files_receiver: async_channel::Receiver<PathBuf>,
                 bytes_archived: Arc<AtomicU64>,
                 server: super::Server,
                 writer: tokio_util::io::SyncIoBridge<tokio::io::WriteHalf<tokio::io::SimplexStream>>,
                 options: crate::server::filesystem::archive::create::CreateTarOptions
-            ) -> Pin<Box<impl Future<Output = Result<(), anyhow::Error>>>> {
+            ) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>> {
                 Box::pin(async move {
                     let writer = crate::server::filesystem::archive::create::create_tar_distributed(
                         server.filesystem.clone(),
@@ -246,17 +325,60 @@ impl OutgoingServerTransfer {
                 })
             }
 
-            let archive_task = get_archive_task(
-                files_receiver.clone(),
-                Arc::clone(&bytes_archived),
-                server.clone(),
-                tokio_util::io::SyncIoBridge::new(checksummed_writer),
-                crate::server::filesystem::archive::create::CreateTarOptions {
-                    compression_type: archive_format.compression_format(),
-                    compression_level,
-                    threads: server.app_state.config.api.file_compression_threads,
-                },
-            );
+            fn get_itaf_archive_task(
+                files_receiver: async_channel::Receiver<PathBuf>,
+                bytes_archived: Arc<AtomicU64>,
+                server: super::Server,
+                writer: tokio_util::io::SyncIoBridge<tokio::io::WriteHalf<tokio::io::SimplexStream>>,
+                options: crate::server::filesystem::archive::create::CreateItafOptions
+            ) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>> {
+                Box::pin(async move {
+                    let writer = crate::server::filesystem::archive::create::create_itaf_distributed(
+                        server.filesystem.clone(),
+                        writer,
+                        Path::new(""),
+                        files_receiver,
+                        Some(Arc::clone(&bytes_archived)),
+                        options,
+                    )
+                    .await?;
+
+                    writer.into_inner().shutdown().await?;
+
+                    Ok(())
+                })
+            }
+
+            let get_archive_task = |writer: tokio_util::io::SyncIoBridge<tokio::io::WriteHalf<tokio::io::SimplexStream>>| {
+                if archive_format.is_tar() {
+                    get_tar_archive_task(
+                        files_receiver.clone(),
+                        Arc::clone(&bytes_archived),
+                        server.clone(),
+                        writer,
+                        crate::server::filesystem::archive::create::CreateTarOptions {
+                            compression_type: archive_format.compression_format(),
+                            compression_level,
+                            threads: server.app_state.config.load().api.file_compression_threads,
+                        },
+                    )
+                } else {
+                    get_itaf_archive_task(
+                        files_receiver.clone(),
+                        Arc::clone(&bytes_archived),
+                        server.clone(),
+                        writer,
+                        crate::server::filesystem::archive::create::CreateItafOptions {
+                            compression_type: archive_format.compression_format(),
+                            compression_level,
+                            threads: server.app_state.config.load().api.file_compression_threads,
+                            crc_enabled: false,
+                        },
+                    )
+                }
+            };
+
+            let archive_task = get_archive_task(tokio_util::io::SyncIoBridge::new(checksummed_writer));
 
             let checksum_task = Box::pin({
                 let bytes_sent = Arc::clone(&bytes_sent);
@@ -271,8 +393,8 @@ impl OutgoingServerTransfer {
                             break;
                         }
 
-                        hasher.update(&buffer[..bytes_read]);
-                        writer.write_all(&buffer[..bytes_read]).await?;
+                        hasher.safe_update(&buffer, bytes_read)?;
+                        writer.safe_write_all(&buffer, bytes_read).await?;
                         bytes_sent.fetch_add(bytes_read as u64, Ordering::Relaxed);
                     }
 
@@ -306,7 +428,7 @@ impl OutgoingServerTransfer {
                     ))
                     .file_name(format!("archive.{}", archive_format.extension()))
                     .mime_str("application/x-tar")
-                    .unwrap(),
+                    .expect("failed to set mime type for archive"),
                 )
                 .part(
                     "checksum",
@@ -315,7 +437,7 @@ impl OutgoingServerTransfer {
                     ))
                     .file_name("checksum")
                     .mime_str("text/plain")
-                    .unwrap(),
+                    .expect("failed to set mime type for checksum"),
                 );
 
             bytes_total.store(server.filesystem.get_logical_cached_size(), Ordering::Relaxed);
@@ -336,7 +458,7 @@ impl OutgoingServerTransfer {
                     ))
                     .file_name("install.log")
                     .mime_str("text/plain")
-                    .unwrap(),
+                    .expect("failed to set mime type for install logs"),
                 );
             }
 
@@ -400,7 +522,7 @@ impl OutgoingServerTransfer {
                                     ))
                                     .file_name(file_name.file_name().unwrap_or_default().to_string_lossy().to_string())
                                     .mime_str("backup/wings")
-                                    .unwrap(),
+                                    .expect("failed to set mime type for archive"),
                                 )
                                 .part(
                                     format!("backup-checksum-{}", backup.uuid()),
@@ -409,7 +531,7 @@ impl OutgoingServerTransfer {
                                     ))
                                     .file_name(format!("backup-checksum-{}", backup.uuid()))
                                     .mime_str("text/plain")
-                                    .unwrap(),
+                                    .expect("failed to set mime type for checksum"),
                                 );
                         }
                         _ => {
@@ -487,8 +609,12 @@ impl OutgoingServerTransfer {
                         let formatted_archive_percentage = format!("{:.2}%", archive_percentage);
 
                         let time_estimate = if history.len() > 1 && current_bytes_archived < bytes_total {
-                            let &(oldest_time, oldest_progress) = history.front().unwrap();
-                            let &(newest_time, newest_progress) = history.back().unwrap();
+                            let Some(&(oldest_time, oldest_progress)) = history.front() else {
+                                return Cow::Borrowed("unknown");
+                            };
+                            let Some(&(newest_time, newest_progress)) = history.back() else {
+                                return Cow::Borrowed("unknown");
+                            };
 
                             let delta_progress = newest_progress.saturating_sub(oldest_progress) as f64;
                             let delta_time = newest_time.duration_since(oldest_time).as_secs_f64();
@@ -498,7 +624,7 @@ impl OutgoingServerTransfer {
                                 let remaining_bytes = bytes_total.saturating_sub(newest_progress) as f64;
                                 let remaining_seconds = remaining_bytes / rate_30s;
 
-                                if remaining_seconds < 60.0 {
+                                Cow::Owned(if remaining_seconds < 60.0 {
                                     format!("{:.0}s", remaining_seconds)
                                 } else if remaining_seconds < 3600.0 {
                                     format!("{:.0}m {:.0}s", remaining_seconds / 60.0, remaining_seconds % 60.0)
@@ -507,14 +633,14 @@ impl OutgoingServerTransfer {
                                         remaining_seconds / 3600.0,
                                         (remaining_seconds % 3600.0) / 60.0
                                     )
-                                }
+                                })
                             } else {
-                                "calculating...".to_string()
+                                Cow::Borrowed("calculating...")
                             }
                         } else if current_bytes_archived >= bytes_total {
-                            "0s".to_string()
+                            Cow::Borrowed("0s")
                         } else {
-                            "unknown".to_string()
+                            Cow::Borrowed("unknown")
                         };
 
                         let elapsed_time = if total_elapsed_secs < 60.0 {
@@ -547,17 +673,17 @@ impl OutgoingServerTransfer {
 
                         server
                             .websocket
-                            .send(super::websocket::WebsocketMessage::new(
-                                super::websocket::WebsocketEvent::ServerTransferProgress,
-                                [serde_json::to_string(&crate::models::TransferProgress {
+                            .send(
+                                super::websocket::WebsocketMessage::builder(
+                                    super::websocket::WebsocketEvent::ServerTransferProgress,
+                                )
+                                .json_arg(crate::models::TransferProgress {
                                     archive_progress: current_bytes_archived,
                                     network_progress: current_bytes_sent,
-                                    total: bytes_total
+                                    total: bytes_total,
                                 })
-                                .unwrap()
-                                .into()]
-                                .into(),
-                            ))
+                                .build(),
+                            )
                             .ok();
 
                         tracing::debug!(
@@ -581,7 +707,7 @@ impl OutgoingServerTransfer {
                 .connect_timeout(std::time::Duration::from_secs(15))
                 .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
                 .build()
-                .unwrap()
+                .expect("failed to build HTTP client")
                 .post(&url)
                 .header("Authorization", &token)
                 .header("Multiplex-Stream-Count", multiplex_streams)
@@ -599,17 +725,7 @@ impl OutgoingServerTransfer {
                 let (mut checksummed_reader, checksummed_writer) = tokio::io::simplex(crate::TRANSFER_BUFFER_SIZE);
                 let (reader, mut writer) = tokio::io::simplex(crate::TRANSFER_BUFFER_SIZE);
 
-                let archive_task = get_archive_task(
-                    files_receiver.clone(),
-                    Arc::clone(&bytes_archived),
-                    server.clone(),
-                    tokio_util::io::SyncIoBridge::new(checksummed_writer),
-                    crate::server::filesystem::archive::create::CreateTarOptions {
-                        compression_type: archive_format.compression_format(),
-                        compression_level,
-                        threads: server.app_state.config.api.file_compression_threads,
-                    },
-                );
+                let archive_task = get_archive_task(tokio_util::io::SyncIoBridge::new(checksummed_writer));
 
                 let checksum_task = Box::pin({
                     let bytes_sent = Arc::clone(&bytes_sent);
@@ -624,8 +740,8 @@ impl OutgoingServerTransfer {
                                 break;
                             }
 
-                            hasher.update(&buffer[..bytes_read]);
-                            writer.write_all(&buffer[..bytes_read]).await?;
+                            hasher.safe_update(&buffer, bytes_read)?;
+                            writer.safe_write_all(&buffer, bytes_read).await?;
                             bytes_sent.fetch_add(bytes_read as u64, Ordering::Relaxed);
                         }
 
@@ -645,7 +761,7 @@ impl OutgoingServerTransfer {
                         ))
                         .file_name(format!("archive.{}", archive_format.extension()))
                         .mime_str("application/x-tar")
-                        .unwrap(),
+                        .expect("failed to set mime type for archive"),
                     )
                     .part(
                         "checksum",
@@ -654,7 +770,7 @@ impl OutgoingServerTransfer {
                         ))
                         .file_name("checksum")
                         .mime_str("text/plain")
-                        .unwrap(),
+                        .expect("failed to set mime type for checksum"),
                     );
 
                 multiplex_responses.push(
@@ -662,7 +778,7 @@ impl OutgoingServerTransfer {
                         .connect_timeout(std::time::Duration::from_secs(15))
                         .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
                         .build()
-                        .unwrap()
+                        .expect("failed to build HTTP client")
                         .post(&url)
                         .header("Authorization", &token)
                         .header("Multiplex-Stream", i)
@@ -752,10 +868,13 @@ impl OutgoingServerTransfer {
 
                 server
                     .websocket
-                    .send(super::websocket::WebsocketMessage::new(
-                        super::websocket::WebsocketEvent::ServerTransferStatus,
-                        ["completed".into()].into(),
-                    ))
+                    .send(
+                        super::websocket::WebsocketMessage::builder(
+                            super::websocket::WebsocketEvent::ServerTransferStatus,
+                        )
+                        .arg("completed")
+                        .build(),
+                    )
                     .ok();
                 server.user_permissions.clear_permissions().await;
             });

@@ -15,11 +15,6 @@ impl<W: std::io::Write> CountingWriter<W> {
             bytes_written,
         }
     }
-
-    #[inline]
-    pub fn into_inner(self) -> W {
-        self.inner
-    }
 }
 
 impl<W: std::io::Write> std::io::Write for CountingWriter<W> {

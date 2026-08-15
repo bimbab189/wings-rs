@@ -288,9 +288,11 @@ async fn exchange(
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
     let now = chrono::Utc::now().timestamp();
-    let issuer = state.config.remote.trim_end_matches('/');
-    let audience = state.config.web_ide.public_url.trim_end_matches('/');
-    let valid = claims.base.validate(&state.config.jwt).await.is_ok()
+    let config = state.config.load();
+    let issuer = config.remote.trim_end_matches('/').to_string();
+    let audience = config.web_ide.public_url.trim_end_matches('/').to_string();
+    drop(config);
+    let valid = claims.base.validate(&state.config.jwt, None).await.is_ok()
         && claims.kind == "webide_launch"
         && claims.base.subject.as_deref() == Some("webide-launch")
         && claims.base.issuer.trim_end_matches('/') == issuer
@@ -594,8 +596,9 @@ async fn agent_chat(
         .header(header::USER_AGENT, "Jexactyl-WebIDE-Agent/1.0")
         .body(encoded);
     if request.provider == "openrouter" {
+        let public_url = state.config.load().web_ide.public_url.clone();
         upstream = upstream
-            .header("HTTP-Referer", &state.config.web_ide.public_url)
+            .header("HTTP-Referer", public_url)
             .header("X-Title", "Jexactyl Web IDE");
     }
     let upstream = match upstream.send().await {
@@ -1052,13 +1055,14 @@ pub(crate) async fn start_local_terminal_listener(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let (uid, gid) = if state.config.system.user.rootless.enabled {
+        let config = state.config.load();
+        let (uid, gid) = if config.system.user.rootless.enabled {
             (
-                state.config.system.user.rootless.container_uid,
-                state.config.system.user.rootless.container_gid,
+                config.system.user.rootless.container_uid,
+                config.system.user.rootless.container_gid,
             )
         } else {
-            (state.config.system.user.uid, state.config.system.user.gid)
+            (config.system.user.uid, config.system.user.gid)
         };
         tokio::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).await?;
         std::os::unix::fs::chown(&socket_path, Some(uid), Some(gid))?;
@@ -1154,13 +1158,14 @@ pub(crate) async fn start_local_addon_tools_listener(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let (uid, gid) = if state.config.system.user.rootless.enabled {
+        let config = state.config.load();
+        let (uid, gid) = if config.system.user.rootless.enabled {
             (
-                state.config.system.user.rootless.container_uid,
-                state.config.system.user.rootless.container_gid,
+                config.system.user.rootless.container_uid,
+                config.system.user.rootless.container_gid,
             )
         } else {
-            (state.config.system.user.uid, state.config.system.user.gid)
+            (config.system.user.uid, config.system.user.gid)
         };
         tokio::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).await?;
         std::os::unix::fs::chown(&socket_path, Some(uid), Some(gid))?;
@@ -1471,7 +1476,7 @@ async fn run_wings_shell(
         let mut container_stdout = None;
         loop {
             if container_stdout.is_none() {
-                container_stdout = stdout_server.container_stdout().await;
+                container_stdout = stdout_server.get_stdout_lines().await;
                 if container_stdout.is_none() {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
@@ -1514,9 +1519,14 @@ async fn run_wings_shell(
     let mut current_line = String::with_capacity(1024);
     let mut authorization_tick = tokio::time::interval(Duration::from_secs(15));
 
-    let prelude = ansi_term::Color::Yellow
+    let config = state.config.load();
+    let app_name = config.app_name.clone();
+    let send_offline_logs = config.api.send_offline_server_logs;
+    let log_count = config.system.websocket_log_count;
+    drop(config);
+    let prelude = nu_ansi_term::Color::Yellow
         .bold()
-        .paint(format!("[{} Daemon]:", state.config.app_name));
+        .paint(format!("[{app_name} Daemon]:"));
     if output_tx
         .send(
             format!(
@@ -1537,11 +1547,9 @@ async fn run_wings_shell(
     // dispatched and floods the result card with unrelated server history.
     if transport == TerminalTransport::Browser
         && (server.state.get_state() != crate::server::state::ServerState::Offline
-            || state.config.api.send_offline_server_logs)
+            || send_offline_logs)
     {
-        let mut logs = server
-            .read_log(Some(state.config.system.websocket_log_count))
-            .await;
+        let mut logs = server.logs_lines(Some(log_count)).await;
         while let Some(Ok(line)) = logs.next().await {
             if output_tx.send(line.to_string().into_bytes()).await.is_err() {
                 stdout_pump.abort();
@@ -1607,10 +1615,11 @@ async fn run_wings_shell(
                                     // what the agent submitted.
                                     if transport == TerminalTransport::NativeProcess && !line.is_empty() {
                                         server.websocket.send(
-                                            crate::server::websocket::WebsocketMessage::new(
+                                            crate::server::websocket::WebsocketMessage::builder(
                                                 crate::server::websocket::WebsocketEvent::ServerConsoleOutput,
-                                                [compact_str::format_compact!("[Web IDE Agent] > {line}")].into(),
-                                            ),
+                                            )
+                                            .arg(compact_str::format_compact!("[Web IDE Agent] > {line}"))
+                                            .build(),
                                         ).ok();
                                     }
                                     let output = if line.is_empty() {
@@ -1675,12 +1684,13 @@ async fn console(
         Some(server) => server,
         None => return StatusCode::NOT_FOUND.into_response(),
     };
-    let container = match server.container.read().await.as_ref() {
-        Some(container) => Arc::clone(container),
+    let mut output = match server.get_stdout_lines().await {
+        Some(output) => output,
         None => return StatusCode::CONFLICT.into_response(),
     };
     let user_ip = Some(state.config.find_ip(&headers, connect_info));
     let server_for_activity = server.clone();
+    let server_for_input = server.clone();
 
     let websocket = match protocol {
         Some(protocol) => websocket.protocols([protocol]),
@@ -1688,8 +1698,6 @@ async fn console(
     };
     websocket.on_upgrade(move |socket| async move {
         let (mut client_tx, mut client_rx) = socket.split();
-        let mut output = container.stdout.resubscribe();
-        let input = container.stdin.clone();
         let mut authorization_tick = tokio::time::interval(Duration::from_secs(15));
         tracing::info!(server = %server_uuid, session = %session_uuid, user = %session.user_uuid, "opened Web IDE console");
         loop {
@@ -1707,7 +1715,7 @@ async fn console(
                             if credential.authenticate(&state, session_uuid, server_uuid, true).await.is_none() { break; }
                             let raw_command = command.trim_end_matches(['\r', '\n']).to_string();
                             let command = format!("{raw_command}\n");
-                            if input.send(command.into()).await.is_err() { break; }
+                            if server_for_input.send_stdin(command.into()).await.is_err() { break; }
                             server_for_activity.activity.log_activity(Activity {
                                 event: ActivityEvent::ConsoleCommand,
                                 user: Some(session.user_uuid),
@@ -1892,11 +1900,11 @@ async fn proxy(
     let method = request.method().clone();
     let uri = request.uri().clone();
     let request_headers = request.headers().clone();
-    let body =
-        match body::to_bytes(request.into_body(), state.config.web_ide.max_request_bytes).await {
-            Ok(body) => body,
-            Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-        };
+    let max_request_bytes = state.config.load().web_ide.max_request_bytes;
+    let body = match body::to_bytes(request.into_body(), max_request_bytes).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
 
     let client = match reqwest::Client::builder()
         .unix_socket(session.socket_path.clone())
@@ -2187,11 +2195,12 @@ fn session_credential(
 }
 
 fn same_origin(state: &GetState, headers: &HeaderMap) -> bool {
+    let config = state.config.load();
     headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|origin| {
-            origin.trim_end_matches('/') == state.config.web_ide.public_url.trim_end_matches('/')
+            origin.trim_end_matches('/') == config.web_ide.public_url.trim_end_matches('/')
         })
 }
 

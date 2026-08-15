@@ -1,3 +1,6 @@
+#![recursion_limit = "512"]
+
+use crate::{response::ApiResponse, routes::GetState, server::executor::ServerExecutor};
 use anyhow::Context;
 use axum::{
     body::Body,
@@ -8,10 +11,125 @@ use axum::{
 };
 use colored::Colorize;
 use russh::server::Server;
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Instant};
+use std::{fmt::Debug, net::SocketAddr, path::Path, sync::Arc, time::Instant};
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa_axum::router::OpenApiRouter;
-use wings_rs::{response::ApiResponse, routes::GetState};
+
+mod bins;
+mod commands;
+mod config;
+mod deserialize;
+mod io;
+mod models;
+mod payload;
+mod remote;
+mod response;
+mod routes;
+mod server;
+mod ssh;
+mod stats;
+mod utils;
+
+use payload::Payload;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const GIT_COMMIT: &str = env!("CARGO_GIT_COMMIT");
+const GIT_BRANCH: &str = env!("CARGO_GIT_BRANCH");
+const TARGET: &str = env!("CARGO_TARGET");
+
+#[cfg(unix)]
+const DEFAULT_CONFIG_PATH: &str = "/etc/pterodactyl/config.yml";
+#[cfg(windows)]
+const DEFAULT_CONFIG_PATH: &str = "C:\\ProgramData\\Calagopus-Wings\\config.yml";
+
+/// 32 KiB - used for general IO
+const BUFFER_SIZE: usize = 32 * 1024;
+/// 4 MiB - used for transfers
+const TRANSFER_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+fn full_version() -> String {
+    if GIT_BRANCH == "unknown" {
+        VERSION.to_string()
+    } else {
+        format!("{VERSION}:{GIT_COMMIT}@{GIT_BRANCH}")
+    }
+}
+
+fn spawn_blocking_handled<
+    F: FnOnce() -> Result<(), E> + Send + 'static,
+    E: Debug + Send + 'static,
+>(
+    f: F,
+) {
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(f).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                tracing::error!("spawned blocking task failed: {:?}", err);
+            }
+            Err(err) => {
+                tracing::error!("spawned blocking task panicked: {:?}", err);
+            }
+        }
+    });
+}
+
+fn spawn_handled<
+    F: std::future::Future<Output = Result<(), E>> + Send + 'static,
+    E: Debug + Send + 'static,
+>(
+    f: F,
+) {
+    tokio::spawn(async move {
+        match f.await {
+            Ok(_) => {}
+            Err(err) => {
+                tracing::error!("spawned async task failed: {:?}", err);
+            }
+        }
+    });
+}
+
+#[inline(always)]
+#[cold]
+fn cold_path() {}
+
+#[inline(always)]
+fn likely(b: bool) -> bool {
+    if b {
+        true
+    } else {
+        cold_path();
+        false
+    }
+}
+
+#[inline(always)]
+fn unlikely(b: bool) -> bool {
+    if b {
+        cold_path();
+        true
+    } else {
+        false
+    }
+}
+
+macro_rules! exit_error {
+    ($msg:expr) => {
+        {
+            use ::colored::Colorize;
+            eprintln!("{}", $msg.red());
+            std::process::exit(1);
+        }
+    };
+    ($fmt:expr, $($arg:tt)*) => {
+        {
+            use ::colored::Colorize;
+            eprintln!("{}", format!($fmt, $($arg)*).red());
+            std::process::exit(1);
+        }
+    };
+}
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[global_allocator]
@@ -25,16 +143,15 @@ async fn handle_request(req: Request<Body>, next: Next) -> Result<Response<Body>
         req.method().to_string().to_lowercase(),
     );
 
-    Ok(wings_rs::response::ACCEPT_HEADER
-        .scope(
-            wings_rs::response::accept_from_headers(req.headers()),
-            async { next.run(req).await },
-        )
+    Ok(crate::response::ACCEPT_HEADER
+        .scope(crate::response::accept_from_headers(req.headers()), async {
+            next.run(req).await
+        })
         .await)
 }
 
 async fn handle_cors(
-    state: wings_rs::routes::GetState,
+    state: crate::routes::GetState,
     req: Request,
     next: Next,
 ) -> Result<Response<Body>, StatusCode> {
@@ -51,7 +168,7 @@ async fn handle_cors(
     );
     headers.insert("Access-Control-Allow-Headers", HeaderValue::from_static("Accept, Accept-Encoding, Authorization, Cache-Control, Content-Type, Content-Length, Origin, X-Real-IP, X-CSRF-Token"));
 
-    if state.config.allow_cors_private_network {
+    if state.config.load().allow_cors_private_network {
         headers.insert(
             "Access-Control-Request-Private-Network",
             HeaderValue::from_static("true"),
@@ -61,9 +178,9 @@ async fn handle_cors(
     headers.insert("Access-Control-Max-Age", HeaderValue::from_static("7200"));
 
     if let Some(origin) = req.headers().get("Origin")
-        && origin.to_str().ok() != Some(state.config.remote.as_str())
+        && origin.to_str().ok() != Some(state.config.load().remote.as_str())
     {
-        for o in state.config.allowed_origins.iter() {
+        for o in state.config.load().allowed_origins.iter() {
             if o == "*" || origin.to_str().ok() == Some(o.as_str()) {
                 if let Ok(o) = o.parse() {
                     headers.insert("Access-Control-Allow-Origin", o);
@@ -75,7 +192,7 @@ async fn handle_cors(
     }
 
     if !headers.contains_key("Access-Control-Allow-Origin") {
-        if let Ok(origin) = state.config.remote.parse() {
+        if let Ok(origin) = state.config.load().remote.parse() {
             headers.insert("Access-Control-Allow-Origin", origin);
         } else {
             return Ok(ApiResponse::error("invalid remote URL configured")
@@ -98,23 +215,27 @@ async fn handle_cors(
     Ok(response)
 }
 
-#[tokio::main]
-async fn main() {
-    let cli = wings_rs::commands::CliCommandGroupBuilder::new(
+async fn main_rt() {
+    let cli = crate::commands::CliCommandGroupBuilder::new(
         "wings-rs",
         "The wings server implementing server management for the panel.",
     );
 
-    let mut cli = wings_rs::commands::commands(cli);
+    let mut cli = crate::commands::commands(cli);
     let mut matches = cli.get_matches();
 
-    let config_path = matches.get_one::<String>("config").unwrap().clone();
-    let debug = *matches.get_one::<bool>("debug").unwrap();
+    let config_path = matches
+        .get_one::<String>("config")
+        .expect("config path is required")
+        .clone();
+    let debug = *matches
+        .get_one::<bool>("debug")
+        .expect("debug flag is required");
     let ignore_certificate_errors = matches
         .get_one::<bool>("ignore_certificate_errors")
         .copied()
         .unwrap_or(false);
-    let config = wings_rs::config::Config::open(
+    let config = crate::config::Config::open(
         &config_path,
         debug,
         matches.subcommand().is_some(),
@@ -151,21 +272,18 @@ async fn main() {
             tracing::info!("   \\_/\\_/ |_|_| |_|\\__, |___/__ ___ ");
             tracing::info!("                    __/ | | '__/ __|");
             tracing::info!("                   |___/  | |  \\__ \\");
-            tracing::info!("{: >25} |_|  |___/", wings_rs::VERSION);
-            tracing::info!("github.com/calagopus/wings#{}\n", wings_rs::GIT_COMMIT);
+            tracing::info!("{: >25} |_|  |___/", crate::VERSION);
+            tracing::info!("github.com/calagopus/wings#{}\n", crate::GIT_COMMIT);
         }
     }
 
     let (config, _guard) = match config {
         Ok(config) => config,
-        Err(err) => {
-            eprintln!("failed to load configuration: {err:#?}");
-            std::process::exit(1);
-        }
+        Err(err) => exit_error!("failed to load config from {}: {:?}", config_path, err),
     };
     tracing::info!("config loaded from {}", config_path);
 
-    wings_rs::spawn_handled(async move {
+    crate::spawn_handled(async move {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
@@ -230,72 +348,72 @@ async fn main() {
     });
 
     tracing::info!("connecting to docker");
-    let docker =
+    let docker = {
+        let config_ref = config.load();
         Arc::new(
-            if config.docker.socket.starts_with("http://")
-                || config.docker.socket.starts_with("tcp://")
+            match if config_ref.docker.socket.starts_with("http://")
+                || config_ref.docker.socket.starts_with("tcp://")
             {
                 bollard::Docker::connect_with_http(
-                    &config.docker.socket,
+                    &config_ref.docker.socket,
                     120,
                     bollard::API_DEFAULT_VERSION,
                 )
             } else {
                 bollard::Docker::connect_with_local(
-                    &config.docker.socket,
+                    &config_ref.docker.socket,
                     120,
                     bollard::API_DEFAULT_VERSION,
                 )
-            }
-            .context("failed to connect to docker")
-            .unwrap(),
-        );
+            } {
+                Ok(docker) => docker,
+                Err(err) => exit_error!("failed to connect to docker: {:?}", err),
+            },
+        )
+    };
+    let executor = Arc::new(crate::server::executor::docker::DockerExecutor::new(
+        Arc::clone(&docker),
+        config.clone(),
+    ));
 
-    tracing::info!("ensuring docker network exists");
-    config
-        .ensure_network(&docker)
-        .await
-        .context("failed to ensure docker network")
-        .unwrap();
+    tracing::info!("running server executor boot tasks");
+    if let Err(err) = executor.boot().await {
+        exit_error!("failed to boot server executor: {:?}", err);
+    }
 
     match config.client.reset_state().await {
         Ok(_) => tracing::info!("remote state reset successfully"),
-        Err(err) => {
-            tracing::error!("failed to reset remote state: {:?}", err);
-            std::process::exit(1);
-        }
+        Err(err) => exit_error!("failed to reset remote state: {:?}", err),
     }
 
     tracing::info!("creating server manager");
-    let servers = config
-        .client
-        .servers()
-        .await
-        .context("failed to fetch servers from remote")
-        .unwrap();
+    let servers = match config.client.servers().await {
+        Ok(servers) => servers,
+        Err(err) => exit_error!("failed to fetch servers from remote: {:?}", err),
+    };
 
-    let state = Arc::new(wings_rs::routes::AppState {
+    let state = Arc::new(crate::routes::AppState {
         start_time: Instant::now(),
         container_type: match std::env::var("OCI_CONTAINER").as_deref() {
-            Ok("official") => wings_rs::routes::AppContainerType::Official,
-            Ok(_) => wings_rs::routes::AppContainerType::Unknown,
-            Err(_) => wings_rs::routes::AppContainerType::None,
+            Ok("official") => crate::routes::AppContainerType::Official,
+            Ok(_) => crate::routes::AppContainerType::Unknown,
+            Err(_) => crate::routes::AppContainerType::None,
         },
-        version: wings_rs::full_version(),
+        version: crate::full_version(),
 
         config: Arc::clone(&config),
         docker: Arc::clone(&docker),
-        stats_manager: Arc::new(wings_rs::stats::StatsManager::default()),
-        server_manager: Arc::new(wings_rs::server::manager::ServerManager::new(&servers)),
-        backup_manager: Arc::new(wings_rs::server::backup::manager::BackupManager::default()),
+        executor,
+        stats_manager: Arc::new(crate::stats::StatsManager::default()),
+        server_manager: Arc::new(crate::server::manager::ServerManager::new(&servers)),
+        backup_manager: Arc::new(crate::server::backup::manager::BackupManager::default()),
         inotify_manager: Arc::new(
-            wings_rs::server::filesystem::inotify::InotifyManager::new()
-                .context("failed to initialize inotify manager")
-                .unwrap(),
+            crate::server::filesystem::inotify::InotifyManager::new()
+                .expect("failed to initialize inotify manager"),
         ),
         mime_cache: moka::future::Cache::new(20480),
-        ssh_sessions: wings_rs::ssh::SshSessionRegistry::new(),
-        web_ide: wings_rs::server::web_ide::WebIdeManager::new(
+        ssh_sessions: crate::ssh::SshSessionRegistry::new(),
+        web_ide: crate::server::web_ide::WebIdeManager::new(
             Arc::clone(&config),
             Arc::clone(&docker),
         ),
@@ -304,12 +422,19 @@ async fn main() {
     state.web_ide.reconcile_orphans().await;
     state.web_ide.start_reaper();
 
-    state.server_manager.boot(&state, servers).await;
+    tokio::spawn({
+        let state = Arc::clone(&state);
+
+        async move {
+            state.server_manager.boot(&state, servers).await;
+        }
+    });
 
     let app = OpenApiRouter::new()
-        .merge(wings_rs::routes::router(&state))
+        .merge(crate::routes::router(&state))
         .fallback(|state: GetState, req: Request| async move {
-            if let Some(redirect) = state.config.api.redirects.get(req.uri().path()) {
+            let config = state.config.load();
+            if let Some(redirect) = config.api.redirects.get(req.uri().path()) {
                 return ApiResponse::new(Body::empty())
                     .with_status(StatusCode::FOUND)
                     .with_header("Location", redirect)
@@ -330,13 +455,15 @@ async fn main() {
     let (mut router, mut openapi) = app.split_for_parts();
     openapi.info.version = "1.0.0".into();
     openapi.info.description = None;
-    openapi.info.title = format!("{} Wings API", config.app_name);
+    openapi.info.title = format!("{} Wings API", config.load().app_name);
     openapi.info.contact = None;
     openapi.info.license = None;
-    openapi.components.as_mut().unwrap().add_security_scheme(
-        "api_key",
-        SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("Authorization"))),
-    );
+    if let Some(components) = openapi.components.as_mut() {
+        components.add_security_scheme(
+            "api_key",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("Authorization"))),
+        );
+    }
 
     for (path, item) in openapi.paths.paths.iter_mut() {
         let operations = [
@@ -358,31 +485,37 @@ async fn main() {
         }
     }
 
-    if !config.api.disable_openapi_docs {
+    if !config.load().api.disable_openapi_docs {
         router = router.route(
             "/openapi.json",
             axum::routing::get(|| async move { axum::Json(openapi) }),
         );
     }
 
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
+    if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
+        exit_error!("Failed to install rustls crypto provider: {:?}", err);
+    }
 
-    if config.system.sftp.enabled {
+    if config.load().system.sftp.enabled {
         tracing::info!("starting ssh server");
 
         tokio::spawn({
             let state = Arc::clone(&state);
 
             async move {
-                let mut server = wings_rs::ssh::Server::new(Arc::clone(&state));
+                let mut server = crate::ssh::Server::new(Arc::clone(&state));
 
-                let key_file = Path::new(&state.config.system.data_directory)
+                let key_file = Path::new(&state.config.load().system.data_directory)
                     .join(".sftp")
                     .join(format!(
                         "id_{}",
-                        state.config.system.sftp.key_algorithm.replace("-", "_")
+                        state
+                            .config
+                            .load()
+                            .system
+                            .sftp
+                            .key_algorithm
+                            .replace("-", "_")
                     ));
                 let key = match tokio::fs::read(&key_file)
                     .await
@@ -399,37 +532,35 @@ async fn main() {
                     }
                     _ => {
                         tracing::info!(
-                            algorithm = %state.config.system.sftp.key_algorithm,
+                            algorithm = %state.config.load().system.sftp.key_algorithm,
                             "generating new sftp host key"
                         );
 
-                        let key = russh::keys::PrivateKey::random(
+                        let key = match russh::keys::PrivateKey::random(
                             &mut rand::rngs::ThreadRng::default(),
-                            state
-                                .config
-                                .system
-                                .sftp
-                                .key_algorithm
-                                .parse()
-                                .context("failed to parse sftp key algorithm")
-                                .unwrap(),
-                        )
-                        .unwrap();
+                            match state.config.load().system.sftp.key_algorithm.parse() {
+                                Ok(alg) => alg,
+                                Err(_) => exit_error!("invalid sftp host key algorithm configured"),
+                            },
+                        ) {
+                            Ok(key) => key,
+                            Err(err) => exit_error!("failed to generate sftp host key: {:?}", err),
+                        };
 
-                        if let Some(parent) = key_file.parent() {
-                            tokio::fs::create_dir_all(parent)
-                                .await
-                                .context("failed to create sftp host key directory")
-                                .unwrap();
+                        if let Some(parent) = key_file.parent()
+                            && let Err(err) = tokio::fs::create_dir_all(parent).await
+                        {
+                            exit_error!("failed to create sftp host key directory: {:?}", err);
                         }
-                        tokio::fs::write(
+                        if let Err(err) = tokio::fs::write(
                             key_file,
                             key.to_openssh(russh::keys::ssh_key::LineEnding::LF)
-                                .unwrap(),
+                                .expect("failed to convert sftp host key to OpenSSH format"),
                         )
                         .await
-                        .context("failed to write sftp host key")
-                        .unwrap();
+                        {
+                            exit_error!("failed to write sftp host key: {:?}", err);
+                        }
 
                         tracing::info!(
                             algorithm = %key.algorithm().to_string(),
@@ -455,14 +586,14 @@ async fn main() {
                 };
 
                 let address = SocketAddr::from((
-                    state.config.system.sftp.bind_address,
-                    state.config.system.sftp.bind_port,
+                    state.config.load().system.sftp.bind_address,
+                    state.config.load().system.sftp.bind_port,
                 ));
 
                 tracing::info!(
                     "ssh server listening on {} (app@{}, {}ms)",
                     address.to_string(),
-                    wings_rs::VERSION,
+                    crate::VERSION,
                     state.start_time.elapsed().as_millis()
                 );
 
@@ -470,12 +601,10 @@ async fn main() {
                     Ok(_) => {}
                     Err(err) => {
                         if err.kind() == std::io::ErrorKind::AddrInUse {
-                            tracing::error!("failed to start ssh server (address already in use)");
+                            exit_error!("failed to start ssh server (address already in use)");
                         } else {
-                            tracing::error!("failed to start ssh server: {:?}", err);
+                            exit_error!("failed to start ssh server: {:?}", err);
                         }
-
-                        std::process::exit(1);
                     }
                 }
             }
@@ -484,8 +613,10 @@ async fn main() {
 
     #[cfg(unix)]
     tokio::spawn(async move {
-        let mut signal =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).unwrap();
+        let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        else {
+            return;
+        };
 
         loop {
             signal.recv().await;
@@ -493,35 +624,59 @@ async fn main() {
         }
     });
 
-    if let Ok(host) = state.config.api.host.parse::<std::net::IpAddr>() {
-        let address = SocketAddr::from((host, state.config.api.port));
+    if let Ok(host) = state.config.load().api.host.parse::<std::net::IpAddr>() {
+        let address = SocketAddr::from((host, state.config.load().api.port));
 
-        if config.api.ssl.enabled {
+        if config.load().api.ssl.enabled {
             tracing::info!("loading ssl certs");
 
-            let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-                config.api.ssl.cert.as_str(),
-                config.api.ssl.key.as_str(),
+            let rustls_config = match axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                config.load().api.ssl.cert.as_str(),
+                config.load().api.ssl.key.as_str(),
             )
             .await
-            .context("failed to load SSL certificate and key")
-            .unwrap();
+            {
+                Ok(config) => config,
+                Err(err) => exit_error!("failed to load SSL certificate and key: {:?}", err),
+            };
+
+            tokio::spawn({
+                let rustls_config = rustls_config.clone();
+                let config = config.clone();
+
+                async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+                        tracing::info!("reloading ssl certs");
+
+                        if let Err(err) = rustls_config
+                            .reload_from_pem_file(
+                                config.load().api.ssl.cert.as_str(),
+                                config.load().api.ssl.key.as_str(),
+                            )
+                            .await
+                        {
+                            tracing::error!("failed to reload SSL certificate and key: {:?}", err);
+                        } else {
+                            tracing::info!("ssl certs reloaded successfully");
+                        }
+                    }
+                }
+            });
 
             tracing::info!("https listening on {}", address.to_string());
 
-            match axum_server::bind_rustls(address, config)
+            match axum_server::bind_rustls(address, rustls_config)
                 .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                 .await
             {
                 Ok(_) => {}
                 Err(err) => {
                     if err.kind() == std::io::ErrorKind::AddrInUse {
-                        tracing::error!("failed to start https server (address already in use)");
+                        exit_error!("failed to start https server (address already in use)");
                     } else {
-                        tracing::error!("failed to start https server: {:?}", err,);
+                        exit_error!("failed to start https server: {:?}", err);
                     }
-
-                    std::process::exit(1);
                 }
             }
         } else {
@@ -532,11 +687,9 @@ async fn main() {
                     Ok(listener) => listener,
                     Err(err) => {
                         if err.kind() == std::io::ErrorKind::AddrInUse {
-                            tracing::error!("failed to start http server (address already in use)");
-                            std::process::exit(1);
+                            exit_error!("failed to start http server (address already in use)");
                         } else {
-                            tracing::error!("failed to start http server: {:?}", err);
-                            std::process::exit(1);
+                            exit_error!("failed to start http server: {:?}", err);
                         }
                     }
                 },
@@ -547,19 +700,17 @@ async fn main() {
                 Ok(_) => {}
                 Err(err) => {
                     if err.kind() == std::io::ErrorKind::AddrInUse {
-                        tracing::error!("failed to start http server (address already in use)");
+                        exit_error!("failed to start http server (address already in use)");
                     } else {
-                        tracing::error!("failed to start http server: {:?}", err);
+                        exit_error!("failed to start http server: {:?}", err);
                     }
-
-                    std::process::exit(1);
                 }
             }
         }
     } else {
         #[cfg(unix)]
         {
-            let socket_path = &state.config.api.host;
+            let socket_path = state.config.load().api.host.clone();
 
             tracing::info!("http server listening on {}", socket_path);
 
@@ -573,19 +724,38 @@ async fn main() {
                 },
             ));
 
-            let _ = tokio::fs::remove_file(socket_path).await;
+            let _ = tokio::fs::remove_file(&socket_path).await;
+            let listener = match tokio::net::UnixListener::bind(socket_path) {
+                Ok(listener) => listener,
+                Err(err) => exit_error!("failed to bind to unix socket: {:?}", err),
+            };
 
-            let listener = tokio::net::UnixListener::bind(socket_path).unwrap();
-
-            axum::serve(listener, router.into_make_service())
-                .await
-                .unwrap();
+            if let Err(err) = axum::serve(listener, router.into_make_service()).await {
+                exit_error!("failed to start http server: {:?}", err);
+            }
         }
-
         #[cfg(not(unix))]
         {
-            tracing::error!("unix socket support is only available on unix systems");
-            std::process::exit(1);
+            exit_error!("unix socket support is only available on unix systems");
         }
     }
+}
+
+fn main() {
+    let thread_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(1024)
+        .thread_name_fn({
+            let thread_count = thread_count.clone();
+            move || {
+                let count = thread_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                format!("calagopus-wings-rt-{count}")
+            }
+        })
+        .name("calagopus-wings-rt")
+        .build()
+        .expect("failed to build Tokio runtime")
+        .block_on(main_rt());
 }

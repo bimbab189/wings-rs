@@ -1,15 +1,18 @@
 use notify::Watcher;
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Arc,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::sync::Mutex;
 
 type ServerNotifiers = Arc<Mutex<HashMap<uuid::Uuid, InotifyServerNotifier>>>;
 
 pub struct InotifyManager {
-    watcher: Arc<std::sync::Mutex<notify::RecommendedWatcher>>,
+    watcher: Arc<parking_lot::Mutex<notify::RecommendedWatcher>>,
     server_notifiers: ServerNotifiers,
 }
 
@@ -21,8 +24,8 @@ impl InotifyManager {
             {
                 let server_notifiers = Arc::clone(&server_notifiers);
 
-                move |res: Result<notify::Event, notify::Error>| {
-                    if let Ok(event) = res {
+                move |res: Result<notify::Event, notify::Error>| match res {
+                    Ok(event) => {
                         if event.kind.is_access() || event.kind.is_other() {
                             return;
                         }
@@ -40,43 +43,27 @@ impl InotifyManager {
                             }
                         }
                     }
+                    Err(err) => {
+                        if matches!(err.kind, notify::ErrorKind::MaxFilesWatch) {
+                            tracing::error!(
+                                "os file watch limit reached, inotify sender unsure of state, falling back: {}",
+                                err
+                            );
+
+                            for notifier in server_notifiers.blocking_lock().values() {
+                                notifier.is_trusted.store(false, Ordering::Relaxed);
+                            }
+                        }
+                    }
                 }
             },
             notify::Config::default().with_follow_symlinks(false),
         )?;
 
         Ok(Self {
-            watcher: Arc::new(std::sync::Mutex::new(watcher)),
+            watcher: Arc::new(parking_lot::Mutex::new(watcher)),
             server_notifiers,
         })
-    }
-
-    pub async fn register_server(
-        &self,
-        base_path: &Path,
-        uuid: uuid::Uuid,
-    ) -> Result<InotifyServerNotifier, anyhow::Error> {
-        let base_path = tokio::task::spawn_blocking({
-            let base_path = base_path.to_path_buf();
-            let watcher = Arc::clone(&self.watcher);
-
-            move || {
-                watcher
-                    .lock()
-                    .unwrap()
-                    .watch(&base_path, notify::RecursiveMode::Recursive)?;
-                Ok::<_, anyhow::Error>(base_path)
-            }
-        })
-        .await??;
-
-        let notifier = InotifyServerNotifier::new(base_path);
-        self.server_notifiers
-            .lock()
-            .await
-            .insert(uuid, notifier.clone());
-
-        Ok(notifier)
     }
 
     pub async fn register_server_with_notifier(
@@ -90,7 +77,6 @@ impl InotifyManager {
         tokio::task::spawn_blocking(move || {
             watcher
                 .lock()
-                .unwrap()
                 .watch(&base_path, notify::RecursiveMode::Recursive)?;
             Ok::<_, anyhow::Error>(())
         })
@@ -107,7 +93,7 @@ impl InotifyManager {
                 let path = notifier.path.clone();
                 let watcher = Arc::clone(&self.watcher);
 
-                move || watcher.lock().unwrap().unwatch(&path)
+                move || watcher.lock().unwatch(&path)
             });
         }
     }
@@ -117,6 +103,7 @@ impl InotifyManager {
 pub struct InotifyServerNotifier {
     path: PathBuf,
     modified_paths: Arc<Mutex<Vec<PathBuf>>>,
+    is_trusted: Arc<AtomicBool>,
 }
 
 impl InotifyServerNotifier {
@@ -124,6 +111,7 @@ impl InotifyServerNotifier {
         Self {
             path: path.clone(),
             modified_paths: Arc::new(Mutex::new(vec![path])),
+            is_trusted: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -145,6 +133,10 @@ impl InotifyServerNotifier {
             // still too many paths, just keep the base path
             *paths = vec![self.path.clone()];
         }
+    }
+
+    pub fn is_trusted(&self) -> bool {
+        self.is_trusted.load(Ordering::Relaxed)
     }
 
     pub async fn clear_modified_paths(&self) {

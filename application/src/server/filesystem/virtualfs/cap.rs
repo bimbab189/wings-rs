@@ -265,7 +265,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                     ModifiedDesc => b.modified.cmp(&a.modified),
                     CreatedAsc => a.created.cmp(&b.created),
                     CreatedDesc => b.created.cmp(&a.created),
-                    NameAsc | NameDesc => unreachable!(),
+                    NameAsc | NameDesc => std::cmp::Ordering::Equal,
                 },
             });
 
@@ -407,7 +407,13 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         is_ignored: IsIgnoredFn,
     ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
         let names = self.inner.async_read_dir_all(path).await?;
-        let file_compression_threads = self.server.app_state.config.api.file_compression_threads;
+        let file_compression_threads = self
+            .server
+            .app_state
+            .config
+            .load()
+            .api
+            .file_compression_threads;
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
         tokio::spawn({
@@ -448,7 +454,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                             }
                         }
                     }
-                    _ => {
+                    f if f.is_tar() => {
                         match crate::server::filesystem::archive::create::create_tar(
                             filesystem,
                             writer,
@@ -474,6 +480,40 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                                 );
                             }
                         }
+                    }
+                    f if f.is_itaf() => {
+                        match crate::server::filesystem::archive::create::create_itaf(
+                            filesystem,
+                            writer,
+                            &path,
+                            names,
+                            bytes_archived,
+                            is_ignored,
+                            crate::server::filesystem::archive::create::CreateItafOptions {
+                                compression_type: archive_format.compression_format(),
+                                compression_level,
+                                threads: file_compression_threads,
+                                crc_enabled: true,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(inner) => {
+                                inner.into_inner().shutdown().await.ok();
+                            }
+                            Err(err) => {
+                                tracing::error!(
+                                    "failed to create itaf archive for cap vfs: {}",
+                                    err
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        tracing::error!(
+                            "unsupported archive format for cap vfs: {}",
+                            archive_format.extension()
+                        );
                     }
                 }
             }
@@ -676,7 +716,16 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
     }
 
     fn chown(&self, path: &(dyn AsRef<Path> + Send + Sync)) -> Result<(), anyhow::Error> {
-        if self.server.app_state.config.system.user.rootless.enabled {
+        if self
+            .server
+            .app_state
+            .config
+            .load()
+            .system
+            .user
+            .rootless
+            .enabled
+        {
             return Ok(());
         }
 
@@ -690,7 +739,16 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error> {
-        if self.server.app_state.config.system.user.rootless.enabled {
+        if self
+            .server
+            .app_state
+            .config
+            .load()
+            .system
+            .user
+            .rootless
+            .enabled
+        {
             return Ok(());
         }
 

@@ -7,6 +7,7 @@ use crate::{
     utils::PortablePermissions,
 };
 use cap_std::fs::{Metadata, OpenOptions};
+use parking_lot::Mutex;
 use positioned_io::{ReadAt, WriteAt};
 use russh_sftp::protocol::{
     Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode,
@@ -15,7 +16,7 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 
 mod extended;
@@ -27,7 +28,7 @@ pub struct FileHandle {
     changed: bool,
     original_content: Option<String>,
 
-    file: Arc<RwLock<std::fs::File>>,
+    file: Arc<Mutex<std::fs::File>>,
 }
 
 pub struct DirHandle {
@@ -459,7 +460,7 @@ impl russh_sftp::server::Handler for SftpSession {
             _ => return Err(StatusCode::NoSuchFile),
         };
 
-        if handle.consumed >= self.state.config.system.sftp.directory_entry_limit {
+        if handle.consumed >= self.state.config.load().system.sftp.directory_entry_limit {
             return Err(StatusCode::Eof);
         }
 
@@ -497,8 +498,15 @@ impl russh_sftp::server::Handler for SftpSession {
             files.push(Self::convert_entry(&path, metadata, target_metadata));
             handle.consumed += 1;
 
-            if handle.consumed >= self.state.config.system.sftp.directory_entry_limit
-                || files.len() >= self.state.config.system.sftp.directory_entry_send_amount
+            if handle.consumed >= self.state.config.load().system.sftp.directory_entry_limit
+                || files.len()
+                    >= self
+                        .state
+                        .config
+                        .load()
+                        .system
+                        .sftp
+                        .directory_entry_send_amount
             {
                 tracing::debug!(
                     "{} entries sent early in sftp readdir ({} total)",
@@ -518,7 +526,7 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::PermissionDenied);
         }
 
-        if self.state.config.system.sftp.read_only {
+        if self.state.config.load().system.sftp.read_only {
             return Err(StatusCode::PermissionDenied);
         }
 
@@ -542,6 +550,10 @@ impl russh_sftp::server::Handler for SftpSession {
 
             if self.server.filesystem.truncate_path(&path).await.is_err() {
                 return Err(StatusCode::NoSuchFile);
+            }
+
+            if let Err(err) = self.server.diff.forget_file(&path.to_string_lossy()).await {
+                tracing::error!("failed to forget file from diff storage: {:?}", err);
             }
 
             self.server
@@ -572,7 +584,7 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::PermissionDenied);
         }
 
-        if self.state.config.system.sftp.read_only {
+        if self.state.config.load().system.sftp.read_only {
             return Err(StatusCode::PermissionDenied);
         }
 
@@ -633,7 +645,7 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::PermissionDenied);
         }
 
-        if self.state.config.system.sftp.read_only {
+        if self.state.config.load().system.sftp.read_only {
             return Err(StatusCode::PermissionDenied);
         }
 
@@ -717,7 +729,7 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::PermissionDenied);
         }
 
-        if self.state.config.system.sftp.read_only {
+        if self.state.config.load().system.sftp.read_only {
             return Err(StatusCode::PermissionDenied);
         }
 
@@ -772,11 +784,21 @@ impl russh_sftp::server::Handler for SftpSession {
         if self
             .server
             .filesystem
-            .rename_path(old_path, new_path)
+            .rename_path(&old_path, &new_path)
             .await
             .is_err()
         {
             return Err(StatusCode::NoSuchFile);
+        }
+
+        let new_path = self.server.filesystem.relative_path(&new_path);
+        if let Err(err) = self
+            .server
+            .diff
+            .rename_file(&old_path.to_string_lossy(), &new_path.to_string_lossy())
+            .await
+        {
+            tracing::error!("failed to rename file in diff storage: {:?}", err);
         }
 
         self.server.activity.log_activity(activity).await;
@@ -799,7 +821,7 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::PermissionDenied);
         }
 
-        if self.state.config.system.sftp.read_only {
+        if self.state.config.load().system.sftp.read_only {
             return Err(StatusCode::PermissionDenied);
         }
 
@@ -811,6 +833,10 @@ impl russh_sftp::server::Handler for SftpSession {
             Ok(path) => path,
             Err(_) => return Err(StatusCode::NoSuchFile),
         };
+
+        if path.components().next().is_none() {
+            return Err(StatusCode::NoSuchFile);
+        }
 
         let metadata = match self.server.filesystem.async_symlink_metadata(&path).await {
             Ok(metadata) => metadata,
@@ -994,7 +1020,7 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::PermissionDenied);
         }
 
-        if self.state.config.system.sftp.read_only {
+        if self.state.config.load().system.sftp.read_only {
             return Err(StatusCode::PermissionDenied);
         }
 
@@ -1126,7 +1152,7 @@ impl russh_sftp::server::Handler for SftpSession {
         if pflags.contains(OpenFlags::TRUNCATE) || pflags.contains(OpenFlags::CREATE) {
             activity_event = Some(ActivityEvent::SftpCreate);
         } else if pflags.contains(OpenFlags::READ)
-            && self.state.config.system.sftp.activity.log_file_reads
+            && self.state.config.load().system.sftp.activity.log_file_reads
         {
             activity_event = Some(ActivityEvent::SftpRead);
         }
@@ -1210,7 +1236,7 @@ impl russh_sftp::server::Handler for SftpSession {
                 writable,
                 changed: false,
                 original_content,
-                file: Arc::new(RwLock::new(file)),
+                file: Arc::new(Mutex::new(file)),
             }),
         );
 
@@ -1241,7 +1267,7 @@ impl russh_sftp::server::Handler for SftpSession {
 
             move || -> Result<Vec<u8>, std::io::Error> {
                 let mut data = vec![0; len.min(256 * 1024) as usize];
-                let bytes_read = file.read().unwrap().read_at(offset, &mut data)?;
+                let bytes_read = file.lock().read_at(offset, &mut data)?;
 
                 data.truncate(bytes_read);
                 data.shrink_to_fit();
@@ -1275,7 +1301,7 @@ impl russh_sftp::server::Handler for SftpSession {
             _ => return Err(StatusCode::NoSuchFile),
         };
 
-        if self.state.config.system.sftp.read_only {
+        if self.state.config.load().system.sftp.read_only {
             return Err(StatusCode::PermissionDenied);
         }
 
@@ -1283,7 +1309,10 @@ impl russh_sftp::server::Handler for SftpSession {
             .server
             .filesystem
             .async_allocate_in_path_iterator(
-                &handle.path_components[0..handle.path_components.len() - 1],
+                handle
+                    .path_components
+                    .get(0..handle.path_components.len() - 1)
+                    .ok_or(StatusCode::Failure)?,
                 data.len() as i64,
                 false,
             )
@@ -1295,7 +1324,7 @@ impl russh_sftp::server::Handler for SftpSession {
         tokio::task::spawn_blocking({
             let file = Arc::clone(&handle.file);
 
-            move || file.write().unwrap().write_all_at(offset, &data)
+            move || file.lock().write_all_at(offset, &data)
         })
         .await
         .map_err(|_| StatusCode::Failure)?

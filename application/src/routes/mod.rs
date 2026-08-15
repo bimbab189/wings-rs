@@ -1,4 +1,3 @@
-use bollard::Docker;
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Instant};
 use utoipa::ToSchema;
@@ -130,7 +129,10 @@ pub struct AppState {
     pub version: String,
 
     pub config: Arc<crate::config::Config>,
-    pub docker: Arc<Docker>,
+    /// Shared Docker client retained for fork-specific helper and Web IDE
+    /// operations that need Docker metadata beyond the executor abstraction.
+    pub docker: Arc<bollard::Docker>,
+    pub executor: Arc<dyn crate::server::executor::ServerExecutor>,
     pub stats_manager: Arc<crate::stats::StatsManager>,
     pub server_manager: Arc<crate::server::manager::ServerManager>,
     pub backup_manager: Arc<crate::server::backup::manager::BackupManager>,
@@ -149,11 +151,6 @@ impl<'a> ApiError<'a> {
     #[inline]
     pub fn new(error: &'a str) -> Self {
         Self { error }
-    }
-
-    #[inline]
-    pub fn to_json(&self) -> serde_json::Value {
-        serde_json::to_value(self).unwrap()
     }
 }
 

@@ -271,7 +271,7 @@ impl ScheduleAction {
                 output_into,
                 ..
             } => {
-                let mut stdout = match server.container_stdout().await {
+                let mut stdout = match server.get_stdout_lines().await {
                     Some(stdout) => stdout,
                     None => {
                         return Err("unable to get server stdout, is the server offline?".into());
@@ -489,33 +489,31 @@ impl ScheduleAction {
                     return Err("server is not running.".into());
                 }
 
-                if let Some(stdin) = server.container_stdin().await {
-                    let command = match execution_context.resolve_parameter(command) {
-                        Some(command) => command,
-                        None => {
-                            return Err(
-                                "unable to resolve parameter `command` into a string.".into()
-                            );
-                        }
-                    };
-
-                    if stdin.send(format!("{command}\n").into()).await.is_ok() {
-                        server
-                            .activity
-                            .log_activity(Activity {
-                                event: ActivityEvent::ConsoleCommand,
-                                user: None,
-                                ip: None,
-                                metadata: Some(serde_json::json!({
-                                    "command": command,
-                                })),
-                                schedule: Some(execution_context.schedule_uuid),
-                                timestamp: chrono::Utc::now(),
-                            })
-                            .await;
+                let command = match execution_context.resolve_parameter(command) {
+                    Some(command) => command,
+                    None => {
+                        return Err("unable to resolve parameter `command` into a string.".into());
                     }
-                } else {
-                    return Err("failed to get stdin (is server offline?)".into());
+                };
+
+                if server
+                    .send_stdin(format!("{command}\n").into())
+                    .await
+                    .is_ok()
+                {
+                    server
+                        .activity
+                        .log_activity(Activity {
+                            event: ActivityEvent::ConsoleCommand,
+                            user: None,
+                            ip: None,
+                            metadata: Some(serde_json::json!({
+                                "command": command,
+                            })),
+                            schedule: Some(execution_context.schedule_uuid),
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .await;
                 }
             }
             ScheduleAction::CreateBackup {
@@ -1205,11 +1203,11 @@ impl ScheduleAction {
                                             crate::server::filesystem::archive::create::CreateTarOptions {
                                                 compression_type: format.compression_format(),
                                                 compression_level: state
-                                                    .config
+                                                    .config.load()
                                                     .system
                                                     .backups
                                                     .compression_level,
-                                                threads: state.config.api.file_compression_threads,
+                                                threads: state.config.load().api.file_compression_threads,
                                             },
                                         )
                                         .await
@@ -1224,7 +1222,7 @@ impl ScheduleAction {
                                             ignored.into(),
                                             crate::server::filesystem::archive::create::CreateZipOptions {
                                                 compression_level: state
-                                                    .config
+                                                    .config.load()
                                                     .system
                                                     .backups
                                                     .compression_level,
@@ -1242,11 +1240,11 @@ impl ScheduleAction {
                                             ignored.into(),
                                             crate::server::filesystem::archive::create::Create7zOptions {
                                                 compression_level: state
-                                                    .config
+                                                    .config.load()
                                                     .system
                                                     .backups
                                                     .compression_level,
-                                                threads: state.config.api.file_compression_threads,
+                                                threads: state.config.load().api.file_compression_threads,
                                             },
                                         )
                                         .await

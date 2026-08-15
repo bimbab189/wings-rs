@@ -74,7 +74,10 @@ pub(crate) mod get {
             }
         }
 
-        let cpu = &sys.cpus()[0];
+        let Some(cpu) = sys.cpus().first() else {
+            return ApiResponse::error("failed to retrieve cpu information").ok();
+        };
+
         let mut servers = ResponseServers {
             total: 0,
             online: 0,
