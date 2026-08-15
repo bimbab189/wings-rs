@@ -12,7 +12,8 @@ use utoipa_axum::router::OpenApiRouter;
 
 pub(crate) mod backups;
 pub(crate) mod deauthorize_user;
-pub(crate) mod servers;
+pub mod servers;
+mod ports;
 pub(crate) mod system;
 pub(crate) mod transfers;
 pub(crate) mod update;
@@ -78,6 +79,11 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest(
             "/deauthorize-user",
             deauthorize_user::router(state)
+                .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth)),
+        )
+        .nest(
+            "/ports",
+            ports::router(state)
                 .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth)),
         )
         .route(

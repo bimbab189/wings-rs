@@ -14,9 +14,9 @@ use crate::{
             cap::FileType,
             encode_mode,
             virtualfs::{
-                AsyncFileRead, AsyncReadableFileStream, ByteRange, DirectoryListing,
-                DirectoryStreamWalk, DirectoryWalk, FileMetadata, FileRead, IsIgnoredFn,
-                VirtualReadableFilesystem,
+                AsyncDirectoryStreamWalk, AsyncDirectoryWalk, AsyncFileRead,
+                AsyncReadableFileStream, ByteRange, DirectoryListing, DirectoryWalk, FileMetadata,
+                FileRead, IsIgnoredFn, VirtualReadableFilesystem,
             },
         },
     },
@@ -46,6 +46,8 @@ type ResticBackupCache =
     RwLock<HashMap<uuid::Uuid, (ResticSnapshot, Arc<ResticBackupConfiguration>)>>;
 static RESTIC_BACKUP_CACHE: LazyLock<ResticBackupCache> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+
+const RESTIC_STDERR_CAPTURE_LIMIT: usize = 8 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct ResticSnapshot {
@@ -224,11 +226,10 @@ pub struct ResticBackup {
     configuration: Arc<ResticBackupConfiguration>,
 }
 
-fn get_restic_cache_dir(config: &crate::config::Config) -> String {
-    format!(
-        "{}/.cache/restic",
-        config.load().system.backup_directory.trim_end_matches('/')
-    )
+impl ResticBackup {
+    pub fn get_restic_cache_dir(config: &crate::config::Config) -> String {
+        config.resolve_as_str(|cfg| &cfg.system.backup_directory) + "/.cache/restic"
+    }
 }
 
 #[async_trait::async_trait]
@@ -238,9 +239,13 @@ impl BackupFindExt for ResticBackup {
             return Ok(true);
         }
 
-        if tokio::fs::metadata(&state.config.load().system.backups.restic.password_file)
-            .await
-            .is_ok()
+        if tokio::fs::metadata(
+            state
+                .config
+                .resolve_as_path(|cfg| &cfg.system.backups.restic.password_file),
+        )
+        .await
+        .is_ok()
         {
             let config = state.config.load();
             let output = match Command::new("restic")
@@ -248,11 +253,11 @@ impl BackupFindExt for ResticBackup {
                 .arg("--json")
                 .arg("--no-lock")
                 .arg("--repo")
-                .arg(&config.system.backups.restic.repository)
+                .arg(&*config.system.backups.restic.repository.as_str(&config))
                 .arg("--password-file")
-                .arg(&config.system.backups.restic.password_file)
+                .arg(&*config.system.backups.restic.password_file.as_str(&config))
                 .arg("--cache-dir")
-                .arg(get_restic_cache_dir(&state.config))
+                .arg(Self::get_restic_cache_dir(&state.config))
                 .arg("snapshots")
                 .output()
                 .await
@@ -273,8 +278,22 @@ impl BackupFindExt for ResticBackup {
                     let config = state.config.load();
 
                     Arc::new(ResticBackupConfiguration {
-                        repository: config.system.backups.restic.repository.clone(),
-                        password_file: Some(config.system.backups.restic.password_file.clone()),
+                        repository: config
+                            .system
+                            .backups
+                            .restic
+                            .repository
+                            .as_str(&config)
+                            .into(),
+                        password_file: Some(
+                            config
+                                .system
+                                .backups
+                                .restic
+                                .password_file
+                                .as_str(&config)
+                                .into(),
+                        ),
                         retry_lock_seconds: config.system.backups.restic.retry_lock_seconds,
                         environment: config.system.backups.restic.environment.clone(),
                     })
@@ -313,7 +332,7 @@ impl BackupFindExt for ResticBackup {
                 .arg("--repo")
                 .arg(&configuration.repository)
                 .arg("--cache-dir")
-                .arg(get_restic_cache_dir(&state.config))
+                .arg(Self::get_restic_cache_dir(&state.config))
                 .arg("snapshots")
                 .output()
                 .await
@@ -383,9 +402,13 @@ impl BackupFindExt for ResticBackup {
             })));
         }
 
-        if tokio::fs::metadata(&state.config.load().system.backups.restic.password_file)
-            .await
-            .is_ok()
+        if tokio::fs::metadata(
+            state
+                .config
+                .resolve_as_path(|cfg| &cfg.system.backups.restic.password_file),
+        )
+        .await
+        .is_ok()
         {
             let config = state.config.load();
             let output = match Command::new("restic")
@@ -393,11 +416,11 @@ impl BackupFindExt for ResticBackup {
                 .arg("--json")
                 .arg("--no-lock")
                 .arg("--repo")
-                .arg(&config.system.backups.restic.repository)
+                .arg(&*config.system.backups.restic.repository.as_str(&config))
                 .arg("--password-file")
-                .arg(&config.system.backups.restic.password_file)
+                .arg(&*config.system.backups.restic.password_file.as_str(&config))
                 .arg("--cache-dir")
-                .arg(get_restic_cache_dir(&state.config))
+                .arg(Self::get_restic_cache_dir(&state.config))
                 .arg("snapshots")
                 .output()
                 .await
@@ -415,8 +438,22 @@ impl BackupFindExt for ResticBackup {
                     let config = state.config.load();
 
                     Arc::new(ResticBackupConfiguration {
-                        repository: config.system.backups.restic.repository.clone(),
-                        password_file: Some(config.system.backups.restic.password_file.clone()),
+                        repository: config
+                            .system
+                            .backups
+                            .restic
+                            .repository
+                            .as_str(&config)
+                            .into(),
+                        password_file: Some(
+                            config
+                                .system
+                                .backups
+                                .restic
+                                .password_file
+                                .as_str(&config)
+                                .into(),
+                        ),
                         retry_lock_seconds: config.system.backups.restic.retry_lock_seconds,
                         environment: config.system.backups.restic.environment.clone(),
                     })
@@ -470,7 +507,7 @@ impl BackupFindExt for ResticBackup {
                 .arg("--repo")
                 .arg(&configuration.repository)
                 .arg("--cache-dir")
-                .arg(get_restic_cache_dir(&state.config))
+                .arg(Self::get_restic_cache_dir(&state.config))
                 .arg("snapshots")
                 .output()
                 .await
@@ -547,14 +584,10 @@ impl BackupCreateExt for ResticBackup {
         }
 
         let (mut child, configuration) = if tokio::fs::metadata(
-            &server
+            server
                 .app_state
                 .config
-                .load()
-                .system
-                .backups
-                .restic
-                .password_file,
+                .resolve_as_path(|cfg| &cfg.system.backups.restic.password_file),
         )
         .await
         .is_ok()
@@ -566,11 +599,11 @@ impl BackupCreateExt for ResticBackup {
                     .envs(&config.system.backups.restic.environment)
                     .arg("--json")
                     .arg("--repo")
-                    .arg(&config.system.backups.restic.repository)
+                    .arg(&*config.system.backups.restic.repository.as_str(&config))
                     .arg("--password-file")
-                    .arg(&config.system.backups.restic.password_file)
+                    .arg(&*config.system.backups.restic.password_file.as_str(&config))
                     .arg("--cache-dir")
-                    .arg(get_restic_cache_dir(&server.app_state.config))
+                    .arg(Self::get_restic_cache_dir(&server.app_state.config))
                     .arg("--retry-lock")
                     .arg(format!(
                         "{}s",
@@ -591,8 +624,22 @@ impl BackupCreateExt for ResticBackup {
                     .stderr(std::process::Stdio::piped())
                     .spawn()?,
                 ResticBackupConfiguration {
-                    repository: config.system.backups.restic.repository.clone(),
-                    password_file: Some(config.system.backups.restic.password_file.clone()),
+                    repository: config
+                        .system
+                        .backups
+                        .restic
+                        .repository
+                        .as_str(&config)
+                        .into(),
+                    password_file: Some(
+                        config
+                            .system
+                            .backups
+                            .restic
+                            .password_file
+                            .as_str(&config)
+                            .into(),
+                    ),
                     retry_lock_seconds: config.system.backups.restic.retry_lock_seconds,
                     environment: config.system.backups.restic.environment.clone(),
                 },
@@ -612,7 +659,7 @@ impl BackupCreateExt for ResticBackup {
                     .arg("--repo")
                     .arg(&configuration.repository)
                     .arg("--cache-dir")
-                    .arg(get_restic_cache_dir(&server.app_state.config))
+                    .arg(Self::get_restic_cache_dir(&server.app_state.config))
                     .arg("--retry-lock")
                     .arg(format!("{}s", configuration.retry_lock_seconds))
                     .arg("backup")
@@ -761,7 +808,7 @@ impl BackupExt for ResticBackup {
                         .arg(&self.configuration.repository)
                         .args(self.configuration.password())
                         .arg("--cache-dir")
-                        .arg(get_restic_cache_dir(&state.config))
+                        .arg(Self::get_restic_cache_dir(&state.config))
                         .arg("dump")
                         .arg(format!("{}:{}", self.short_id, self.server_path.display()))
                         .arg("/")
@@ -775,10 +822,11 @@ impl BackupExt for ResticBackup {
                     let mut archive = zip::ZipWriter::new_stream(writer);
 
                     let mut subtar = tar::Archive::new(child.into_stdout()?);
-                    let mut entries = subtar.entries()?;
+                    let entries = subtar.entries()?;
 
                     let mut read_buffer = vec![0; crate::BUFFER_SIZE];
-                    while let Some(Ok(mut entry)) = entries.next() {
+                    for entry in entries {
+                        let mut entry = entry?;
                         let header = entry.header().clone();
                         let relative = entry.path()?;
 
@@ -832,7 +880,7 @@ impl BackupExt for ResticBackup {
                         .arg(&self.configuration.repository)
                         .args(self.configuration.password())
                         .arg("--cache-dir")
-                        .arg(get_restic_cache_dir(&self.config))
+                        .arg(Self::get_restic_cache_dir(&self.config))
                         .arg("dump")
                         .arg(format!("{}:{}", self.short_id, self.server_path.display()))
                         .arg("/")
@@ -874,7 +922,7 @@ impl BackupExt for ResticBackup {
                         .arg(&self.configuration.repository)
                         .args(self.configuration.password())
                         .arg("--cache-dir")
-                        .arg(get_restic_cache_dir(&self.config))
+                        .arg(Self::get_restic_cache_dir(&self.config))
                         .arg("dump")
                         .arg(format!("{}:{}", self.short_id, self.server_path.display()))
                         .arg("/")
@@ -901,9 +949,10 @@ impl BackupExt for ResticBackup {
 
                     let mut dir_stack = Vec::new();
                     let mut restic_tar = tar::Archive::new(child.into_stdout()?);
-                    let mut entries = restic_tar.entries()?;
+                    let entries = restic_tar.entries()?;
 
-                    while let Some(Ok(entry)) = entries.next() {
+                    for entry in entries {
+                        let entry = entry?;
                         let header = entry.header().clone();
                         let relative = entry.path()?.to_path_buf();
 
@@ -1028,7 +1077,7 @@ impl BackupExt for ResticBackup {
     ) -> Result<(), anyhow::Error> {
         total.store(self.total_bytes_processed, Ordering::Relaxed);
 
-        let child = Command::new("restic")
+        let mut child = Command::new("restic")
             .envs(&self.configuration.environment)
             .arg("--json")
             .arg("--no-lock")
@@ -1036,7 +1085,7 @@ impl BackupExt for ResticBackup {
             .arg(&self.configuration.repository)
             .args(self.configuration.password())
             .arg("--cache-dir")
-            .arg(get_restic_cache_dir(&server.app_state.config))
+            .arg(Self::get_restic_cache_dir(&server.app_state.config))
             .arg("restore")
             .arg(format!("{}:{}", self.short_id, self.server_path.display()))
             .arg("--target")
@@ -1055,9 +1104,36 @@ impl BackupExt for ResticBackup {
             )
             .arg("-vv")
             .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()?;
 
-        let mut line_reader = tokio::io::BufReader::new(child.into_stdout()?).lines();
+        let stdout = child.take_stdout()?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("No stderr available"))?;
+        let mut line_reader = tokio::io::BufReader::new(stdout).lines();
+
+        let stderr_task = tokio::spawn({
+            async move {
+                let mut reader = tokio::io::BufReader::new(stderr);
+                let mut output = String::new();
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if output.len() < RESTIC_STDERR_CAPTURE_LIMIT {
+                                output.push_str(&line);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                output
+            }
+        });
 
         while let Ok(Some(line)) = line_reader.next_line().await {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line)
@@ -1079,6 +1155,18 @@ impl BackupExt for ResticBackup {
             }
         }
 
+        let status = child.wait().await?;
+        let stderr_output = stderr_task.await.unwrap_or_default();
+
+        if !status.success() {
+            let mut message = compact_str::CompactString::from("failed to restore restic backup");
+            if !stderr_output.is_empty() {
+                message.push_str(":\n");
+                message.push_str(stderr_output.trim_end());
+            }
+            return Err(anyhow::anyhow!("{}", message));
+        }
+
         server.filesystem.rerun_disk_checker();
 
         Ok(())
@@ -1091,7 +1179,7 @@ impl BackupExt for ResticBackup {
             .arg(&self.configuration.repository)
             .args(self.configuration.password())
             .arg("--cache-dir")
-            .arg(get_restic_cache_dir(&self.config))
+            .arg(Self::get_restic_cache_dir(&self.config))
             .arg("--retry-lock")
             .arg(format!("{}s", self.configuration.retry_lock_seconds))
             .arg("forget")
@@ -1131,7 +1219,7 @@ impl BackupExt for ResticBackup {
             .arg(&self.configuration.repository)
             .args(self.configuration.password())
             .arg("--cache-dir")
-            .arg(get_restic_cache_dir(&self.config))
+            .arg(Self::get_restic_cache_dir(&self.config))
             .arg("--retry-lock")
             .arg(format!("{}s", self.configuration.retry_lock_seconds))
             .arg("ls")
@@ -1172,7 +1260,7 @@ impl BackupExt for ResticBackup {
             stderr.read_to_string(&mut stderr_out).await?;
 
             tracing::error!(
-                "failed to list Kopia snapshot for browsing: {}",
+                "failed to list Restic snapshot for browsing: {}",
                 stderr_out.trim()
             );
         }
@@ -1227,6 +1315,7 @@ impl VirtualResticBackup {
             directory: true,
             file: false,
             symlink: false,
+            r#virtual: true,
             mime: detected_mime.mime,
             modified: node.mtime,
             created: chrono::DateTime::from_timestamp(0, 0).unwrap_or_default(),
@@ -1261,6 +1350,7 @@ impl VirtualResticBackup {
             directory: false,
             file: meta.file_type.is_file(),
             symlink: meta.file_type.is_symlink(),
+            r#virtual: true,
             mime: detected_mime.mime,
             modified: meta.mtime,
             created: chrono::DateTime::from_timestamp(0, 0).unwrap_or_default(),
@@ -1283,7 +1373,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         if path_ref == Path::new("") || path_ref == Path::new("/") {
             return Ok(FileMetadata {
                 file_type: FileType::Dir,
-                permissions: PortablePermissions::from_mode(0o755),
+                permissions: PortablePermissions::from_mode_dir(0o755),
                 size: 0,
                 modified: None,
                 created: None,
@@ -1299,7 +1389,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             };
             return Ok(FileMetadata {
                 file_type: FileType::Dir,
-                permissions: PortablePermissions::from_mode(mode),
+                permissions: PortablePermissions::from_mode_dir(mode),
                 size: 0,
                 modified,
                 created: None,
@@ -1309,7 +1399,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         if let Some(meta) = self.tree.lookup_file(path_ref) {
             return Ok(FileMetadata {
                 file_type: meta.file_type,
-                permissions: PortablePermissions::from_mode(meta.mode),
+                permissions: PortablePermissions::from_mode_file(meta.mode),
                 size: meta.size,
                 modified: Some(meta.mtime.into()),
                 created: None,
@@ -1489,7 +1579,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         })
     }
 
-    async fn async_walk_dir<'a>(
+    fn walk_dir<'a>(
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
@@ -1526,8 +1616,55 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             items: std::vec::IntoIter<(FileType, PathBuf)>,
         }
 
-        #[async_trait::async_trait]
         impl DirectoryWalk for TreeWalk {
+            fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
+                self.items.next().map(Ok)
+            }
+        }
+
+        Ok(Box::new(TreeWalk {
+            items: flat.into_iter(),
+        }))
+    }
+    async fn async_walk_dir<'a>(
+        &'a self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        is_ignored: IsIgnoredFn,
+    ) -> Result<Box<dyn AsyncDirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
+        let start = self.tree.lookup_dir(path.as_ref());
+        let mut flat: Vec<(FileType, PathBuf)> = Vec::new();
+
+        if let Some(start) = start {
+            fn walk(
+                node: &ResticTreeNode,
+                current_path: &Path,
+                is_ignored: &IsIgnoredFn,
+                out: &mut Vec<(FileType, PathBuf)>,
+            ) {
+                for (name, meta) in node.files.iter() {
+                    let child_path = current_path.join(name.as_str());
+                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path) {
+                        out.push((meta.file_type, filtered));
+                    }
+                }
+                for (name, child) in node.dirs.iter() {
+                    let child_path = current_path.join(name.as_str());
+                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()) {
+                        out.push((FileType::Dir, filtered));
+                    }
+                    walk(child, &child_path, is_ignored, out);
+                }
+            }
+
+            walk(start, path.as_ref(), &is_ignored, &mut flat);
+        }
+
+        struct TreeWalk {
+            items: std::vec::IntoIter<(FileType, PathBuf)>,
+        }
+
+        #[async_trait::async_trait]
+        impl AsyncDirectoryWalk for TreeWalk {
             async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
                 self.items.next().map(Ok)
             }
@@ -1542,7 +1679,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
-    ) -> Result<Box<dyn DirectoryStreamWalk + Send + Sync + 'a>, anyhow::Error> {
+    ) -> Result<Box<dyn AsyncDirectoryStreamWalk + Send + Sync + 'a>, anyhow::Error> {
         struct ResticDirStreamWalk {
             entry_wanted_notifier: Arc<tokio::sync::Notify>,
             entry_channel_rx: tokio::sync::mpsc::Receiver<
@@ -1551,7 +1688,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         }
 
         #[async_trait::async_trait]
-        impl DirectoryStreamWalk for ResticDirStreamWalk {
+        impl AsyncDirectoryStreamWalk for ResticDirStreamWalk {
             fn supports_multithreading(&self) -> bool {
                 false
             }
@@ -1609,7 +1746,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                     .arg(&configuration.repository)
                                     .args(configuration.password())
                                     .arg("--cache-dir")
-                                    .arg(get_restic_cache_dir(&config))
+                                    .arg(ResticBackup::get_restic_cache_dir(&config))
                                     .arg("dump")
                                     .arg(format!("{}:{}", short_id, full_path.display()))
                                     .arg("/")
@@ -1624,9 +1761,10 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                             tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
                                 let runtime = tokio::runtime::Handle::current();
                                 let mut restic_tar = tar::Archive::new(child.into_stdout()?);
-                                let mut entries = restic_tar.entries()?;
+                                let entries = restic_tar.entries()?;
 
-                                while let Some(Ok(mut entry)) = entries.next() {
+                                for entry in entries {
+                                    let mut entry = entry?;
                                     let header = entry.header().clone();
                                     let relative = path.join(entry.path()?);
 
@@ -1670,7 +1808,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                 .arg(&configuration.repository)
                                 .args(configuration.password())
                                 .arg("--cache-dir")
-                                .arg(get_restic_cache_dir(&config))
+                                .arg(ResticBackup::get_restic_cache_dir(&config))
                                 .arg("dump")
                                 .arg(format!("{}:{}", short_id, full_path.display()))
                                 .stdout(std::process::Stdio::piped())
@@ -1727,7 +1865,9 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             .arg(&self.configuration.repository)
             .args(self.configuration.password())
             .arg("--cache-dir")
-            .arg(get_restic_cache_dir(&self.server.app_state.config))
+            .arg(ResticBackup::get_restic_cache_dir(
+                &self.server.app_state.config,
+            ))
             .arg("dump")
             .arg(&self.short_id)
             .arg(full_path)
@@ -1766,7 +1906,9 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             .arg(&self.configuration.repository)
             .args(self.configuration.password())
             .arg("--cache-dir")
-            .arg(get_restic_cache_dir(&self.server.app_state.config))
+            .arg(ResticBackup::get_restic_cache_dir(
+                &self.server.app_state.config,
+            ))
             .arg("dump")
             .arg(&self.short_id)
             .arg(full_path)
@@ -1804,7 +1946,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
         let entry = self.async_metadata(&path).await?;
 
         if !entry.file_type.is_dir() {
@@ -1818,6 +1960,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         let path = path.as_ref().to_path_buf();
 
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         let configuration = self.configuration.clone();
         let config = self.server.app_state.config.clone();
@@ -1839,7 +1982,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                 .arg(&configuration.repository)
                 .args(configuration.password())
                 .arg("--cache-dir")
-                .arg(get_restic_cache_dir(&config))
+                .arg(ResticBackup::get_restic_cache_dir(&config))
                 .arg("dump")
                 .arg(format!("{}:{}", short_id, full_path.display()))
                 .arg("/")
@@ -1850,17 +1993,18 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let mut child = spawn_restic()?;
 
                     let writer = tokio_util::io::SyncIoBridge::new(writer);
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
                     let mut restic_tar = tar::Archive::new(child.take_stdout()?);
-                    let mut entries = restic_tar.entries()?;
+                    let entries = restic_tar.entries()?;
 
                     let mut read_buffer = vec![0; crate::BUFFER_SIZE];
-                    while let Some(Ok(mut entry)) = entries.next() {
+                    for entry in entries {
+                        let mut entry = entry?;
                         let header = entry.header().clone();
                         let relative = entry.path()?.to_path_buf();
 
@@ -1928,7 +2072,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                 });
             }
             f if f.is_tar() => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let mut child = spawn_restic()?;
 
                     let writer = CompressionWriter::new(
@@ -1940,9 +2084,10 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                     let mut tar = tar::Builder::new(writer);
 
                     let mut restic_tar = tar::Archive::new(child.take_stdout()?);
-                    let mut entries = restic_tar.entries()?;
+                    let entries = restic_tar.entries()?;
 
-                    while let Some(Ok(entry)) = entries.next() {
+                    for entry in entries {
+                        let entry = entry?;
                         let mut header = entry.header().clone();
                         let relative = entry.path()?.to_path_buf();
 
@@ -1979,7 +2124,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                 });
             }
             f if f.is_itaf() => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let mut child = spawn_restic()?;
 
                     let writer = CompressionWriter::new(
@@ -1998,9 +2143,10 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
 
                     let mut dir_stack = Vec::new();
                     let mut restic_tar = tar::Archive::new(child.take_stdout()?);
-                    let mut entries = restic_tar.entries()?;
+                    let entries = restic_tar.entries()?;
 
-                    while let Some(Ok(entry)) = entries.next() {
+                    for entry in entries {
+                        let entry = entry?;
                         let header = entry.header().clone();
                         let relative = entry.path()?.to_path_buf();
 
@@ -2130,7 +2276,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
         let entry = self.async_metadata(&path).await?;
 
         if !entry.file_type.is_dir() {
@@ -2144,6 +2290,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         let path = path.as_ref().to_path_buf();
 
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         let configuration = self.configuration.clone();
         let config = self.server.app_state.config.clone();
@@ -2165,7 +2312,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                 .arg(&configuration.repository)
                 .args(configuration.password())
                 .arg("--cache-dir")
-                .arg(get_restic_cache_dir(&config))
+                .arg(ResticBackup::get_restic_cache_dir(&config))
                 .arg("dump")
                 .args(if is_dir {
                     vec![
@@ -2212,7 +2359,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = tokio_util::io::SyncIoBridge::new(writer);
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
@@ -2224,9 +2371,10 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                 let mut child = spawn_restic(true, &entry_path)?;
 
                                 let mut restic_tar = tar::Archive::new(child.take_stdout()?);
-                                let mut entries = restic_tar.entries()?;
+                                let entries = restic_tar.entries()?;
 
-                                while let Some(Ok(mut entry)) = entries.next() {
+                                for entry in entries {
+                                    let mut entry = entry?;
                                     let header = entry.header().clone();
                                     let relative = entry_path.join(entry.path()?);
 
@@ -2340,7 +2488,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                 });
             }
             f if f.is_tar() => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = CompressionWriter::new(
                         tokio_util::io::SyncIoBridge::new(writer),
                         f.compression_format(),
@@ -2355,9 +2503,10 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                 let mut child = spawn_restic(true, &entry_path)?;
 
                                 let mut restic_tar = tar::Archive::new(child.take_stdout()?);
-                                let mut entries = restic_tar.entries()?;
+                                let entries = restic_tar.entries()?;
 
-                                while let Some(Ok(entry)) = entries.next() {
+                                for entry in entries {
+                                    let entry = entry?;
                                     let mut header = entry.header().clone();
                                     let relative = entry.path()?.to_path_buf();
 
@@ -2417,7 +2566,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                 });
             }
             f if f.is_itaf() => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = CompressionWriter::new(
                         tokio_util::io::SyncIoBridge::new(writer),
                         f.compression_format(),
@@ -2501,9 +2650,10 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
                                 let base_depth = dir_stack.len();
                                 let mut child = spawn_restic(true, &entry_path)?;
                                 let mut restic_tar = tar::Archive::new(child.take_stdout()?);
-                                let mut entries = restic_tar.entries()?;
+                                let entries = restic_tar.entries()?;
 
-                                while let Some(Ok(entry)) = entries.next() {
+                                for entry in entries {
+                                    let entry = entry?;
                                     let header = entry.header().clone();
                                     let relative = entry.path()?.to_path_buf();
 

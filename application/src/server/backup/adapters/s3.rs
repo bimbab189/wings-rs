@@ -62,12 +62,16 @@ pub struct S3Backup {
 impl S3Backup {
     #[inline]
     fn get_file_name(config: &crate::config::Config, uuid: uuid::Uuid) -> PathBuf {
-        Path::new(&config.load().system.backup_directory).join(format!("{uuid}.s3.tar.gz"))
+        config
+            .resolve_as_path(|cfg| &cfg.system.backup_directory)
+            .join(format!("{uuid}.s3.tar.gz"))
     }
 
     #[inline]
     fn get_scratch_file_name(config: &crate::config::Config, uuid: uuid::Uuid) -> PathBuf {
-        Path::new(&config.load().system.backup_directory).join(format!("{uuid}.s3.part"))
+        config
+            .resolve_as_path(|cfg| &cfg.system.backup_directory)
+            .join(format!("{uuid}.s3.part"))
     }
 
     async fn upload_part(
@@ -206,30 +210,31 @@ impl S3Backup {
         let (mut archive_reader, archive_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
         let total_task = {
+            let filesystem = server.filesystem.clone();
             let total = Arc::clone(&total);
-            let server = server.clone();
             let ignore = ignore.clone();
 
             async move {
-                let mut walker = server
-                    .filesystem
-                    .async_walk_dir(Path::new(""))
-                    .await?
-                    .with_is_ignored(ignore.into());
-                let mut total_files = 0;
-                while let Some(Ok((_, path))) = walker.next_entry().await {
-                    let metadata = match server.filesystem.async_symlink_metadata(&path).await {
-                        Ok(metadata) => metadata,
-                        Err(_) => continue,
-                    };
+                tokio::task::spawn_blocking(move || {
+                    let mut walker = filesystem
+                        .walk_dir(Path::new(""))?
+                        .with_is_ignored(ignore.into());
+                    let mut total_files = 0;
+                    while let Some(Ok((_, path))) = walker.next_entry() {
+                        let metadata = match filesystem.symlink_metadata(&path) {
+                            Ok(metadata) => metadata,
+                            Err(_) => continue,
+                        };
 
-                    total.fetch_add(metadata.len(), Ordering::Relaxed);
-                    if !metadata.is_dir() {
-                        total_files += 1;
+                        total.fetch_add(metadata.len(), Ordering::Relaxed);
+                        if !metadata.is_dir() {
+                            total_files += 1;
+                        }
                     }
-                }
 
-                Ok::<_, anyhow::Error>(total_files)
+                    Ok::<_, anyhow::Error>(total_files)
+                })
+                .await?
             }
         };
 
@@ -443,30 +448,31 @@ impl S3Backup {
         };
 
         let total_task = {
+            let filesystem = server.filesystem.clone();
             let total = Arc::clone(&total);
-            let server = server.clone();
             let ignore = ignore.clone();
 
             async move {
-                let mut walker = server
-                    .filesystem
-                    .async_walk_dir(Path::new(""))
-                    .await?
-                    .with_is_ignored(ignore.into());
-                let mut total_files = 0;
-                while let Some(Ok((_, path))) = walker.next_entry().await {
-                    let metadata = match server.filesystem.async_symlink_metadata(&path).await {
-                        Ok(metadata) => metadata,
-                        Err(_) => continue,
-                    };
+                tokio::task::spawn_blocking(move || {
+                    let mut walker = filesystem
+                        .walk_dir(Path::new(""))?
+                        .with_is_ignored(ignore.into());
+                    let mut total_files = 0;
+                    while let Some(Ok((_, path))) = walker.next_entry() {
+                        let metadata = match filesystem.symlink_metadata(&path) {
+                            Ok(metadata) => metadata,
+                            Err(_) => continue,
+                        };
 
-                    total.fetch_add(metadata.len(), Ordering::Relaxed);
-                    if !metadata.is_dir() {
-                        total_files += 1;
+                        total.fetch_add(metadata.len(), Ordering::Relaxed);
+                        if !metadata.is_dir() {
+                            total_files += 1;
+                        }
                     }
-                }
 
-                Ok::<_, anyhow::Error>(total_files)
+                    Ok::<_, anyhow::Error>(total_files)
+                })
+                .await?
             }
         };
 
@@ -710,6 +716,14 @@ impl BackupExt for S3Backup {
         self.uuid
     }
 
+    async fn download_info(
+        &self,
+    ) -> Result<crate::server::backup::BackupDownloadInfo, anyhow::Error> {
+        Err(anyhow::anyhow!(
+            "this backup adapter does not support downloads"
+        ))
+    }
+
     async fn download(
         &self,
         _state: &crate::routes::State,
@@ -780,21 +794,21 @@ impl BackupExt for S3Backup {
             let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
             for entry in entries {
                 let mut entry = entry?;
-                let path = entry.path()?;
+                let path = server.filesystem.relative_path(&entry.path()?);
 
-                if path.is_absolute() {
+                if path.as_os_str().is_empty() {
                     continue;
                 }
 
                 let header = entry.header();
                 match header.entry_type() {
                     tar::EntryType::Directory => {
-                        server.filesystem.create_chowned_dir_all(path.as_ref())?;
+                        server.filesystem.create_chowned_dir_all(path.as_path())?;
                         server
                             .filesystem
                             .set_permissions(
-                                path.as_ref(),
-                                PortablePermissions::from_mode(header.mode().unwrap_or(0o755)),
+                                path.as_path(),
+                                PortablePermissions::from_mode_dir(header.mode().unwrap_or(0o755)),
                             )?;
 
                         if let Ok(modified_time) = header.mtime() && directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
@@ -814,7 +828,7 @@ impl BackupExt for S3Backup {
                         let mut writer = crate::server::filesystem::file::ServerFile::new(
                             server.clone(),
                             &path,
-                            Some(PortablePermissions::from_mode(header.mode().unwrap_or(0o644))),
+                            Some(PortablePermissions::from_mode_file(header.mode().unwrap_or(0o644))),
                             header
                                 .mtime()
                                 .map(|t| std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
@@ -829,7 +843,7 @@ impl BackupExt for S3Backup {
                     tar::EntryType::Symlink => {
                         let link = entry.link_name().unwrap_or_default().unwrap_or_default();
 
-                        if let Err(err) = server.filesystem.symlink(link, path.as_ref()) {
+                        if let Err(err) = server.filesystem.symlink(link, path.as_path()) {
                             tracing::debug!(path = %path.display(), "failed to create symlink from backup: {:?}", err);
                         } else {
                             progress.increment_files();
@@ -838,7 +852,7 @@ impl BackupExt for S3Backup {
                                 server
                                     .filesystem
                                     .set_times(
-                                        path.as_ref(),
+                                        path.as_path(),
                                         std::time::UNIX_EPOCH
                                             + std::time::Duration::from_secs(modified_time),
                                         None,

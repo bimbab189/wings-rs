@@ -26,7 +26,8 @@ pub struct ZfsBackup {
 impl ZfsBackup {
     #[inline]
     fn get_backup_path(config: &crate::config::Config, uuid: uuid::Uuid) -> PathBuf {
-        Path::new(&config.load().system.backup_directory)
+        config
+            .resolve_as_path(|cfg| &cfg.system.backup_directory)
             .join("zfs")
             .join(uuid.to_string())
     }
@@ -42,8 +43,8 @@ impl ZfsBackup {
         server_uuid: uuid::Uuid,
         uuid: uuid::Uuid,
     ) -> PathBuf {
-        Path::new(&config.load().system.data_directory)
-            .join(server_uuid.to_string())
+        config
+            .data_path(server_uuid)
             .join(".zfs")
             .join("snapshot")
             .join(Self::get_snapshot_name(uuid))
@@ -171,30 +172,31 @@ impl BackupCreateExt for ZfsBackup {
         tokio::fs::create_dir_all(Self::get_backup_path(&server.app_state.config, uuid)).await?;
 
         let total_task = {
-            let server = server.clone();
+            let filesystem = server.filesystem.clone();
             let ignore = ignore.clone();
 
             async move {
-                let mut walker = server
-                    .filesystem
-                    .async_walk_dir(&PathBuf::from(""))
-                    .await?
-                    .with_is_ignored(ignore.into());
-                let mut total_size = 0;
-                let mut total_files = 0;
-                while let Some(Ok((_, path))) = walker.next_entry().await {
-                    let metadata = match server.filesystem.async_symlink_metadata(&path).await {
-                        Ok(metadata) => metadata,
-                        Err(_) => continue,
-                    };
+                tokio::task::spawn_blocking(move || {
+                    let mut walker = filesystem
+                        .walk_dir(Path::new(""))?
+                        .with_is_ignored(ignore.into());
+                    let mut total_size = 0;
+                    let mut total_files = 0;
+                    while let Some(Ok((_, path))) = walker.next_entry() {
+                        let metadata = match filesystem.symlink_metadata(&path) {
+                            Ok(metadata) => metadata,
+                            Err(_) => continue,
+                        };
 
-                    total_size += metadata.len();
-                    if !metadata.is_dir() {
-                        total_files += 1;
+                        total_size += metadata.len();
+                        if !metadata.is_dir() {
+                            total_files += 1;
+                        }
                     }
-                }
 
-                Ok::<_, anyhow::Error>((total_size, total_files))
+                    Ok::<_, anyhow::Error>((total_size, total_files))
+                })
+                .await?
             }
         };
 
@@ -280,6 +282,7 @@ impl BackupExt for ZfsBackup {
         let ignore = Self::get_ignore(&state.config, self.uuid).await?;
 
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         tokio::spawn({
             let config = Arc::clone(&state.config);
@@ -304,12 +307,14 @@ impl BackupExt for ZfsBackup {
                         {
                             Ok(inner) => {
                                 inner.into_inner().shutdown().await.ok();
+                                signal.succeed();
                             }
                             Err(err) => {
                                 tracing::error!(
                                     "failed to create zip archive for zfs backup: {}",
                                     err
                                 );
+                                signal.fail(err);
                             }
                         }
                     }
@@ -331,12 +336,14 @@ impl BackupExt for ZfsBackup {
                         {
                             Ok(inner) => {
                                 inner.into_inner().shutdown().await.ok();
+                                signal.succeed();
                             }
                             Err(err) => {
                                 tracing::error!(
                                     "failed to create tar archive for zfs backup: {}",
                                     err
                                 );
+                                signal.fail(err);
                             }
                         }
                     }
@@ -359,12 +366,14 @@ impl BackupExt for ZfsBackup {
                         {
                             Ok(inner) => {
                                 inner.into_inner().shutdown().await.ok();
+                                signal.succeed();
                             }
                             Err(err) => {
                                 tracing::error!(
                                     "failed to create itaf archive for zfs backup: {}",
                                     err
                                 );
+                                signal.fail(err);
                             }
                         }
                     }

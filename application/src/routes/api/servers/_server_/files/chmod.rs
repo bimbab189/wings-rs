@@ -5,7 +5,7 @@ pub(crate) mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
-        server::filesystem::{cap::FileType, virtualfs::DirectoryWalkFn},
+        server::filesystem::{cap::FileType, virtualfs::AsyncDirectoryWalkFn},
         utils::PortablePermissions,
     };
     use serde::{Deserialize, Serialize};
@@ -62,7 +62,7 @@ pub(crate) mod post {
                 .filesystem
                 .resolve_writable_fs(&server, Path::new(&data.root).join(&file.file))
                 .await;
-            if source == Path::new(&data.root) {
+            if source.as_os_str().is_empty() || source == Path::new(&data.root) {
                 continue;
             }
 
@@ -85,7 +85,7 @@ pub(crate) mod post {
             };
 
             if filesystem
-                .async_set_permissions(&source, PortablePermissions::from_mode(mode))
+                .async_set_permissions(&source, PortablePermissions::from_mode_file(mode))
                 .await
                 .is_ok()
             {
@@ -102,10 +102,10 @@ pub(crate) mod post {
                         walker
                             .run_multithreaded(
                                 state.config.load().system.check_permissions_on_boot_threads,
-                                DirectoryWalkFn::from({
+                                AsyncDirectoryWalkFn::from({
                                     let filesystem = filesystem.clone();
                                     let updated_count_arc = updated_count_arc.clone();
-                                    let mode = PortablePermissions::from_mode(mode);
+                                    let mode = PortablePermissions::from_mode_file(mode);
 
                                     move |file_type: FileType, path: PathBuf| {
                                         let filesystem = filesystem.clone();

@@ -108,7 +108,8 @@ impl H2Transport {
         let (host, port) = parse_host_port(config.base_url())?;
         let authority = format!("{host}:{port}");
 
-        let tls_config = tls::build_client_config(&config.fingerprint).map_err(PbsError::Config)?;
+        let tls_config =
+            tls::build_client_config(config.fingerprint.as_deref()).map_err(PbsError::Config)?;
         let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
 
         let tcp = tokio::net::TcpStream::connect((host.as_str(), port))

@@ -3,7 +3,10 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 pub(crate) mod post {
     use crate::{
-        io::{SafeSliceExt, SafeSliceMutExt},
+        io::{
+            SafeSliceExt, SafeSliceMutExt, UninterruptedReadExt,
+            abort::{AbortGuard, AbortReader},
+        },
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
         server::filesystem::{cap::FileType, virtualfs::DirectoryWalkFn},
@@ -13,78 +16,97 @@ pub(crate) mod post {
     use parking_lot::Mutex;
     use serde::{Deserialize, Serialize};
     use std::{
+        cell::RefCell,
+        io::{BufRead, BufReader, Read},
         path::{Path, PathBuf},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
     };
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use utoipa::ToSchema;
 
-    async fn search_in_stream(
-        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-        substr: &str,
+    thread_local! {
+        static SEARCH_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+
+    struct Needle {
+        finder: memchr::memmem::Finder<'static>,
         case_insensitive: bool,
+    }
+
+    impl Needle {
+        fn new(substr: &str, case_insensitive: bool) -> Self {
+            let bytes = if case_insensitive {
+                substr.to_ascii_lowercase().into_bytes()
+            } else {
+                substr.as_bytes().to_vec()
+            };
+
+            Self {
+                finder: memchr::memmem::Finder::new(&bytes).into_owned(),
+                case_insensitive,
+            }
+        }
+
+        fn len(&self) -> usize {
+            self.finder.needle().len()
+        }
+
+        fn is_empty(&self) -> bool {
+            self.finder.needle().is_empty()
+        }
+    }
+
+    fn search_in_stream(
+        reader: &mut (dyn std::io::Read + Unpin + Send),
+        needle: &Needle,
     ) -> Result<bool, std::io::Error> {
-        if substr.is_empty() {
+        if needle.is_empty() {
             return Ok(true);
         }
 
-        let needle_owned;
-        let needle_bytes = if case_insensitive {
-            needle_owned = substr.to_lowercase();
-            needle_owned.as_bytes()
-        } else {
-            substr.as_bytes()
-        };
+        let needle_len = needle.len();
 
-        let needle_len = needle_bytes.len();
-
-        let mut buffer = vec![0; std::cmp::max(crate::BUFFER_SIZE, needle_len) + needle_len];
-        let mut valid_bytes = 0;
-
-        let finder = if !case_insensitive {
-            Some(memchr::memmem::Finder::new(needle_bytes))
-        } else {
-            None
-        };
-
-        loop {
-            let bytes_read = reader
-                .read(buffer.get_slice_mut(valid_bytes..valid_bytes + crate::BUFFER_SIZE)?)
-                .await?;
-
-            if crate::unlikely(bytes_read == 0) {
-                return Ok(false);
+        SEARCH_SCRATCH.with(|scratch| {
+            let mut buffer = scratch.borrow_mut();
+            let required = std::cmp::max(crate::BUFFER_SIZE, needle_len) + needle_len;
+            if buffer.len() < required {
+                buffer.resize(required, 0);
             }
 
-            let data_end = valid_bytes + bytes_read;
-            let active_slice = buffer.get_slice(..data_end)?;
+            let mut valid_bytes = 0;
 
-            let found = if let Some(f) = &finder {
-                f.find(active_slice).is_some()
-            } else {
-                active_slice.windows(needle_len).any(|window| {
-                    window
-                        .iter()
-                        .zip(needle_bytes.iter())
-                        .all(|(a, b)| a.eq_ignore_ascii_case(b))
-                })
-            };
+            loop {
+                let bytes_read = reader.read_uninterrupted(
+                    buffer.get_slice_mut(valid_bytes..valid_bytes + crate::BUFFER_SIZE)?,
+                )?;
 
-            if crate::unlikely(found) {
-                return Ok(true);
+                if crate::unlikely(bytes_read == 0) {
+                    return Ok(false);
+                }
+
+                let data_end = valid_bytes + bytes_read;
+
+                if needle.case_insensitive {
+                    buffer
+                        .get_slice_mut(valid_bytes..data_end)?
+                        .make_ascii_lowercase();
+                }
+
+                if crate::unlikely(needle.finder.find(buffer.get_slice(..data_end)?).is_some()) {
+                    return Ok(true);
+                }
+
+                if data_end >= needle_len {
+                    let keep_len = needle_len - 1;
+                    buffer.copy_within(data_end - keep_len..data_end, 0);
+                    valid_bytes = keep_len;
+                } else {
+                    valid_bytes = data_end;
+                }
             }
-
-            if data_end >= needle_len {
-                let keep_len = needle_len - 1;
-                buffer.copy_within(data_end - keep_len..data_end, 0);
-                valid_bytes = keep_len;
-            } else {
-                valid_bytes = data_end;
-            }
-        }
+        })
     }
 
     #[derive(ToSchema, Deserialize)]
@@ -189,6 +211,7 @@ pub(crate) mod post {
     ) -> ApiResponseResult {
         let results_count = Arc::new(AtomicUsize::new(0));
         let results = Arc::new(Mutex::new(Vec::new()));
+        let (_guard, listener) = AbortGuard::new();
 
         match data {
             Payload::V1(data) => {
@@ -212,95 +235,116 @@ pub(crate) mod post {
                 } else {
                     Default::default()
                 };
-                let mut walker = filesystem.async_walk_dir(&root, ignored).await?;
 
-                walker
-                    .run_multithreaded(
-                        state.config.load().api.file_search_threads,
-                        DirectoryWalkFn::from({
-                            let filesystem = filesystem.clone();
-                            let results_count = Arc::clone(&results_count);
-                            let results = Arc::clone(&results);
-                            let data = Arc::new(data);
-                            let root = Arc::new(root);
+                let needle = Arc::new(Needle::new(&data.query, true));
 
-                            move |file_type: FileType, path: PathBuf| {
+                tokio::task::spawn_blocking({
+                    let root = Arc::new(root);
+                    let results = Arc::clone(&results);
+                    let listener = listener.clone();
+
+                    move || {
+                        let mut walker = filesystem.walk_dir(&*root, ignored)?;
+
+                        let result = walker.run_multithreaded(
+                            state.config.load().api.file_search_threads,
+                            DirectoryWalkFn::from({
+                                let handle = tokio::runtime::Handle::current();
                                 let filesystem = filesystem.clone();
                                 let results_count = Arc::clone(&results_count);
                                 let results = Arc::clone(&results);
-                                let data = Arc::clone(&data);
-                                let root = Arc::clone(&root);
+                                let data = Arc::new(data);
+                                let needle = Arc::clone(&needle);
+                                let listener = listener.clone();
 
-                                async move {
-                                    if !file_type.is_file()
-                                        || results_count.load(Ordering::Relaxed) >= limit
-                                    {
+                                move |file_type: FileType, path: PathBuf| {
+                                    if crate::unlikely(
+                                        listener.is_aborted()
+                                            || results_count.load(Ordering::Relaxed) >= limit,
+                                    ) {
+                                        return Err(anyhow::anyhow!("walk stopped"));
+                                    }
+
+                                    if !file_type.is_file() {
                                         return Ok(());
                                     }
 
                                     if path.to_string_lossy().contains(data.query.as_str()) {
-                                        let mut entry =
-                                            filesystem.async_directory_entry(&path).await?;
+                                        let mut entry = handle
+                                            .block_on(filesystem.async_directory_entry(&path))?;
                                         entry.name = match path.strip_prefix(&*root) {
                                             Ok(path) => path.to_string_lossy().into(),
                                             Err(_) => return Ok(()),
                                         };
 
-                                        results.lock().push(entry);
-                                        results_count.fetch_add(1, Ordering::Relaxed);
+                                        if results_count.fetch_add(1, Ordering::Relaxed) < limit {
+                                            results.lock().push(entry);
+                                        }
                                         return Ok(());
                                     }
 
-                                    let metadata =
-                                        match filesystem.async_symlink_metadata(&path).await {
-                                            Ok(metadata) => metadata,
-                                            Err(_) => return Ok(()),
-                                        };
+                                    if !data.include_content || !filesystem.is_fast() {
+                                        return Ok(());
+                                    }
 
-                                    if data.include_content
-                                        && metadata.size <= max_size
-                                        && filesystem.is_fast()
-                                    {
-                                        let file_read =
-                                            match filesystem.async_read_file(&path, None).await {
-                                                Ok(reader) => reader,
+                                    let metadata = match filesystem.symlink_metadata(&path) {
+                                        Ok(metadata) => metadata,
+                                        Err(_) => return Ok(()),
+                                    };
+
+                                    if metadata.size > max_size {
+                                        return Ok(());
+                                    }
+
+                                    let file_read = match filesystem.read_file(&path, None) {
+                                        Ok(reader) => reader,
+                                        Err(_) => return Ok(()),
+                                    };
+                                    let reader =
+                                        AbortReader::new(file_read.reader, listener.clone());
+                                    let mut reader = BufReader::new(reader);
+                                    let buffer = match reader.fill_buf() {
+                                        Ok(buffer) => {
+                                            match buffer.get_slice(..buffer.len().min(64)) {
+                                                Ok(slice) => slice.to_vec(),
                                                 Err(_) => return Ok(()),
-                                            };
-                                        let mut reader = BufReader::new(file_read.reader);
-                                        let buffer = match reader.fill_buf().await {
-                                            Ok(buffer) => {
-                                                match buffer.get_slice(..buffer.len().min(64)) {
-                                                    Ok(slice) => slice.to_vec(),
-                                                    Err(_) => return Ok(()),
-                                                }
                                             }
+                                        }
+                                        Err(_) => return Ok(()),
+                                    };
+
+                                    if !crate::utils::is_valid_utf8_slice(&buffer) {
+                                        return Ok(());
+                                    }
+
+                                    if search_in_stream(&mut (&mut reader).take(max_size), &needle)?
+                                    {
+                                        let mut entry = handle.block_on(
+                                            filesystem.async_directory_entry_buffer(&path, &buffer),
+                                        )?;
+                                        entry.name = match path.strip_prefix(&*root) {
+                                            Ok(path) => path.to_string_lossy().into(),
                                             Err(_) => return Ok(()),
                                         };
 
-                                        if !crate::utils::is_valid_utf8_slice(&buffer) {
-                                            return Ok(());
-                                        }
-
-                                        if search_in_stream(&mut reader, &data.query, true).await? {
-                                            let mut entry = filesystem
-                                                .async_directory_entry_buffer(&path, &buffer)
-                                                .await?;
-                                            entry.name = match path.strip_prefix(&*root) {
-                                                Ok(path) => path.to_string_lossy().into(),
-                                                Err(_) => return Ok(()),
-                                            };
-
+                                        if results_count.fetch_add(1, Ordering::Relaxed) < limit {
                                             results.lock().push(entry);
-                                            results_count.fetch_add(1, Ordering::Relaxed);
                                         }
                                     }
 
                                     Ok(())
                                 }
-                            }
-                        }),
-                    )
-                    .await?;
+                            }),
+                        );
+
+                        if results_count.load(Ordering::Relaxed) >= limit {
+                            return Ok(());
+                        }
+
+                        result
+                    }
+                })
+                .await??;
             }
             Payload::V2(data) => {
                 let (root, filesystem) = server
@@ -330,6 +374,10 @@ pub(crate) mod post {
                     }
                 }
 
+                let has_path_includes = data
+                    .path_filter
+                    .as_ref()
+                    .is_some_and(|pf| !pf.include.is_empty());
                 let path_includes = Arc::new(override_builder.build()?);
 
                 let ignored = if filesystem.is_primary_server_fs() {
@@ -337,50 +385,67 @@ pub(crate) mod post {
                 } else {
                     ignore_builder.build()?.into()
                 };
-                let mut walker = filesystem.async_walk_dir(&root, ignored).await?;
 
-                walker
-                    .run_multithreaded(
-                        state.config.load().api.file_search_threads,
-                        DirectoryWalkFn::from({
-                            let filesystem = filesystem.clone();
-                            let results_count = Arc::clone(&results_count);
-                            let results = Arc::clone(&results);
-                            let data = Arc::new(data);
-                            let root = Arc::new(root);
+                let needle = data
+                    .content_filter
+                    .as_ref()
+                    .map(|cf| Arc::new(Needle::new(&cf.query, cf.case_insensitive)));
 
-                            move |file_type: FileType, path: PathBuf| {
+                let per_page = data.per_page;
+
+                tokio::task::spawn_blocking({
+                    let root = Arc::new(root);
+                    let results = Arc::clone(&results);
+                    let listener = listener.clone();
+
+                    move || {
+                        let mut walker = filesystem.walk_dir(&*root, ignored)?;
+
+                        let result = walker.run_multithreaded(
+                            state.config.load().api.file_search_threads,
+                            DirectoryWalkFn::from({
+                                let handle = tokio::runtime::Handle::current();
                                 let filesystem = filesystem.clone();
                                 let results_count = Arc::clone(&results_count);
                                 let results = Arc::clone(&results);
-                                let path_includes = Arc::clone(&path_includes);
-                                let data = Arc::clone(&data);
+                                let data = Arc::new(data);
                                 let root = Arc::clone(&root);
+                                let path_includes = Arc::clone(&path_includes);
+                                let needle = needle.clone();
+                                let listener = listener.clone();
 
-                                async move {
-                                    if !file_type.is_file()
-                                        || results_count.load(Ordering::Relaxed) >= data.per_page
+                                move |file_type: FileType, path: PathBuf| {
+                                    if crate::unlikely(
+                                        listener.is_aborted()
+                                            || results_count.load(Ordering::Relaxed)
+                                                >= data.per_page,
+                                    ) {
+                                        return Err(anyhow::anyhow!("walk stopped"));
+                                    }
+
+                                    if !file_type.is_file() {
+                                        return Ok(());
+                                    }
+
+                                    if has_path_includes
+                                        && !path_includes.matched(&path, false).is_whitelist()
                                     {
                                         return Ok(());
                                     }
 
-                                    if data.path_filter.is_some()
-                                        && !path_includes
-                                            .matched(path.clone(), file_type.is_dir())
-                                            .is_whitelist()
+                                    let size = if data.size_filter.is_some()
+                                        || data.content_filter.is_some()
                                     {
-                                        return Ok(());
-                                    }
-
-                                    let metadata =
-                                        match filesystem.async_symlink_metadata(&path).await {
-                                            Ok(metadata) => metadata,
+                                        match filesystem.symlink_metadata(&path) {
+                                            Ok(metadata) => metadata.size,
                                             Err(_) => return Ok(()),
-                                        };
+                                        }
+                                    } else {
+                                        0
+                                    };
 
                                     if let Some(size_filter) = &data.size_filter
-                                        && !(size_filter.min..size_filter.max)
-                                            .contains(&metadata.size)
+                                        && !(size_filter.min..size_filter.max).contains(&size)
                                     {
                                         return Ok(());
                                     }
@@ -388,16 +453,17 @@ pub(crate) mod post {
                                     let mut local_buffer = [0; 128];
                                     let buffer = if let Some(content_filter) = &data.content_filter
                                         && filesystem.is_fast()
-                                        && (metadata.size <= content_filter.max_search_size
+                                        && (size <= content_filter.max_search_size
                                             || content_filter.include_unmatched)
                                     {
-                                        let file_read =
-                                            match filesystem.async_read_file(&path, None).await {
-                                                Ok(reader) => reader,
-                                                Err(_) => return Ok(()),
-                                            };
-                                        let mut reader = BufReader::new(file_read.reader);
-                                        let buffer = match reader.fill_buf().await {
+                                        let file_read = match filesystem.read_file(&path, None) {
+                                            Ok(reader) => reader,
+                                            Err(_) => return Ok(()),
+                                        };
+                                        let reader =
+                                            AbortReader::new(file_read.reader, listener.clone());
+                                        let mut reader = BufReader::new(reader);
+                                        let buffer = match reader.fill_buf() {
                                             Ok(buffer) => buffer,
                                             Err(_) => return Ok(()),
                                         };
@@ -407,19 +473,19 @@ pub(crate) mod post {
                                             .get_slice_mut(..buf_len)?
                                             .copy_from_slice(buffer.get_slice(..buf_len)?);
 
-                                        if metadata.size <= content_filter.max_search_size {
+                                        if size <= content_filter.max_search_size {
                                             if !crate::utils::is_valid_utf8_slice(
                                                 local_buffer.get_slice(..buf_len)?,
                                             ) {
                                                 return Ok(());
                                             }
 
-                                            if !search_in_stream(
-                                                &mut reader,
-                                                &content_filter.query,
-                                                content_filter.case_insensitive,
-                                            )
-                                            .await?
+                                            if let Some(needle) = &needle
+                                                && !search_in_stream(
+                                                    &mut (&mut reader)
+                                                        .take(content_filter.max_search_size),
+                                                    needle,
+                                                )?
                                             {
                                                 return Ok(());
                                             }
@@ -433,39 +499,50 @@ pub(crate) mod post {
                                     {
                                         return Ok(());
                                     } else if filesystem.is_fast() {
-                                        let mut file_read =
-                                            match filesystem.async_read_file(&path, None).await {
-                                                Ok(reader) => reader,
-                                                Err(_) => return Ok(()),
-                                            };
-                                        let bytes_read =
-                                            match file_read.reader.read(&mut local_buffer).await {
-                                                Ok(bytes_read) => bytes_read,
-                                                Err(_) => return Ok(()),
-                                            };
+                                        let mut file_read = match filesystem.read_file(&path, None)
+                                        {
+                                            Ok(reader) => reader,
+                                            Err(_) => return Ok(()),
+                                        };
+                                        let bytes_read = match file_read
+                                            .reader
+                                            .read_uninterrupted(&mut local_buffer)
+                                        {
+                                            Ok(bytes_read) => bytes_read,
+                                            Err(_) => return Ok(()),
+                                        };
 
                                         local_buffer.get_slice(..bytes_read)?
                                     } else {
                                         &[]
                                     };
 
-                                    let mut entry = filesystem
-                                        .async_directory_entry_buffer(&path, buffer)
-                                        .await?;
+                                    let mut entry = handle.block_on(
+                                        filesystem.async_directory_entry_buffer(&path, buffer),
+                                    )?;
                                     entry.name = match path.strip_prefix(&*root) {
                                         Ok(path) => path.to_string_lossy().into(),
                                         Err(_) => return Ok(()),
                                     };
 
-                                    results.lock().push(entry);
-                                    results_count.fetch_add(1, Ordering::Relaxed);
+                                    if results_count.fetch_add(1, Ordering::Relaxed) < data.per_page
+                                    {
+                                        results.lock().push(entry);
+                                    }
 
                                     Ok(())
                                 }
-                            }
-                        }),
-                    )
-                    .await?;
+                            }),
+                        );
+
+                        if results_count.load(Ordering::Relaxed) >= per_page {
+                            return Ok(());
+                        }
+
+                        result
+                    }
+                })
+                .await??;
             }
         }
 

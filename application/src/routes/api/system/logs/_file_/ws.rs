@@ -23,12 +23,15 @@ pub async fn handle_ws(
     Query(params): Query<Params>,
 ) -> Response {
     ws.on_upgrade(move |socket| async move {
-        if file_path.contains("..") {
+        if !crate::utils::is_single_component_file_name(&file_path) {
             return;
         }
 
         let mut file = match tokio::fs::File::open(
-            std::path::Path::new(&state.config.load().system.log_directory).join(&file_path),
+            state
+                .config
+                .resolve_as_path(|cfg| &cfg.system.log_directory)
+                .join(&file_path),
         )
         .await
         {

@@ -17,9 +17,9 @@ use crate::{
             cap::FileType,
             file::AsyncServerFile,
             virtualfs::{
-                AsyncFileRead, AsyncReadableFileStream, ByteRange, DirectoryListing,
-                DirectoryStreamWalk, DirectoryWalk, FileMetadata, FileRead, IsIgnoredFn,
-                VirtualReadableFilesystem,
+                AsyncDirectoryStreamWalk, AsyncDirectoryWalk, AsyncFileRead,
+                AsyncReadableFileStream, ByteRange, DirectoryListing, DirectoryWalk, FileMetadata,
+                FileRead, IsIgnoredFn, VirtualReadableFilesystem,
             },
         },
     },
@@ -59,13 +59,15 @@ pub struct PbsBackup {
 }
 
 fn build_config(remote: PbsBackupConfiguration) -> PbsConfig {
+    let fingerprint = remote.fingerprint().map(Into::into);
+
     PbsConfig {
         url: remote.url.into(),
         datastore: remote.datastore.into(),
         namespace: remote.namespace.map(Into::into),
         token_id: remote.token_id.into(),
         token_secret: remote.token_secret.into(),
-        fingerprint: remote.fingerprint.into(),
+        fingerprint,
         backup_id_prefix: remote.backup_id_prefix.map(Into::into),
     }
 }
@@ -130,25 +132,27 @@ impl BackupCreateExt for PbsBackup {
         let (archive_reader, archive_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
         let total_task = {
+            let filesystem = server.filesystem.clone();
             let total = Arc::clone(&total);
-            let server = server.clone();
             let ignore = ignore.clone();
 
             async move {
-                let mut walker = server
-                    .filesystem
-                    .async_walk_dir(Path::new(""))
-                    .await?
-                    .with_is_ignored(ignore.into());
-                while let Some(Ok((_, path))) = walker.next_entry().await {
-                    let metadata = match server.filesystem.async_symlink_metadata(&path).await {
-                        Ok(metadata) => metadata,
-                        Err(_) => continue,
-                    };
-                    total.fetch_add(metadata.len(), Ordering::Relaxed);
-                }
+                tokio::task::spawn_blocking(move || {
+                    let mut walker = filesystem
+                        .walk_dir(Path::new(""))?
+                        .with_is_ignored(ignore.into());
+                    while let Some(Ok((_, path))) = walker.next_entry() {
+                        let metadata = match filesystem.symlink_metadata(&path) {
+                            Ok(metadata) => metadata,
+                            Err(_) => continue,
+                        };
 
-                Ok::<_, anyhow::Error>(())
+                        total.fetch_add(metadata.len(), Ordering::Relaxed);
+                    }
+
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await?
             }
         };
 
@@ -198,11 +202,20 @@ impl BackupCreateExt for PbsBackup {
             let config = config.clone();
             let backup_id = backup_id.clone();
             let server_uuid = server.uuid;
+            let compression_threads = server
+                .app_state
+                .config
+                .load()
+                .system
+                .backups
+                .pbs
+                .create_threads;
 
             async move {
                 let mut writer = PbsBackupWriter::connect(&config, &backup_id, backup_time).await?;
 
-                let known_chunks = match writer.previous_archive_digests(ARCHIVE_NAME).await {
+                let result = async {
+                    let known_chunks = match writer.previous_archive_digests(ARCHIVE_NAME).await {
                     Ok(digests) => digests,
                     Err(err) => {
                         tracing::debug!(
@@ -213,7 +226,9 @@ impl BackupCreateExt for PbsBackup {
                     }
                 };
 
-                let archive = writer.upload_archive(archive_reader, known_chunks).await?;
+                let archive = writer
+                    .upload_archive(archive_reader, known_chunks, compression_threads)
+                    .await?;
 
                 let catalog = catalog_rx
                     .await
@@ -223,6 +238,7 @@ impl BackupCreateExt for PbsBackup {
                         pbs_client::catalog::CATALOG_NAME,
                         std::io::Cursor::new(catalog),
                         Default::default(),
+                        compression_threads,
                     )
                     .await?;
 
@@ -248,9 +264,14 @@ impl BackupCreateExt for PbsBackup {
                 manifest.add_file(archive.file);
                 manifest.add_file(catalog_file.file);
                 manifest.add_file(meta_file);
-                writer.finish(&manifest).await?;
+                    writer.finish(&manifest).await?;
 
-                Ok::<_, anyhow::Error>((archive.size, checksum))
+                    Ok::<_, anyhow::Error>((archive.size, checksum))
+                }
+                .await;
+
+                writer.close().await;
+                result
             }
         };
 
@@ -297,8 +318,12 @@ impl BackupExt for PbsBackup {
         let (pxar_reader, mut pxar_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
+        let download_concurrency = state.config.load().system.backups.pbs.download_concurrency;
         tokio::spawn(async move {
-            if let Err(err) = session.reassemble_archive(&mut pxar_writer, None).await {
+            if let Err(err) = session
+                .reassemble_archive(&mut pxar_writer, None, download_concurrency)
+                .await
+            {
                 tracing::error!("failed to reassemble PBS archive for download: {:?}", err);
             }
             let _ = pxar_writer.shutdown().await;
@@ -586,7 +611,18 @@ impl BackupExt for PbsBackup {
         let fetch_task = async {
             let mut pxar_writer = pxar_writer;
             reader
-                .reassemble_archive(&mut pxar_writer, progress.clone_bytes())
+                .reassemble_archive(
+                    &mut pxar_writer,
+                    progress.clone_bytes(),
+                    server
+                        .app_state
+                        .config
+                        .load()
+                        .system
+                        .backups
+                        .pbs
+                        .download_concurrency,
+                )
                 .await?;
             pxar_writer.shutdown().await?;
 
@@ -632,7 +668,7 @@ impl BackupExt for PbsBackup {
                             .filesystem
                             .async_set_permissions(
                                 path.as_path(),
-                                PortablePermissions::from_mode(mode),
+                                PortablePermissions::from_mode_dir(mode),
                             )
                             .await?;
 
@@ -659,7 +695,7 @@ impl BackupExt for PbsBackup {
                         let mut writer = AsyncServerFile::new(
                             server.clone(),
                             &path,
-                            Some(PortablePermissions::from_mode(mode)),
+                            Some(PortablePermissions::from_mode_file(mode)),
                             Some(mtime),
                         )
                         .await?;
@@ -954,6 +990,7 @@ impl PbsVirtualFilesystem {
             directory: true,
             file: false,
             symlink: false,
+            r#virtual: true,
             mime: MimeCacheValue::directory().mime,
             modified: node.mtime,
             created: chrono::DateTime::from_timestamp(0, 0).unwrap_or_default(),
@@ -988,6 +1025,7 @@ impl PbsVirtualFilesystem {
             directory: false,
             file: meta.file_type.is_file(),
             symlink: meta.file_type.is_symlink(),
+            r#virtual: true,
             mime: detected_mime.mime,
             modified: meta.mtime,
             created: chrono::DateTime::from_timestamp(0, 0).unwrap_or_default(),
@@ -1053,7 +1091,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
         if path == Path::new("") || path == Path::new("/") {
             return Ok(FileMetadata {
                 file_type: FileType::Dir,
-                permissions: PortablePermissions::from_mode(0o755),
+                permissions: PortablePermissions::from_mode_dir(0o755),
                 size: 0,
                 modified: None,
                 created: None,
@@ -1064,7 +1102,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             let mode = if node.mode != 0 { node.mode } else { 0o755 };
             return Ok(FileMetadata {
                 file_type: FileType::Dir,
-                permissions: PortablePermissions::from_mode(mode),
+                permissions: PortablePermissions::from_mode_dir(mode),
                 size: 0,
                 modified: node
                     .has_explicit_entry
@@ -1076,7 +1114,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
         if let Some(meta) = self.tree.lookup_file(path) {
             return Ok(FileMetadata {
                 file_type: meta.file_type,
-                permissions: PortablePermissions::from_mode(meta.mode),
+                permissions: PortablePermissions::from_mode_file(meta.mode),
                 size: meta.size,
                 modified: Some(mtime_to_system_time(meta.mtime)),
                 created: None,
@@ -1254,7 +1292,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
         })
     }
 
-    async fn async_walk_dir<'a>(
+    fn walk_dir<'a>(
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
@@ -1290,8 +1328,54 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             items: std::vec::IntoIter<(FileType, PathBuf)>,
         }
 
-        #[async_trait::async_trait]
         impl DirectoryWalk for TreeWalk {
+            fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
+                self.items.next().map(Ok)
+            }
+        }
+
+        Ok(Box::new(TreeWalk {
+            items: flat.into_iter(),
+        }))
+    }
+    async fn async_walk_dir<'a>(
+        &'a self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        is_ignored: IsIgnoredFn,
+    ) -> Result<Box<dyn AsyncDirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
+        let mut flat: Vec<(FileType, PathBuf)> = Vec::new();
+
+        if let Some(start) = self.tree.lookup_dir(path.as_ref()) {
+            fn walk(
+                node: &PbsTreeNode,
+                current_path: &Path,
+                is_ignored: &IsIgnoredFn,
+                out: &mut Vec<(FileType, PathBuf)>,
+            ) {
+                for (name, meta) in node.files.iter() {
+                    let child_path = current_path.join(name.as_str());
+                    if let Some(filtered) = (is_ignored)(meta.file_type, child_path) {
+                        out.push((meta.file_type, filtered));
+                    }
+                }
+                for (name, child) in node.dirs.iter() {
+                    let child_path = current_path.join(name.as_str());
+                    if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()) {
+                        out.push((FileType::Dir, filtered));
+                    }
+                    walk(child, &child_path, is_ignored, out);
+                }
+            }
+
+            walk(start, path.as_ref(), &is_ignored, &mut flat);
+        }
+
+        struct TreeWalk {
+            items: std::vec::IntoIter<(FileType, PathBuf)>,
+        }
+
+        #[async_trait::async_trait]
+        impl AsyncDirectoryWalk for TreeWalk {
             async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
                 self.items.next().map(Ok)
             }
@@ -1306,7 +1390,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
-    ) -> Result<Box<dyn DirectoryStreamWalk + Send + Sync + 'a>, anyhow::Error> {
+    ) -> Result<Box<dyn AsyncDirectoryStreamWalk + Send + Sync + 'a>, anyhow::Error> {
         struct PbsDirStreamWalk {
             entry_wanted_notifier: Arc<tokio::sync::Notify>,
             entry_channel_rx: tokio::sync::mpsc::Receiver<
@@ -1315,7 +1399,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
         }
 
         #[async_trait::async_trait]
-        impl DirectoryStreamWalk for PbsDirStreamWalk {
+        impl AsyncDirectoryStreamWalk for PbsDirStreamWalk {
             fn supports_multithreading(&self) -> bool {
                 false
             }
@@ -1486,7 +1570,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
         let base_path = path.as_ref().to_path_buf();
         let node = match self.tree.lookup_dir(&base_path) {
             Some(node) => node,
@@ -1510,10 +1594,11 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
             .api
             .file_compression_threads;
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = SyncIoBridge::new(writer);
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
@@ -1572,7 +1657,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
                 });
             }
             f if f.is_tar() => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = CompressionWriter::new(
                         SyncIoBridge::new(writer),
                         f.compression_format(),
@@ -1625,7 +1710,7 @@ impl VirtualReadableFilesystem for PbsVirtualFilesystem {
                 });
             }
             f if f.is_itaf() => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = CompressionWriter::new(
                         SyncIoBridge::new(writer),
                         f.compression_format(),

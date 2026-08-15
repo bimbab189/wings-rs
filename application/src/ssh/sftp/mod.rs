@@ -15,8 +15,12 @@ use russh_sftp::protocol::{
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 mod extended;
@@ -24,13 +28,11 @@ mod extended;
 pub struct FileHandle {
     _guard: super::limiter::SshLimiterHandleGuard,
     path: PathBuf,
-    path_components: Vec<String>,
     writable: bool,
     changed: bool,
     original_content: Option<String>,
 
-    file: Arc<Mutex<std::fs::File>>,
-    known_size: u64,
+    file: Arc<Mutex<crate::server::filesystem::file::ServerFile>>,
     append: bool,
 
     diff_track: bool,
@@ -40,11 +42,11 @@ pub struct FileHandle {
 
 pub struct DirHandle {
     _guard: super::limiter::SshLimiterHandleGuard,
-    path: PathBuf,
+    path: Arc<Path>,
 
-    dir: crate::server::filesystem::cap::AsyncReadDir,
+    dir: Arc<Mutex<crate::server::filesystem::cap::ReadDir>>,
 
-    consumed: u64,
+    consumed: Arc<AtomicU64>,
 }
 
 pub enum ServerHandle {
@@ -56,8 +58,8 @@ impl ServerHandle {
     #[inline]
     fn path(&self) -> &Path {
         match self {
-            ServerHandle::File(handle) => handle.path.as_path(),
-            ServerHandle::Dir(handle) => handle.path.as_path(),
+            ServerHandle::File(handle) => &handle.path,
+            ServerHandle::Dir(handle) => &handle.path,
         }
     }
 }
@@ -94,15 +96,15 @@ impl SftpSession {
                     .unwrap_or_default()
                     .as_secs() as u32,
             ),
-            permissions: Some(PortablePermissions::from(metadata.permissions()).mode),
+            permissions: Some(PortablePermissions::from(metadata.permissions()).mode() as u32),
             ..Default::default()
         };
 
         #[cfg(unix)]
         {
-            match rustix::fs::FileType::from_raw_mode(
-                PortablePermissions::from(metadata.permissions()).mode,
-            ) {
+            use cap_std::fs::MetadataExt;
+
+            match rustix::fs::FileType::from_raw_mode(metadata.mode() as _) {
                 rustix::fs::FileType::RegularFile => attrs.set_regular(true),
                 rustix::fs::FileType::Directory => attrs.set_dir(true),
                 rustix::fs::FileType::Symlink => attrs.set_symlink(true),
@@ -113,9 +115,7 @@ impl SftpSession {
             }
 
             if let Some(target_metadata) = target_metadata {
-                match rustix::fs::FileType::from_raw_mode(
-                    PortablePermissions::from(target_metadata.permissions()).mode,
-                ) {
+                match rustix::fs::FileType::from_raw_mode(target_metadata.mode() as _) {
                     rustix::fs::FileType::RegularFile => attrs.set_regular(true),
                     rustix::fs::FileType::Directory => attrs.set_dir(true),
                     rustix::fs::FileType::BlockDevice => attrs.set_block(true),
@@ -482,9 +482,16 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::NoSuchFile);
         }
 
-        let dir = match self.server.filesystem.async_read_dir(&path).await {
-            Ok(dir) => dir,
-            Err(_) => return Err(StatusCode::NoSuchFile),
+        let dir = match tokio::task::spawn_blocking({
+            let server = self.server.clone();
+            let path = path.clone();
+
+            move || server.filesystem.read_dir(path)
+        })
+        .await
+        {
+            Ok(Ok(dir)) => dir,
+            _ => return Err(StatusCode::NoSuchFile),
         };
 
         let handle = self.next_handle_id();
@@ -496,9 +503,9 @@ impl russh_sftp::server::Handler for SftpSession {
                     .limiter
                     .open_handle()
                     .map_err(|_| StatusCode::Failure)?,
-                path,
-                dir,
-                consumed: 0,
+                path: Arc::from(path),
+                dir: Arc::new(Mutex::new(dir)),
+                consumed: Arc::new(AtomicU64::new(0)),
             }),
         );
 
@@ -518,62 +525,74 @@ impl russh_sftp::server::Handler for SftpSession {
             _ => return Err(StatusCode::NoSuchFile),
         };
 
-        if handle.consumed >= self.state.config.load().system.sftp.directory_entry_limit {
+        if handle.consumed.load(Ordering::Relaxed)
+            >= self.state.config.load().system.sftp.directory_entry_limit
+        {
             return Err(StatusCode::Eof);
         }
 
-        let mut files = Vec::new();
+        let files = tokio::task::spawn_blocking({
+            let server = self.server.clone();
+            let user_uuid = self.user_uuid;
+            let state = self.state.clone();
+            let path = Arc::clone(&handle.path);
+            let dir = Arc::clone(&handle.dir);
+            let consumed = Arc::clone(&handle.consumed);
 
-        loop {
-            let file = match handle.dir.next_entry().await {
-                Some(Ok((_, file))) => file,
-                _ => {
-                    if files.is_empty() {
-                        return Err(StatusCode::Eof);
+            move || {
+                let mut files = Vec::new();
+                let mut dir = dir.lock();
+
+                loop {
+                    let file = match dir.next_entry() {
+                        Some(Ok((_, file))) => file,
+                        _ => {
+                            if files.is_empty() {
+                                return Err(StatusCode::Eof);
+                            }
+
+                            break;
+                        }
+                    };
+
+                    let path = path.join(file);
+                    let metadata = match server.filesystem.symlink_metadata(&path) {
+                        Ok(metadata) => metadata,
+                        Err(_) => continue,
+                    };
+
+                    if Self::is_ignored_server(&server, user_uuid, &path, metadata.is_dir()) {
+                        continue;
                     }
 
-                    break;
+                    let target_metadata = if metadata.is_symlink() {
+                        server.filesystem.metadata(&path).ok()
+                    } else {
+                        None
+                    };
+
+                    files.push(Self::convert_entry(&path, metadata, target_metadata));
+                    let prev_consumed = consumed.fetch_add(1, Ordering::Relaxed);
+
+                    if prev_consumed + 1 >= state.config.load().system.sftp.directory_entry_limit
+                        || files.len()
+                            >= state.config.load().system.sftp.directory_entry_send_amount
+                    {
+                        tracing::debug!(
+                            "{} entries sent early in sftp readdir ({} total)",
+                            files.len(),
+                            prev_consumed + 1,
+                        );
+
+                        break;
+                    }
                 }
-            };
 
-            let path = handle.path.join(file);
-            let metadata = match self.server.filesystem.async_symlink_metadata(&path).await {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
-            };
-
-            if Self::is_ignored_server(&self.server, self.user_uuid, &path, metadata.is_dir()) {
-                continue;
+                Ok::<_, StatusCode>(files)
             }
-
-            let target_metadata = if metadata.is_symlink() {
-                self.server.filesystem.async_metadata(&path).await.ok()
-            } else {
-                None
-            };
-
-            files.push(Self::convert_entry(&path, metadata, target_metadata));
-            handle.consumed += 1;
-
-            if handle.consumed >= self.state.config.load().system.sftp.directory_entry_limit
-                || files.len()
-                    >= self
-                        .state
-                        .config
-                        .load()
-                        .system
-                        .sftp
-                        .directory_entry_send_amount
-            {
-                tracing::debug!(
-                    "{} entries sent early in sftp readdir ({} total)",
-                    files.len(),
-                    handle.consumed,
-                );
-
-                break;
-            }
-        }
+        })
+        .await
+        .map_err(|_| StatusCode::Failure)??;
 
         Ok(Name { id, files })
     }
@@ -767,7 +786,7 @@ impl russh_sftp::server::Handler for SftpSession {
             && self
                 .server
                 .filesystem
-                .async_set_permissions(&path, PortablePermissions::from_mode(permissions))
+                .async_set_permissions(&path, PortablePermissions::from_mode_dir(permissions))
                 .await
                 .is_err()
         {
@@ -865,7 +884,7 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::NoSuchFile);
         }
 
-        let new_path = self.server.filesystem.relative_path(&new_path);
+        let new_path = self.server.filesystem.diff_key(&new_path).await;
         let new_key = new_path.to_string_lossy().to_string();
         let replaced = match self
             .server
@@ -967,9 +986,14 @@ impl russh_sftp::server::Handler for SftpSession {
         }
 
         if let Some(permissions) = attrs.permissions {
+            let permissions = if metadata.is_dir() {
+                PortablePermissions::from_mode_dir(permissions)
+            } else {
+                PortablePermissions::from_mode_file(permissions)
+            };
             self.server
                 .filesystem
-                .async_set_permissions(&path, PortablePermissions::from_mode(permissions))
+                .async_set_permissions(&path, permissions)
                 .await
                 .map_err(|_| StatusCode::Failure)?;
         }
@@ -1246,10 +1270,7 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::PermissionDenied);
         }
 
-        let path = match self.server.filesystem.async_canonicalize(&filename).await {
-            Ok(path) => path,
-            Err(_) => PathBuf::from(filename.strip_prefix("/").unwrap_or(&filename)),
-        };
+        let path = self.server.filesystem.diff_key(Path::new(&filename)).await;
 
         let pre_size = match self.server.filesystem.async_symlink_metadata(&path).await {
             Ok(metadata) => {
@@ -1373,7 +1394,22 @@ impl russh_sftp::server::Handler for SftpSession {
                     open_options.truncate(true);
                 }
 
-                server.filesystem.open_with(path, open_options)
+                let file = server.filesystem.open_with(&path, open_options)?;
+                let initial_size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+
+                let mut file = crate::server::filesystem::file::ServerFile::new_file(
+                    server.clone(),
+                    &path,
+                    file,
+                    initial_size,
+                )
+                .map_err(std::io::Error::other)?;
+
+                if pflags.contains(OpenFlags::APPEND) {
+                    file.seek(SeekFrom::End(0))?;
+                }
+
+                Ok::<_, std::io::Error>(file)
             }
         })
         .await
@@ -1421,16 +1457,10 @@ impl russh_sftp::server::Handler for SftpSession {
                     .open_handle()
                     .map_err(|_| StatusCode::Failure)?,
                 path,
-                path_components,
                 writable,
                 changed: false,
                 original_content,
                 file: Arc::new(Mutex::new(file)),
-                known_size: if pflags.contains(OpenFlags::TRUNCATE) {
-                    0
-                } else {
-                    pre_size.unwrap_or(0)
-                },
                 append: pflags.contains(OpenFlags::APPEND),
                 diff_track,
                 diff_before,
@@ -1503,71 +1533,32 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::PermissionDenied);
         }
 
-        let end = offset.saturating_add(data.len() as u64);
-        let delta = if handle.append {
-            data.len() as i64
-        } else {
-            end.saturating_sub(handle.known_size) as i64
-        };
-
-        if !self
-            .server
-            .filesystem
-            .async_allocate_in_path_iterator(
-                handle
-                    .path_components
-                    .get(0..handle.path_components.len() - 1)
-                    .ok_or(StatusCode::Failure)?,
-                delta,
-                false,
-            )
-            .await
+        if offset
+            .checked_add(data.len() as u64)
+            .is_none_or(|end| end > i64::MAX as u64)
         {
-            return Err(StatusCode::Failure);
+            return Err(StatusCode::BadMessage);
         }
 
-        match tokio::task::spawn_blocking({
+        tokio::task::spawn_blocking({
             let file = Arc::clone(&handle.file);
+            let append = handle.append;
 
-            move || file.lock().write_all_at(offset, &data)
+            move || {
+                let mut file = file.lock();
+
+                if append {
+                    file.write_all(&data)
+                } else {
+                    file.write_all_at(offset, &data)
+                }
+            }
         })
         .await
-        {
-            Ok(Ok(())) => (),
-            Ok(Err(_)) => {
-                self.server
-                    .filesystem
-                    .async_allocate_in_path_iterator(
-                        handle
-                            .path_components
-                            .get(0..handle.path_components.len() - 1)
-                            .ok_or(StatusCode::Failure)?,
-                        -delta,
-                        true,
-                    )
-                    .await;
-                return Err(StatusCode::Failure);
-            }
-            Err(_) => {
-                self.server
-                    .filesystem
-                    .async_allocate_in_path_iterator(
-                        handle
-                            .path_components
-                            .get(0..handle.path_components.len() - 1)
-                            .ok_or(StatusCode::Failure)?,
-                        -delta,
-                        true,
-                    )
-                    .await;
-                return Err(StatusCode::Failure);
-            }
-        }
+        .map_err(|_| StatusCode::Failure)?
+        .map_err(|_| StatusCode::Failure)?;
 
         handle.diff_dirty = true;
-        if !handle.append {
-            handle.known_size = handle.known_size.max(end);
-        }
 
         handle.changed = true;
 

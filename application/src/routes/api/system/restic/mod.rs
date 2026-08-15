@@ -20,13 +20,6 @@ pub struct ResticTaskResult {
     stderr: compact_str::CompactString,
 }
 
-fn get_restic_cache_dir(config: &crate::config::Config) -> compact_str::CompactString {
-    compact_str::format_compact!(
-        "{}/.cache/restic",
-        config.load().system.backup_directory.trim_end_matches('/')
-    )
-}
-
 fn build_restic_command(
     config: &crate::config::Config,
     configuration: &ResticBackupConfiguration,
@@ -38,7 +31,7 @@ fn build_restic_command(
         .arg("--repo")
         .arg(&configuration.repository)
         .arg("--cache-dir")
-        .arg(get_restic_cache_dir(config));
+        .arg(crate::server::backup::adapters::restic::ResticBackup::get_restic_cache_dir(config));
 
     if let Some(password_file) = &configuration.password_file {
         command.arg("--password-file").arg(password_file);
@@ -85,13 +78,13 @@ async fn execute_restic_command(mut command: Command, operation: &'static str) -
 }
 
 fn system_restic_configuration(config: &crate::config::Config) -> Arc<ResticBackupConfiguration> {
-    let config_ref = config.load();
+    let cfg = config.load();
 
     Arc::new(ResticBackupConfiguration {
-        repository: config_ref.system.backups.restic.repository.clone(),
-        password_file: Some(config_ref.system.backups.restic.password_file.clone()),
-        retry_lock_seconds: config_ref.system.backups.restic.retry_lock_seconds,
-        environment: config_ref.system.backups.restic.environment.clone(),
+        repository: cfg.system.backups.restic.repository.as_str(&cfg).into(),
+        password_file: Some(cfg.system.backups.restic.password_file.as_str(&cfg).into()),
+        retry_lock_seconds: cfg.system.backups.restic.retry_lock_seconds,
+        environment: cfg.system.backups.restic.environment.clone(),
     })
 }
 

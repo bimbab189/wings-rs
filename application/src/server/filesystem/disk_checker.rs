@@ -1,5 +1,5 @@
 use super::usage::{DiskUsage, SpaceDelta};
-use crate::utils::PortableSizeExt;
+use crate::{server::resources::ResourceUsageWatchExt, utils::PortableSizeExt};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -23,6 +23,7 @@ pub struct DiskCheckerContext {
     pub server_notifier: super::inotify::InotifyServerNotifier,
     pub use_server_notifier: Arc<AtomicBool>,
     pub last_disk_check: Arc<AtomicU64>,
+    pub resource_usage: tokio::sync::watch::Sender<crate::server::resources::ResourceUsage>,
 }
 
 pub async fn run(ctx: DiskCheckerContext) {
@@ -38,6 +39,7 @@ pub async fn run(ctx: DiskCheckerContext) {
         server_notifier,
         use_server_notifier,
         last_disk_check,
+        resource_usage,
     } = ctx;
 
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -46,8 +48,8 @@ pub async fn run(ctx: DiskCheckerContext) {
     let mut force_scan = false;
 
     loop {
-        let permit = config
-            .disk_check_concurrency_semaphore
+        let semaphore = config.disk_check_concurrency_semaphore.load();
+        let permit = semaphore
             .acquire()
             .await
             .expect("failed to acquire disk check concurrency semaphore");
@@ -57,6 +59,7 @@ pub async fn run(ctx: DiskCheckerContext) {
             let disk_usage = disk_usage.clone();
             let disk_usage_cached_logical = disk_usage_cached_logical.clone();
             let disk_usage_cached_physical = disk_usage_cached_physical.clone();
+            let resource_usage = resource_usage.clone();
 
             async move {
                 tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
@@ -189,6 +192,7 @@ pub async fn run(ctx: DiskCheckerContext) {
                                     .store(root_space.get_logical(), Ordering::Relaxed);
                                 disk_usage_cached_physical
                                     .store(root_space.get_physical(), Ordering::Relaxed);
+                                resource_usage.publish_disk_usage(root_space.get_physical());
                             }
 
                             return Ok(());
@@ -252,6 +256,7 @@ pub async fn run(ctx: DiskCheckerContext) {
                         std::mem::replace(&mut *disk_usage.blocking_write(), tmp_disk_usage);
                     disk_usage_cached_logical.store(total_size, Ordering::Relaxed);
                     disk_usage_cached_physical.store(total_size_physical, Ordering::Relaxed);
+                    resource_usage.publish_disk_usage(total_size_physical);
                     drop(old_disk_usage);
 
                     tracing::debug!(
@@ -273,23 +278,24 @@ pub async fn run(ctx: DiskCheckerContext) {
                 "skipping disk usage check due to server state inactivity"
             );
         } else {
-            let paths_to_scan = if full_disk_check_counter
-                % config.load().system.full_disk_check_every
-                == 0
-            {
-                None
-            } else if use_server_notifier.load(Ordering::Relaxed) && server_notifier.is_trusted() {
-                let paths = server_notifier.take_modified_paths();
+            let paths_to_scan =
+                if full_disk_check_counter % config.load().system.full_disk_check_every == 0 {
+                    None
+                } else if use_server_notifier.load(Ordering::Relaxed)
+                    && server_notifier.is_trusted()
+                    && !force_scan
+                {
+                    let paths = server_notifier.take_modified_paths();
 
-                tracing::debug!(
-                    path = %cap_filesystem.base_path.display(),
-                    "checking disk usage for {} modified paths",
-                    paths.len()
-                );
-                Some(paths)
-            } else {
-                None
-            };
+                    tracing::debug!(
+                        path = %cap_filesystem.base_path.display(),
+                        "checking disk usage for {} modified paths",
+                        paths.len()
+                    );
+                    Some(paths)
+                } else {
+                    None
+                };
 
             full_disk_check_counter += 1;
 

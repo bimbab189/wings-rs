@@ -67,4 +67,20 @@ impl ServerExecutor for NoopExecutor {
     ) -> Result<(Arc<dyn ProcessHandle>, StatusReceiver), anyhow::Error> {
         Self::unsupported()
     }
+
+    async fn resolve_internal_target(
+        &self,
+        _server: &crate::server::Server,
+        _port: u16,
+    ) -> Result<Option<std::net::SocketAddr>, anyhow::Error> {
+        Self::unsupported()
+    }
+
+    async fn used_ports(
+        &self,
+        ips: &[std::net::IpAddr],
+    ) -> Result<std::collections::HashMap<std::net::IpAddr, Vec<super::UsedPort>>, anyhow::Error>
+    {
+        Ok(ips.iter().map(|ip| (*ip, Vec::new())).collect())
+    }
 }

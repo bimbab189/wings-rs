@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
 pub const FUSEQUOTA_VERSION: &str = env!("FUSEQUOTA_VERSION");
@@ -9,11 +9,9 @@ pub async fn get_fusequota_bin_path(
 ) -> Result<PathBuf, std::io::Error> {
     pub static BIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    let config = config.load();
-    let tmp_dir = Path::new(&config.system.tmp_directory);
+    let tmp_dir = config.resolve_as_path(|cfg| &cfg.system.tmp_directory);
     let bin_path = tmp_dir.join(format!("wings_fusequota_bin_{}", FUSEQUOTA_VERSION));
     let tmp_bin_path = tmp_dir.join(format!("wings_fusequota_bin_{}_tmp", FUSEQUOTA_VERSION));
-    drop(config);
 
     if tokio::fs::metadata(&bin_path).await.is_err() {
         let _lock = BIN_LOCK.lock().await;

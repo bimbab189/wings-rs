@@ -9,6 +9,7 @@ use crate::{
         },
     },
 };
+use compact_str::ToCompactString;
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -31,9 +32,10 @@ pub struct BtrfsSendStream {
 impl BtrfsBackup {
     #[inline]
     pub fn get_backup_path(config: &crate::config::Config, uuid: uuid::Uuid) -> PathBuf {
-        Path::new(&config.load().system.backup_directory)
+        config
+            .resolve_as_path(|cfg| &cfg.system.backup_directory)
             .join("btrfs")
-            .join(uuid.to_string())
+            .join(uuid.to_compact_string())
     }
 
     #[inline]
@@ -120,7 +122,9 @@ impl BtrfsBackup {
     }
 
     pub async fn cleanup_stale_btrfs_send_snapshots(config: &crate::config::Config) {
-        let btrfs_dir = Path::new(&config.load().system.backup_directory).join("btrfs");
+        let btrfs_dir = config
+            .resolve_as_path(|cfg| &cfg.system.backup_directory)
+            .join("btrfs");
 
         let mut backups = match tokio::fs::read_dir(&btrfs_dir).await {
             Ok(backups) => backups,
@@ -198,7 +202,7 @@ impl BtrfsBackup {
         state: &crate::routes::State,
         archive_format: StreamableArchiveFormat,
         compression_level: crate::io::compression::CompressionLevel,
-    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
         let subvolume_path = Self::get_subvolume_path(&state.config, self.uuid);
 
         if tokio::fs::metadata(&subvolume_path).await.is_err() {
@@ -215,6 +219,7 @@ impl BtrfsBackup {
         let threads = state.config.load().api.file_compression_threads;
 
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         tokio::spawn(async move {
             let writer = tokio_util::io::SyncIoBridge::new(writer);
@@ -271,9 +276,11 @@ impl BtrfsBackup {
             match result {
                 Ok(mut inner) => {
                     inner.shutdown().await.ok();
+                    signal.succeed();
                 }
                 Err(err) => {
                     tracing::error!("failed to create archive for btrfs backup: {err}");
+                    signal.fail(err);
                 }
             }
         });
@@ -333,30 +340,31 @@ impl BackupCreateExt for BtrfsBackup {
         tokio::fs::create_dir_all(Self::get_backup_path(&server.app_state.config, uuid)).await?;
 
         let total_task = {
-            let server = server.clone();
+            let filesystem = server.filesystem.clone();
             let ignore = ignore.clone();
 
             async move {
-                let mut walker = server
-                    .filesystem
-                    .async_walk_dir(&PathBuf::from(""))
-                    .await?
-                    .with_is_ignored(ignore.into());
-                let mut total_size = 0;
-                let mut total_files = 0;
-                while let Some(Ok((_, path))) = walker.next_entry().await {
-                    let metadata = match server.filesystem.async_symlink_metadata(&path).await {
-                        Ok(metadata) => metadata,
-                        Err(_) => continue,
-                    };
+                tokio::task::spawn_blocking(move || {
+                    let mut walker = filesystem
+                        .walk_dir(Path::new(""))?
+                        .with_is_ignored(ignore.into());
+                    let mut total_size = 0;
+                    let mut total_files = 0;
+                    while let Some(Ok((_, path))) = walker.next_entry() {
+                        let metadata = match filesystem.symlink_metadata(&path) {
+                            Ok(metadata) => metadata,
+                            Err(_) => continue,
+                        };
 
-                    total_size += metadata.len();
-                    if !metadata.is_dir() {
-                        total_files += 1;
+                        total_size += metadata.len();
+                        if !metadata.is_dir() {
+                            total_files += 1;
+                        }
                     }
-                }
 
-                Ok::<_, anyhow::Error>((total_size, total_files))
+                    Ok::<_, anyhow::Error>((total_size, total_files))
+                })
+                .await?
             }
         };
 

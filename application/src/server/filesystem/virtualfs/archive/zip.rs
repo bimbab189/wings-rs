@@ -13,8 +13,8 @@ use crate::{
         encode_mode,
         usage::SpaceDelta,
         virtualfs::{
-            AsyncFileRead, AsyncReadableFileStream, ByteRange, DirectoryListing,
-            DirectoryStreamWalk, DirectoryWalk, FileMetadata, FileRead, IsIgnoredFn,
+            AsyncDirectoryStreamWalk, AsyncDirectoryWalk, AsyncFileRead, AsyncReadableFileStream,
+            ByteRange, DirectoryListing, DirectoryWalk, FileMetadata, FileRead, IsIgnoredFn,
             VirtualReadableFilesystem,
         },
     },
@@ -212,6 +212,7 @@ impl VirtualZipArchive {
             directory: true,
             file: false,
             symlink: false,
+            r#virtual: true,
             mime: detected_mime.mime,
             modified: Default::default(),
             created: *archive_created,
@@ -280,6 +281,7 @@ impl VirtualZipArchive {
             directory: entry.is_dir(),
             file: entry.is_file(),
             symlink: entry.is_symlink(),
+            r#virtual: true,
             mime: detected_mime.mime,
             modified: crate::server::filesystem::archive::zip_entry_get_modified_time(&entry)
                 .map(|dt| dt.into())
@@ -315,7 +317,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         if path_ref == Path::new("") || path_ref == Path::new("/") {
             return Ok(FileMetadata {
                 file_type: FileType::Dir,
-                permissions: PortablePermissions::from_mode(0o755),
+                permissions: PortablePermissions::from_mode_dir(0o755),
                 size: 0,
                 modified: None,
                 created: None,
@@ -328,11 +330,15 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
             Ok(entry) => Ok(FileMetadata {
                 file_type: Self::zip_entry_to_file_type(&entry),
                 permissions: if let Some(mode) = entry.unix_mode() {
-                    PortablePermissions::from_mode(mode)
+                    if entry.is_dir() {
+                        PortablePermissions::from_mode_dir(mode)
+                    } else {
+                        PortablePermissions::from_mode_file(mode)
+                    }
                 } else if entry.is_dir() {
-                    PortablePermissions::from_mode(0o755)
+                    PortablePermissions::from_mode_dir(0o755)
                 } else {
-                    PortablePermissions::from_mode(0o644)
+                    PortablePermissions::from_mode_file(0o644)
                 },
                 size: entry.size(),
                 modified: crate::server::filesystem::archive::zip_entry_get_modified_time(&entry),
@@ -342,7 +348,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                 if Self::is_virtual_directory(&self.sizes, path_ref) {
                     Ok(FileMetadata {
                         file_type: FileType::Dir,
-                        permissions: PortablePermissions::from_mode(0o755),
+                        permissions: PortablePermissions::from_mode_dir(0o755),
                         size: 0,
                         modified: None,
                         created: None,
@@ -615,11 +621,55 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         Ok(entries)
     }
 
-    async fn async_walk_dir<'a>(
+    fn walk_dir<'a>(
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
     ) -> Result<Box<dyn DirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
+        struct IgnoreWalkDir {
+            path: PathBuf,
+            archive: zip::ZipArchive<MultiReader>,
+            current_index: usize,
+            is_ignored: IsIgnoredFn,
+        }
+
+        impl DirectoryWalk for IgnoreWalkDir {
+            fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
+                while self.current_index < self.archive.len() {
+                    let entry = self.archive.by_index(self.current_index).ok()?;
+                    self.current_index += 1;
+
+                    let name = match entry.enclosed_name() {
+                        Some(name) => name.to_path_buf(),
+                        None => continue,
+                    };
+
+                    if !name.starts_with(&self.path) || name == self.path {
+                        continue;
+                    }
+
+                    let file_type = VirtualZipArchive::zip_entry_to_file_type(&entry);
+
+                    if let Some(name) = (self.is_ignored)(file_type, name.to_path_buf()) {
+                        return Some(Ok((file_type, name)));
+                    }
+                }
+                None
+            }
+        }
+
+        Ok(Box::new(IgnoreWalkDir {
+            path: path.as_ref().to_path_buf(),
+            archive: self.archive.clone(),
+            current_index: 0,
+            is_ignored,
+        }))
+    }
+    async fn async_walk_dir<'a>(
+        &'a self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        is_ignored: IsIgnoredFn,
+    ) -> Result<Box<dyn AsyncDirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
         struct IgnoreAsyncWalkDir {
             path: PathBuf,
             archive: zip::ZipArchive<MultiReader>,
@@ -628,7 +678,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         }
 
         #[async_trait::async_trait]
-        impl DirectoryWalk for IgnoreAsyncWalkDir {
+        impl AsyncDirectoryWalk for IgnoreAsyncWalkDir {
             async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
                 while self.current_index < self.archive.len() {
                     let entry = self.archive.by_index(self.current_index).ok()?;
@@ -665,7 +715,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
-    ) -> Result<Box<dyn DirectoryStreamWalk + Send + Sync + 'a>, anyhow::Error> {
+    ) -> Result<Box<dyn AsyncDirectoryStreamWalk + Send + Sync + 'a>, anyhow::Error> {
         struct IgnoreAsyncWalkDir {
             path: PathBuf,
             archive: zip::ZipArchive<MultiReader>,
@@ -674,7 +724,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         }
 
         #[async_trait::async_trait]
-        impl DirectoryStreamWalk for IgnoreAsyncWalkDir {
+        impl AsyncDirectoryStreamWalk for IgnoreAsyncWalkDir {
             async fn next_entry(
                 &mut self,
             ) -> Option<Result<(FileType, PathBuf, AsyncReadableFileStream), anyhow::Error>>
@@ -894,15 +944,17 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
         let mut archive = self.archive.clone();
         let path = path.as_ref().to_path_buf();
 
         let (simplex_reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (simplex_reader, signal) =
+            crate::io::fallible_reader::FallibleReader::new(simplex_reader);
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = tokio_util::io::SyncIoBridge::new(writer);
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
@@ -961,7 +1013,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                         .file_compression_threads,
                 )?;
 
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let mut tar = tar::Builder::new(writer);
                     tar.mode(tar::HeaderMode::Complete);
 
@@ -1047,7 +1099,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                         .file_compression_threads,
                 )?;
 
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let mut itaf_enc = ItafEncoder::new(
                         writer,
                         EncoderOptions {

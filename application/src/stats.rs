@@ -70,14 +70,23 @@ impl Default for StatsManager {
             let stats = Arc::clone(&stats);
 
             move || {
-                let mut sys = System::new_all();
+                let refresh_kind = sysinfo::RefreshKind::nothing()
+                    .with_cpu(sysinfo::CpuRefreshKind::nothing().with_cpu_usage())
+                    .with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram());
+
+                let mut sys = System::new_with_specifics(refresh_kind);
                 let mut disks = Disks::new_with_refreshed_list();
                 let mut networks = Networks::new_with_refreshed_list();
+
+                let cpu_model = sys
+                    .cpus()
+                    .first()
+                    .map_or_else(|| "unknown".to_string(), |cpu| cpu.brand().to_string());
 
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(500));
 
-                    sys.refresh_all();
+                    sys.refresh_specifics(refresh_kind);
                     networks.refresh(true);
                     for disk in disks.list_mut() {
                         if disk.mount_point() == Path::new("/") {
@@ -125,7 +134,7 @@ impl Default for StatsManager {
                         sent_packets: 0,
                         sending_packets_rate: 0.0,
                     };
-                    for (_, net) in networks.iter() {
+                    for net in networks.values() {
                         network.received += net.total_received();
                         network.received_packets += net.total_packets_received();
                         network.receiving_rate += net.received() as f64;
@@ -138,16 +147,12 @@ impl Default for StatsManager {
 
                     let cpu_usage = sys.global_cpu_usage();
                     let cpu_threads = sys.cpus().len();
-                    let cpu_model = sys
-                        .cpus()
-                        .first()
-                        .map_or_else(|| "unknown".to_string(), |cpu| cpu.brand().to_string());
 
                     stats.store(Arc::new(SystemStats {
                         cpu: SystemCpuStats {
                             used: cpu_usage,
                             threads: cpu_threads,
-                            model: cpu_model,
+                            model: cpu_model.clone(),
                         },
                         network,
                         memory: SystemMemoryStats {

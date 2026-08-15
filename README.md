@@ -187,6 +187,13 @@ system:
       # how many threads to use when restoring a zfs backup (snapshot)
       restore_threads: 4
 
+    # settings for the pbs backup driver
+    pbs:
+      # how many threads to use when creating a pbs backup
+      create_threads: 4
+      # how many download streams to use when restoring a pbs backup
+      download_concurrency: 4
+
 docker:
   # the docker-compatible socket or http address to connect to
   socket: /var/run/docker.sock
@@ -198,6 +205,14 @@ docker:
   network:
     # whether to disable binding to a specific ip
     disable_interface_binding: false
+
+    interfaces:
+      v4:
+        # whether to enable ipv4 support for the docker network
+        enabled: true
+      v6:
+        # whether to enable ipv6 support for the docker network
+        enabled: true
 
   registry_image_fetch_cache:
     # whether to enable caching of docker registry image fetches (pulls)
@@ -288,4 +303,4 @@ ignore_panel_wings_upgrades: false
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=calagopus/wings&type=date&legend=top-left)](https://www.star-history.com/#calagopus/wings&type=date&legend=top-left)
+[Star History Chart](https://api.star-history.com/chart?repos=calagopus/wings&type=date&legend=top-left&sealed_token=B2O-QGHUHAa_2R6TXAtmVmA-ASHkIyhBD3Rm6jlD9mOeO9XJsHW0uBvsZ-5zINucUHJPH5c29w8c7lL_2Kr7tb5770-KK58lG2pGrET0ksegRMrP1IEbft05EdOtyO6RAUCo1FCK5gnNscF6lwXhRp5LLQd08n2sZgUisdnct1irxGRvQmzUx9o-Bk4o)

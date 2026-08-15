@@ -1,9 +1,17 @@
-use std::sync::Arc;
+use serde::Serialize;
+use std::{collections::HashMap, net::IpAddr, sync::Arc};
+use utoipa::ToSchema;
 
 pub mod docker;
 pub mod noop;
 
-type StatusReceiver = tokio::sync::mpsc::Receiver<(ProcessStatus, super::resources::ResourceUsage)>;
+type StatusReceiver = tokio::sync::mpsc::Receiver<ProcessStatus>;
+
+#[derive(ToSchema, Serialize, Debug, Clone, Copy)]
+pub struct UsedPort {
+    pub port: u16,
+    pub server: Option<uuid::Uuid>,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum ProcessStatus {
@@ -19,8 +27,6 @@ pub trait ProcessHandle: Send + Sync {
     async fn container_id(&self) -> Option<String> {
         None
     }
-
-    async fn resource_usage(&self) -> Result<super::resources::ResourceUsage, anyhow::Error>;
     async fn logs(
         &self,
         lines: Option<usize>,
@@ -74,4 +80,15 @@ pub trait ServerExecutor: Send + Sync {
         server: &super::Server,
         script: &super::installation::InstallationScript,
     ) -> Result<(Arc<dyn ProcessHandle>, StatusReceiver), anyhow::Error>;
+
+    async fn resolve_internal_target(
+        &self,
+        server: &super::Server,
+        port: u16,
+    ) -> Result<Option<std::net::SocketAddr>, anyhow::Error>;
+
+    async fn used_ports(
+        &self,
+        ips: &[IpAddr],
+    ) -> Result<HashMap<IpAddr, Vec<UsedPort>>, anyhow::Error>;
 }

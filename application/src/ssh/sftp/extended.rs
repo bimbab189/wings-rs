@@ -39,7 +39,7 @@ pub async fn handle_extended(
 
     match command.as_str() {
         "check-file" | "check-file-name" => {
-            if !sftp_session.has_permission(Permission::FileRead) {
+            if !sftp_session.has_permission(Permission::FileReadContent) {
                 return Err(StatusCode::PermissionDenied);
             }
 
@@ -331,6 +331,10 @@ pub async fn handle_extended(
             }
         }
         "copy-file" => {
+            if sftp_session.state.config.load().system.sftp.read_only {
+                return Err(StatusCode::PermissionDenied);
+            }
+
             if !sftp_session.has_permission(Permission::FileReadContent)
                 || !sftp_session.has_permission(Permission::FileCreate)
             {
@@ -378,6 +382,10 @@ pub async fn handle_extended(
             }
 
             let destination_path = Path::new(&request.destination);
+
+            if sftp_session.is_ignored(destination_path, false) {
+                return Err(StatusCode::NoSuchFile);
+            }
 
             if let Ok(metadata) = sftp_session
                 .server
@@ -730,7 +738,7 @@ pub async fn handle_extended(
                     .filesystem
                     .async_set_symlink_permissions(
                         &handle.path,
-                        PortablePermissions::from_mode(permissions),
+                        PortablePermissions::from_mode_file(permissions),
                     )
                     .await
                     .map_err(|_| StatusCode::Failure)?;
@@ -887,7 +895,7 @@ pub async fn handle_extended(
                 return Err(StatusCode::NoSuchFile);
             }
 
-            let new_path = sftp_session.server.filesystem.relative_path(&new_path);
+            let new_path = sftp_session.server.filesystem.diff_key(&new_path).await;
             let new_key = new_path.to_string_lossy().to_string();
             let replaced = match sftp_session
                 .server

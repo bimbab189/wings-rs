@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, RwLock};
 
 pub mod activity;
 pub mod backup;
+pub mod collab;
 pub mod configuration;
 pub mod diff;
 pub mod executor;
@@ -26,6 +27,7 @@ pub mod script;
 pub mod state;
 pub mod transfer;
 pub mod web_ide;
+pub mod tunnel;
 pub mod websocket;
 
 pub struct InnerServer {
@@ -38,15 +40,17 @@ pub struct InnerServer {
     pub websocket: tokio::sync::broadcast::Sender<websocket::WebsocketMessage>,
     // Dummy receiver to avoid channel being closed
     _websocket_receiver: tokio::sync::broadcast::Receiver<websocket::WebsocketMessage>,
-    websocket_sender: RwLock<Option<tokio::task::JoinHandle<()>>>,
+    status_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
     pub targeted_websocket: tokio::sync::broadcast::Sender<websocket::TargetedWebsocketMessage>,
     // Dummy receiver to avoid channel being closed
     _targeted_websocket_receiver:
         tokio::sync::broadcast::Receiver<websocket::TargetedWebsocketMessage>,
 
+    resource_usage: tokio::sync::watch::Sender<resources::ResourceUsage>,
     process_handle: RwLock<Option<Arc<dyn executor::ProcessHandle>>>,
     process_startup_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
     pub schedules: Arc<schedule::manager::ScheduleManager>,
+    pub collab: collab::manager::CollabManager,
     pub diff: diff::manager::DiffManager,
     pub activity: activity::ActivityManager,
 
@@ -79,8 +83,8 @@ impl Drop for InnerServer {
         if let Some(startup_task) = self.process_startup_task.get_mut().take() {
             startup_task.abort();
         }
-        if let Some(websocket_sender) = self.websocket_sender.get_mut().take() {
-            websocket_sender.abort();
+        if let Some(status_task) = self.status_task.get_mut().take() {
+            status_task.abort();
         }
     }
 }
@@ -101,23 +105,30 @@ impl Server {
 
         let (websocket_tx, websocket_rx) = tokio::sync::broadcast::channel(128);
         let (targeted_websocket_tx, targeted_websocket_rx) = tokio::sync::broadcast::channel(128);
+        let (resource_usage, _) = tokio::sync::watch::channel(resources::ResourceUsage::default());
 
         let filesystem = filesystem::Filesystem::new(
             configuration.uuid,
             app_state.clone(),
             configuration.build.disk_space * 1024 * 1024,
             websocket_tx.clone(),
+            resource_usage.clone(),
             Arc::clone(&app_state.config),
             &configuration.egg.file_denylist,
         );
 
         let activity = activity::ActivityManager::new(configuration.uuid, &app_state.config);
+        let collab = collab::manager::CollabManager::new(
+            configuration.uuid,
+            targeted_websocket_tx.clone(),
+            &app_state.config,
+        );
         let diff = diff::manager::DiffManager::new(configuration.uuid, &app_state.config);
         let schedules = Arc::new(schedule::manager::ScheduleManager::new(Arc::clone(
             &app_state.config,
         )));
 
-        Self(Arc::new(InnerServer {
+        let server = Self(Arc::new(InnerServer {
             uuid: configuration.uuid,
             app_state,
 
@@ -126,13 +137,15 @@ impl Server {
 
             websocket: websocket_tx.clone(),
             _websocket_receiver: websocket_rx,
-            websocket_sender: RwLock::new(None),
+            status_task: RwLock::new(None),
             targeted_websocket: targeted_websocket_tx,
             _targeted_websocket_receiver: targeted_websocket_rx,
 
+            resource_usage,
             process_handle: RwLock::new(None),
             process_startup_task: RwLock::new(None),
             schedules: Arc::clone(&schedules),
+            collab,
             diff,
             activity,
 
@@ -153,7 +166,41 @@ impl Server {
 
             user_permissions: permissions::UserPermissionsMap::default(),
             filesystem,
-        }))
+        }));
+
+        server.spawn_stats_forwarder();
+
+        server
+    }
+
+    fn spawn_stats_forwarder(&self) {
+        let weak = Arc::downgrade(&self.0);
+        let mut usage_rx = self.resource_usage.subscribe();
+
+        tokio::spawn(async move {
+            while usage_rx.changed().await.is_ok() {
+                let Some(server) = weak.upgrade() else {
+                    break;
+                };
+
+                let mut usage = *usage_rx.borrow_and_update();
+                usage.state = server.state.get_state();
+
+                server
+                    .websocket
+                    .send(
+                        websocket::WebsocketMessage::builder(
+                            websocket::WebsocketEvent::ServerStats,
+                        )
+                        .structured_arg(usage)
+                        .build(),
+                    )
+                    .ok();
+                drop(server);
+
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
     }
 
     #[cfg(test)]
@@ -197,7 +244,8 @@ impl Server {
 
                     if let Some(done_vec) = &startup_configuration.done {
                         if startup_configuration.strip_ansi {
-                            let mut result_line = line.to_compact_string();
+                            let mut result_line =
+                                compact_str::CompactString::with_capacity(line.len());
                             let mut chars = line.chars().peekable();
 
                             while let Some(c) = chars.next() {
@@ -266,40 +314,23 @@ impl Server {
         }
     }
 
-    fn setup_websocket_sender(
+    fn setup_status_task(
         &self,
-        mut status_rx: tokio::sync::mpsc::Receiver<(
-            executor::ProcessStatus,
-            resources::ResourceUsage,
-        )>,
+        mut status_rx: tokio::sync::mpsc::Receiver<executor::ProcessStatus>,
     ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         tracing::debug!(
             server = %self.uuid,
-            "setting up websocket sender"
+            "setting up status task"
         );
         let server = self.clone();
 
         Box::pin(async move {
-            let old_sender = server.clone().websocket_sender.write().await.replace(tokio::spawn(async move {
+            let old_sender = server.clone().status_task.write().await.replace(tokio::spawn(async move {
                 loop {
-                    let (process_status, usage) = match status_rx.recv().await {
-                        Some((process_status, usage)) => (process_status, usage),
+                    let process_status = match status_rx.recv().await {
+                        Some(process_status) => process_status,
                         None => break,
                     };
-
-                    let message = websocket::WebsocketMessage::builder(
-                        websocket::WebsocketEvent::ServerStats,
-                    )
-                    .structured_arg(usage)
-                    .build();
-
-                    if let Err(err) = server.websocket.send(message) {
-                        tracing::error!(
-                            server = %server.uuid,
-                            "failed to send websocket message: {}",
-                            err
-                        );
-                    }
 
                     server.filesystem.disk_checker_state_dirty.store(true, Ordering::Relaxed);
 
@@ -595,23 +626,17 @@ impl Server {
         None
     }
 
-    pub async fn resource_usage(&self) -> resources::ResourceUsage {
-        if let Some(container) = self.process_handle.read().await.as_ref() {
-            container
-                .resource_usage()
-                .await
-                .unwrap_or_else(|_| resources::ResourceUsage {
-                    disk_bytes: 0,
-                    state: self.state.get_state(),
-                    ..Default::default()
-                })
-        } else {
-            resources::ResourceUsage {
-                disk_bytes: self.filesystem.limiter_usage().await,
-                state: self.state.get_state(),
-                ..Default::default()
-            }
-        }
+    pub fn subscribe_resource_usage(
+        &self,
+    ) -> tokio::sync::watch::Receiver<resources::ResourceUsage> {
+        self.resource_usage.subscribe()
+    }
+
+    pub fn resource_usage(&self) -> resources::ResourceUsage {
+        let mut usage = *self.resource_usage.borrow();
+        usage.state = self.state.get_state();
+
+        usage
     }
 
     pub async fn update_configuration(
@@ -771,7 +796,7 @@ impl Server {
             .setup_server_process(&self.clone())
             .await?;
 
-        self.setup_websocket_sender(status_rx).await;
+        self.setup_status_task(status_rx).await;
         self.setup_startup_task(&*process_handle).await;
         *self.process_handle.write().await = Some(process_handle);
 
@@ -796,7 +821,7 @@ impl Server {
         {
             Ok((process_handle, status_rx)) => {
                 self.crash_handled.store(true, Ordering::SeqCst);
-                self.setup_websocket_sender(status_rx).await;
+                self.setup_status_task(status_rx).await;
                 self.setup_startup_task(&*process_handle).await;
                 *self.process_handle.write().await = Some(process_handle);
 
@@ -992,7 +1017,7 @@ impl Server {
                 .state
                 .execute_action(
                     state::ServerState::Starting,
-                    |_| async {
+                    async || {
                         server.filesystem.setup().await;
                         server.filesystem.get_disk_limiter().startup().await?;
 
@@ -1147,7 +1172,7 @@ impl Server {
                 .state
                 .execute_action(
                     state::ServerState::Stopping,
-                    |_| async {
+                    async || {
                         server.stopping.store(true, Ordering::SeqCst);
 
                         if let Some(process_handle) = server.process_handle.read().await.as_ref()
@@ -1210,11 +1235,11 @@ impl Server {
                 // stop request and its return; setting this afterwards races
                 // the watcher and leaves a requested restart offline.
                 server.restarting.store(true, Ordering::SeqCst);
-                if server.state.get_state() != state::ServerState::Stopping {
-                    if let Err(error) = server.stop(aquire_timeout, true).await {
-                        server.restarting.store(false, Ordering::SeqCst);
-                        return Err(error);
-                    }
+                if server.state.get_state() != state::ServerState::Stopping
+                    && let Err(err) = server.stop(aquire_timeout, true).await
+                {
+                    server.restarting.store(false, Ordering::SeqCst);
+                    return Err(err);
                 }
             } else {
                 server.start(aquire_timeout, true).await?;
@@ -1252,34 +1277,29 @@ impl Server {
                 // before the stop/kill operation can make the container
                 // transition to EXITED.
                 server.restarting.store(true, Ordering::SeqCst);
-                if server.state.get_state() != state::ServerState::Stopping {
-                    if let Err(error) = server.stop(None, true).await {
-                        server.restarting.store(false, Ordering::SeqCst);
-                        return Err(error);
-                    }
+                if server.state.get_state() != state::ServerState::Stopping
+                    && let Err(err) = server.stop(None, true).await
+                {
+                    server.restarting.store(false, Ordering::SeqCst);
+                    return Err(err);
                 }
 
-                let deadline = tokio::time::Instant::now() + timeout;
-                loop {
-                    if server.state.get_state() != state::ServerState::Stopping {
-                        break;
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        tracing::info!(
+                if !server
+                    .state
+                    .wait_while_state(state::ServerState::Stopping, timeout)
+                    .await
+                {
+                    tracing::info!(
+                        server = %server.uuid,
+                        "kill timeout reached during restart, killing server"
+                    );
+                    if let Err(err) = server.kill(true).await {
+                        tracing::error!(
                             server = %server.uuid,
-                            "kill timeout reached during restart, killing server"
+                            "failed to kill server during restart: {}",
+                            err
                         );
-                        if let Err(err) = server.kill(true).await {
-                            tracing::error!(
-                                server = %server.uuid,
-                                "failed to kill server during restart: {}",
-                                err
-                            );
-                        }
-                        break;
                     }
-
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
             } else {
                 server.start(aquire_timeout, true).await?;
@@ -1318,12 +1338,12 @@ impl Server {
                 server.stop(None, skip_schedules).await?;
             }
 
-            let deadline = tokio::time::Instant::now() + timeout;
-            while tokio::time::Instant::now() < deadline {
-                if server.state.get_state() == state::ServerState::Offline {
-                    return Ok(());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if server
+                .state
+                .wait_for_state(state::ServerState::Offline, timeout)
+                .await
+            {
+                return Ok(());
             }
 
             tracing::info!(
@@ -1352,7 +1372,7 @@ impl Server {
         }
 
         self.process_handle.write().await.take();
-        if let Some(handle) = self.websocket_sender.write().await.take() {
+        if let Some(handle) = self.status_task.write().await.take() {
             handle.abort();
         }
         if let Some(handle) = self.process_startup_task.write().await.take() {
@@ -1390,7 +1410,6 @@ impl Server {
         crate::server::installation::ServerInstaller::delete_install_logs(self).await;
 
         self.diff.close().await;
-        self.filesystem.close();
 
         tokio::spawn({
             let server = self.clone();
@@ -1398,6 +1417,7 @@ impl Server {
             async move {
                 server.diff.destroy().await;
                 server.filesystem.destroy().await;
+                server.filesystem.close();
 
                 if let Some(installer) = server.installer.read().await.as_ref() {
                     installer.abort();
@@ -1410,7 +1430,7 @@ impl Server {
         json!({
             "state": self.state.get_state(),
             "is_suspended": self.suspended.load(Ordering::SeqCst),
-            "utilization": self.resource_usage().await,
+            "utilization": self.resource_usage(),
             "configuration": *self.configuration.read().await,
         })
     }

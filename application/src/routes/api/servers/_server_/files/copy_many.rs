@@ -27,6 +27,8 @@ pub(crate) mod post {
         #[schema(inline)]
         files: Vec<crate::models::CopyFile>,
 
+        #[serde(default)]
+        overwrite: bool,
         #[serde(default = "foreground")]
         foreground: bool,
     }
@@ -34,11 +36,13 @@ pub(crate) mod post {
     #[derive(ToSchema, Serialize)]
     pub struct Response {
         copied: usize,
+        skipped: Vec<crate::models::DirectoryEntry>,
     }
 
     #[derive(ToSchema, Serialize)]
     struct ResponseAccepted {
         identifier: uuid::Uuid,
+        skipped: Vec<crate::models::DirectoryEntry>,
     }
 
     #[utoipa::path(post, path = "/", responses(
@@ -57,6 +61,31 @@ pub(crate) mod post {
         server: GetServer,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
+        let mut files = Vec::with_capacity(data.files.len());
+        let mut skipped = Vec::new();
+        for file in data.files {
+            if !data.overwrite {
+                let to = Path::new(&data.root).join(&file.to);
+                if let (Some(to_parent), Some(to_file_name)) = (to.parent(), to.file_name()) {
+                    let (destination_root, destination_filesystem) = server
+                        .filesystem
+                        .resolve_writable_fs(&server, to_parent)
+                        .await;
+
+                    if let Ok(mut entry) = destination_filesystem
+                        .async_directory_entry(&destination_root.join(to_file_name))
+                        .await
+                    {
+                        entry.name = file.to;
+                        skipped.push(entry);
+                        continue;
+                    }
+                }
+            }
+
+            files.push(file);
+        }
+
         let bytes_processed = Arc::new(AtomicU64::new(0));
         let bytes_total = Arc::new(AtomicU64::new(0));
         let files_processed = Arc::new(AtomicU64::new(0));
@@ -67,7 +96,7 @@ pub(crate) mod post {
             .add_operation(
                 crate::server::filesystem::operations::FilesystemOperation::CopyMany {
                     path: PathBuf::from(&data.root),
-                    files: data.files.clone(),
+                    files: files.clone(),
                     start_time: chrono::Utc::now(),
                     bytes_processed: bytes_processed.clone(),
                     bytes_total: bytes_total.clone(),
@@ -75,11 +104,12 @@ pub(crate) mod post {
                 },
                 {
                     let server = server.clone();
+                    let root = PathBuf::from(&data.root);
 
                     async move {
                         let mut total_size = 0;
-                        for file in &data.files {
-                            let path = Path::new(&data.root).join(&file.from);
+                        for file in &files {
+                            let path = root.join(&file.from);
                             let parent = match path.parent() {
                                 Some(parent) => parent,
                                 None => continue,
@@ -89,11 +119,11 @@ pub(crate) mod post {
                                 None => continue,
                             };
 
-                            let (root, filesystem) =
+                            let (fs_root, filesystem) =
                                 server.filesystem.resolve_readable_fs(&server, parent).await;
 
                             let directory_entry = match filesystem
-                                .async_directory_entry_buffer(&root.join(file_name), &[])
+                                .async_directory_entry_buffer(&fs_root.join(file_name), &[])
                                 .await
                             {
                                 Ok(entry) => entry,
@@ -106,8 +136,8 @@ pub(crate) mod post {
                         bytes_total.store(total_size, std::sync::atomic::Ordering::Relaxed);
 
                         let mut copied_count = 0;
-                        for file in data.files {
-                            let path = Path::new(&data.root).join(&file.from);
+                        for file in files {
+                            let path = root.join(&file.from);
                             let parent = match path.parent() {
                                 Some(parent) => parent,
                                 None => continue,
@@ -117,16 +147,16 @@ pub(crate) mod post {
                                 None => continue,
                             };
 
-                            let (root, filesystem) =
+                            let (fs_root, filesystem) =
                                 server.filesystem.resolve_readable_fs(&server, parent).await;
 
-                            let from = root.join(file_name);
-                            if from == root {
+                            let from = fs_root.join(file_name);
+                            if from == fs_root {
                                 continue;
                             }
 
-                            let to = Path::new(&data.root).join(file.to);
-                            if to == root {
+                            let to = root.join(&file.to);
+                            if to == fs_root {
                                 continue;
                             }
 
@@ -160,14 +190,6 @@ pub(crate) mod post {
                                 .filesystem
                                 .resolve_writable_fs(&server, to_parent)
                                 .await;
-
-                            if destination_filesystem
-                                .async_metadata(&destination_root.join(to_file_name))
-                                .await
-                                .is_ok()
-                            {
-                                continue;
-                            }
 
                             if destination_filesystem.is_primary_server_fs()
                                 && server
@@ -225,11 +247,14 @@ pub(crate) mod post {
                 }
             };
 
-            ApiResponse::new_serialized(Response { copied }).ok()
+            ApiResponse::new_serialized(Response { copied, skipped }).ok()
         } else {
-            ApiResponse::new_serialized(ResponseAccepted { identifier })
-                .with_status(StatusCode::ACCEPTED)
-                .ok()
+            ApiResponse::new_serialized(ResponseAccepted {
+                identifier,
+                skipped,
+            })
+            .with_status(StatusCode::ACCEPTED)
+            .ok()
         }
     }
 }

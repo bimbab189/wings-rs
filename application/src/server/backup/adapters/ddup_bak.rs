@@ -41,7 +41,7 @@ pub async fn get_repository(
         return Ok(Arc::clone(repository));
     }
 
-    let path = PathBuf::from(&config.load().system.backup_directory);
+    let path = config.resolve_as_path(|cfg| &cfg.system.backup_directory);
     if tokio::fs::metadata(path.join(".ddup-bak")).await.is_ok() {
         let repository = Arc::new(
             tokio::task::spawn_blocking(move || {
@@ -175,14 +175,17 @@ impl DdupBakBackup {
             {
                 let mtime: chrono::DateTime<chrono::Utc> = chrono::DateTime::from(entry.mtime());
 
-                options = options.last_modified_time(zip::DateTime::from_date_and_time(
-                    mtime.year() as u16,
-                    mtime.month() as u8,
-                    mtime.day() as u8,
-                    mtime.hour() as u8,
-                    mtime.minute() as u8,
-                    mtime.second() as u8,
-                )?);
+                options = options.last_modified_time(
+                    zip::DateTime::from_date_and_time(
+                        mtime.year() as u16,
+                        mtime.month() as u8,
+                        mtime.day() as u8,
+                        mtime.hour() as u8,
+                        mtime.minute() as u8,
+                        mtime.second() as u8,
+                    )
+                    .unwrap_or_default(),
+                );
             }
 
             let path = parent_path.join(entry.name());
@@ -335,25 +338,27 @@ impl BackupCreateExt for DdupBakBackup {
         let path = repository.archive_path(&uuid.to_string());
 
         let total_task = {
-            let server = server.clone();
+            let filesystem = server.filesystem.clone();
+            let total = Arc::clone(&total);
             let ignore = ignore.clone();
 
             async move {
-                let mut walker = server
-                    .filesystem
-                    .async_walk_dir(Path::new(""))
-                    .await?
-                    .with_is_ignored(ignore.into());
-                while let Some(Ok((_, path))) = walker.next_entry().await {
-                    let metadata = match server.filesystem.async_symlink_metadata(&path).await {
-                        Ok(metadata) => metadata,
-                        Err(_) => continue,
-                    };
+                tokio::task::spawn_blocking(move || {
+                    let mut walker = filesystem
+                        .walk_dir(Path::new(""))?
+                        .with_is_ignored(ignore.into());
+                    while let Some(Ok((_, path))) = walker.next_entry() {
+                        let metadata = match filesystem.symlink_metadata(&path) {
+                            Ok(metadata) => metadata,
+                            Err(_) => continue,
+                        };
 
-                    total.fetch_add(metadata.len(), Ordering::Relaxed);
-                }
+                        total.fetch_add(metadata.len(), Ordering::Relaxed);
+                    }
 
-                Ok::<(), anyhow::Error>(())
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await?
             }
         };
 
@@ -670,7 +675,7 @@ impl BackupExt for DdupBakBackup {
                             let mut writer = crate::server::filesystem::file::ServerFile::new(
                                 server.clone(),
                                 &path,
-                                Some(PortablePermissions::from_mode(file.mode.bits())),
+                                Some(PortablePermissions::from_mode_file(file.mode.bits())),
                                 Some(file.mtime),
                             )?;
                             let reader = repository.entry_reader(Entry::File(file.clone()))?;
@@ -685,7 +690,7 @@ impl BackupExt for DdupBakBackup {
                             server.filesystem.create_chowned_dir_all(&path)?;
                             server.filesystem.set_permissions(
                                 &path,
-                                PortablePermissions::from_mode(directory.mode.bits()),
+                                PortablePermissions::from_mode_dir(directory.mode.bits()),
                             )?;
 
                             stack.push(Work::FinishDir {

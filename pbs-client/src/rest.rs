@@ -15,7 +15,8 @@ impl PbsClient {
     pub fn new(config: PbsConfig) -> Result<Self, PbsError> {
         config.validate()?;
 
-        let tls = super::tls::build_client_config(&config.fingerprint).map_err(PbsError::Config)?;
+        let tls = super::tls::build_client_config(config.fingerprint.as_deref())
+            .map_err(PbsError::Config)?;
 
         let mut headers = HeaderMap::new();
         let mut auth = HeaderValue::from_str(&config.authorization_header())
@@ -110,7 +111,9 @@ impl PbsClient {
 
     fn map_transport(&self, err: reqwest::Error) -> PbsError {
         let chain = error_chain(&err);
-        if chain.contains("fingerprint mismatch") {
+        if let Some(fingerprint) = &self.config.fingerprint
+            && chain.contains("fingerprint mismatch")
+        {
             let actual = chain
                 .split("server presented ")
                 .nth(1)
@@ -124,9 +127,9 @@ impl PbsClient {
                 .unwrap_or_else(|| "unknown".into());
 
             return PbsError::FingerprintMismatch {
-                expected: super::tls::normalize_fingerprint(&self.config.fingerprint)
+                expected: super::tls::normalize_fingerprint(fingerprint)
                     .map(|b| super::tls::fingerprint_hex(&b))
-                    .unwrap_or_else(|_| self.config.fingerprint.clone()),
+                    .unwrap_or_else(|_| fingerprint.clone()),
                 actual,
             };
         }

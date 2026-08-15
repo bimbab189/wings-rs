@@ -39,18 +39,23 @@ pub(crate) mod get {
         Path(file_path): Path<compact_str::CompactString>,
         Query(params): Query<Params>,
     ) -> ApiResponseResult {
-        if file_path.contains("..") {
+        if !crate::utils::is_single_component_file_name(&file_path) {
             return ApiResponse::error("log file not found").ok();
         }
 
         let mut file = match tokio::fs::File::open(
-            std::path::Path::new(&state.config.load().system.log_directory).join(&file_path),
+            state
+                .config
+                .resolve_as_path(|cfg| &cfg.system.log_directory)
+                .join(&file_path),
         )
         .await
         {
             Ok(file) => file,
             Err(_) => return ApiResponse::error("log file not found").ok(),
         };
+
+        let lines = params.lines.map(|n| n.min(crate::io::tail::LINES_CAP));
 
         let reader: Box<dyn AsyncRead + Send + Unpin> = if file_path.ends_with(".gz") {
             let gz_reader = AsyncCompressionReader::new_mt(
@@ -59,13 +64,13 @@ pub(crate) mod get {
                 state.config.load().api.file_decompression_threads,
             );
 
-            if let Some(lines) = params.lines {
+            if let Some(lines) = lines {
                 Box::new(crate::io::tail::async_tail_stream(gz_reader, lines).await?)
             } else {
                 Box::new(gz_reader)
             }
         } else {
-            if let Some(lines) = params.lines {
+            if let Some(lines) = lines {
                 file = crate::io::tail::async_tail(file, lines).await?;
             }
 

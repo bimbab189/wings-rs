@@ -26,7 +26,7 @@ static DISK_USAGE: LazyLock<Arc<RwLock<DiskUsageMap>>> = LazyLock::new(|| {
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     continue;
                 }
-                for (_, (_, mount, subvol_id, _)) in usage_map.iter() {
+                for (_, mount, subvol_id, _) in usage_map.values() {
                     mount_groups
                         .entry(mount.clone())
                         .or_default()
@@ -304,7 +304,7 @@ impl<'a> DiskLimiterExt for BtrfsSubvolumeLimiter<'a> {
             .await?;
 
         if !output.status.success() {
-            tokio::fs::remove_dir_all(&self.filesystem.base_path).await?;
+            super::remove_volume(self.filesystem).await?;
         }
 
         DISK_USAGE.write().await.remove(&self.filesystem.uuid);

@@ -1,5 +1,5 @@
 use compact_str::ToCompactString;
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{collections::HashMap, sync::Arc};
@@ -93,11 +93,16 @@ impl BasePayload {
     }
 }
 
-type CountingMap = HashMap<compact_str::CompactString, (usize, chrono::DateTime<chrono::Utc>)>;
+type CountingMap = HashMap<
+    compact_str::CompactString,
+    (
+        std::sync::atomic::AtomicUsize,
+        chrono::DateTime<chrono::Utc>,
+    ),
+>;
 
 pub struct JwtClient {
     pub decoding_key: DecodingKey,
-    pub encoding_key: EncodingKey,
     pub validation: Validation,
     pub boot_time: chrono::DateTime<chrono::Utc>,
     pub max_jwt_uses: usize,
@@ -127,8 +132,8 @@ impl JwtClient {
                     drop(denied);
 
                     let mut seen = seen_jtoken_ids.write();
-                    seen.retain(|_, &mut (_, expiration)| {
-                        expiration > chrono::Utc::now() - chrono::Duration::hours(1)
+                    seen.retain(|_, (_, expiration)| {
+                        *expiration > chrono::Utc::now() - chrono::Duration::hours(1)
                     });
                     drop(seen);
                 }
@@ -142,7 +147,6 @@ impl JwtClient {
 
         Self {
             decoding_key: DecodingKey::from_secret(config.token.as_bytes()),
-            encoding_key: EncodingKey::from_secret(config.token.as_bytes()),
             validation,
             boot_time: chrono::Utc::now(),
             max_jwt_uses: config.api.max_jwt_uses,
@@ -161,39 +165,106 @@ impl JwtClient {
         Ok(data.claims)
     }
 
-    #[inline]
-    pub fn create<T: Serialize>(&self, payload: &T) -> Result<String, jsonwebtoken::errors::Error> {
-        jsonwebtoken::encode(&Header::new(Algorithm::HS256), payload, &self.encoding_key)
-    }
-
     pub fn limited_jwt_id(&self, id: &str) -> bool {
-        let seen = self.seen_jtoken_ids.read();
-        if let Some((count, _)) = seen.get(id) {
-            if *count >= self.max_jwt_uses {
-                return false;
-            } else {
-                drop(seen);
-
-                if self.max_jwt_uses != 0 {
-                    let mut seen = self.seen_jtoken_ids.write();
-                    if let Some((count, _)) = seen.get_mut(id) {
-                        *count += 1;
-                    }
-                }
-            }
-        } else {
-            drop(seen);
-
-            self.seen_jtoken_ids
-                .write()
-                .insert(id.to_compact_string(), (1, chrono::Utc::now()));
+        if self.max_jwt_uses == 0 {
+            return true;
         }
 
-        true
+        let claim_use = |count: &std::sync::atomic::AtomicUsize| {
+            count
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |count| (count < self.max_jwt_uses).then_some(count + 1),
+                )
+                .is_ok()
+        };
+
+        let seen = self.seen_jtoken_ids.read();
+        if let Some((count, _)) = seen.get(id) {
+            return claim_use(count);
+        }
+        drop(seen);
+
+        match self.seen_jtoken_ids.write().entry(id.to_compact_string()) {
+            std::collections::hash_map::Entry::Occupied(entry) => claim_use(&entry.get().0),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((std::sync::atomic::AtomicUsize::new(1), chrono::Utc::now()));
+                true
+            }
+        }
     }
 
     pub fn deny(&self, id: impl Into<compact_str::CompactString>) {
         let mut denied = self.denied_jtokens.write();
         denied.insert(id.into(), chrono::Utc::now());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client_with_max_uses(max_jwt_uses: usize) -> JwtClient {
+        let mut config = crate::config::InnerConfig::default();
+        config.api.max_jwt_uses = max_jwt_uses;
+
+        JwtClient::new(&config)
+    }
+
+    // JwtClient
+
+    #[test]
+    fn limited_jwt_id_allows_up_to_max_uses() {
+        tokio_test::block_on(async {
+            let client = client_with_max_uses(3);
+            assert!(client.limited_jwt_id("token"));
+            assert!(client.limited_jwt_id("token"));
+            assert!(client.limited_jwt_id("token"));
+            assert!(!client.limited_jwt_id("token"));
+            // other ids have their own budget
+            assert!(client.limited_jwt_id("other"));
+        });
+    }
+
+    #[test]
+    fn limited_jwt_id_zero_means_unlimited() {
+        tokio_test::block_on(async {
+            let client = client_with_max_uses(0);
+            for _ in 0..100 {
+                assert!(client.limited_jwt_id("token"));
+            }
+        });
+    }
+
+    #[test]
+    fn limited_jwt_id_grants_exactly_max_uses_under_contention() {
+        tokio_test::block_on(async {
+            let client = Arc::new(client_with_max_uses(5));
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let successes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let client = Arc::clone(&client);
+                    let barrier = Arc::clone(&barrier);
+                    let successes = Arc::clone(&successes);
+
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        for _ in 0..10 {
+                            if client.limited_jwt_id("token") {
+                                successes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread.join().unwrap();
+            }
+
+            assert_eq!(successes.load(std::sync::atomic::Ordering::SeqCst), 5);
+        });
     }
 }

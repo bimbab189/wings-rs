@@ -82,6 +82,7 @@ pub struct DirectoryEntry {
     pub directory: bool,
     pub file: bool,
     pub symlink: bool,
+    pub r#virtual: bool,
     pub mime: &'static str,
     pub created: chrono::DateTime<chrono::Utc>,
     pub modified: chrono::DateTime<chrono::Utc>,

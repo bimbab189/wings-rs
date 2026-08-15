@@ -142,6 +142,11 @@ impl UserPermissionsMap {
             match receiver.recv().await {
                 Ok(uuid) if uuid == user_uuid => break,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+                    if !self.map.lock().contains_key(&user_uuid) =>
+                {
+                    break;
+                }
                 _ => {}
             }
         }
@@ -180,6 +185,8 @@ impl UserPermissionsMap {
         path: impl AsRef<std::path::Path>,
         is_dir: bool,
     ) -> bool {
+        let path = crate::server::filesystem::cap::CapFilesystem::resolve_path(path.as_ref());
+
         let mut map = self.map.lock();
         if let Some((_, ignored, last_access)) = map.get_mut(&user_uuid) {
             *last_access = std::time::Instant::now();
@@ -564,6 +571,36 @@ mod tests {
             .await;
 
             assert!(done.is_ok(), "wait_for_removal did not resolve");
+            assert!(!permissions.has_permission(user, Permission::FileRead));
+        });
+    }
+
+    #[test]
+    fn map_wait_for_removal_resolves_despite_channel_overflow() {
+        tokio_test::block_on(async {
+            let permissions = UserPermissionsMap::default();
+            let user = uuid::Uuid::new_v4();
+            permissions.set_permissions(user, perms(&[Permission::FileRead]), None::<&[&str]>);
+
+            for _ in 0..64 {
+                permissions.set_permissions(
+                    uuid::Uuid::new_v4(),
+                    perms(&[Permission::FileRead]),
+                    None::<&[&str]>,
+                );
+            }
+
+            let done = tokio::time::timeout(Duration::from_secs(2), async {
+                let removal = permissions.wait_for_removal(user);
+                let trigger = async {
+                    tokio::task::yield_now().await;
+                    permissions.clear_permissions();
+                };
+                tokio::join!(removal, trigger);
+            })
+            .await;
+
+            assert!(done.is_ok(), "wait_for_removal did not resolve after lag");
             assert!(!permissions.has_permission(user, Permission::FileRead));
         });
     }

@@ -26,6 +26,8 @@ pub(crate) mod post {
         path: compact_str::CompactString,
         name: Option<compact_str::CompactString>,
 
+        #[serde(default)]
+        overwrite: bool,
         #[serde(default = "foreground")]
         foreground: bool,
     }
@@ -39,6 +41,7 @@ pub(crate) mod post {
         (status = OK, body = crate::models::DirectoryEntry),
         (status = ACCEPTED, body = inline(Response)),
         (status = NOT_FOUND, body = ApiError),
+        (status = CONFLICT, body = ApiError),
         (status = EXPECTATION_FAILED, body = ApiError),
     ), params(
         (
@@ -148,6 +151,7 @@ pub(crate) mod post {
                 .ok();
         }
 
+        let explicit_name = data.name.is_some();
         let new_name = if let Some(name) = data.name {
             name
         } else {
@@ -155,11 +159,52 @@ pub(crate) mod post {
         };
         let file_name = parent.join(&new_name);
 
-        let (destination_path, destination_filesystem) =
-            server.filesystem.resolve_writable_fs(&server, parent).await;
+        let destination_parent = match file_name.parent() {
+            Some(parent) => parent,
+            None => {
+                return ApiResponse::error("destination has no parent")
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            }
+        };
+        let destination_file_name = match file_name.file_name() {
+            Some(name) => name,
+            None => {
+                return ApiResponse::error("invalid destination file name")
+                    .with_status(StatusCode::EXPECTATION_FAILED)
+                    .ok();
+            }
+        };
+
+        let (destination_path, destination_filesystem) = server
+            .filesystem
+            .resolve_writable_fs(&server, destination_parent)
+            .await;
         let destination_path = server
             .filesystem
-            .relative_path(&destination_path.join(&new_name));
+            .relative_path(&destination_path.join(destination_file_name));
+
+        if destination_filesystem.is_primary_server_fs()
+            && server
+                .filesystem
+                .is_ignored(&destination_path, metadata.file_type.is_dir())
+        {
+            return ApiResponse::error("destination file not found")
+                .with_status(StatusCode::EXPECTATION_FAILED)
+                .ok();
+        }
+
+        if explicit_name
+            && !data.overwrite
+            && destination_filesystem
+                .async_metadata(&destination_path)
+                .await
+                .is_ok()
+        {
+            return ApiResponse::error("a file with that name already exists")
+                .with_status(StatusCode::CONFLICT)
+                .ok();
+        }
 
         let total_size = match filesystem.async_directory_entry_buffer(&path, &[]).await {
             Ok(entry) => entry.size,

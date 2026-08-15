@@ -19,6 +19,25 @@ mod resolver;
 
 static DOWNLOAD_CLIENT: RwLock<Option<Arc<reqwest::Client>>> = RwLock::const_new(None);
 
+fn host_to_ip(host: &str) -> Option<std::net::IpAddr> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    std::net::IpAddr::from_str(host).ok()
+}
+
+fn is_blocked_ip(config: &crate::config::InnerConfig, ip: &std::net::IpAddr) -> bool {
+    let ip = ip.to_canonical();
+
+    config
+        .api
+        .remote_download_blocked_cidrs
+        .iter()
+        .any(|cidr| cidr.contains(&ip))
+}
+
 async fn get_download_client(
     config: &Arc<crate::config::Config>,
 ) -> Result<Arc<reqwest::Client>, anyhow::Error> {
@@ -30,10 +49,22 @@ async fn get_download_client(
     drop(client);
     let mut write_lock = DOWNLOAD_CLIENT.write().await;
 
+    let redirect_config = Arc::clone(config);
     let new_client = reqwest::Client::builder()
         .user_agent("Calagopus Wings (https://github.com/calagopus/wings)")
         .connect_timeout(std::time::Duration::from_secs(30))
         .dns_resolver(Arc::new(resolver::DnsResolver::new(config)))
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if let Some(host) = attempt.url().host_str()
+                && let Some(ip) = host_to_ip(host)
+                && is_blocked_ip(&redirect_config.load(), &ip)
+            {
+                tracing::warn!("blocking redirect to internal IP address in pull: {}", ip);
+                return attempt.error(anyhow::anyhow!("IP address {} is blocked", ip));
+            }
+
+            attempt.follow()
+        }))
         .build()
         .context("failed to build download client")?;
 
@@ -60,14 +91,11 @@ impl PullQueryResponse {
         let url = reqwest::Url::parse(url).context("failed to parse download URL")?;
 
         if let Some(host) = url.host_str()
-            && let Ok(ip) = std::net::IpAddr::from_str(host)
+            && let Some(ip) = host_to_ip(host)
+            && is_blocked_ip(&config.load(), &ip)
         {
-            for cidr in config.load().api.remote_download_blocked_cidrs.iter() {
-                if cidr.contains(&ip) {
-                    tracing::warn!("blocking internal IP address in pull: {}", ip);
-                    return Err(anyhow::anyhow!("IP address {} is blocked", ip));
-                }
-            }
+            tracing::warn!("blocking internal IP address in pull: {}", ip);
+            return Err(anyhow::anyhow!("IP address {} is blocked", ip));
         }
 
         let response = get_download_client(config)
@@ -137,21 +165,11 @@ impl Download {
         let url = reqwest::Url::parse(&url).context("failed to parse download URL")?;
 
         if let Some(host) = url.host_str()
-            && let Ok(ip) = std::net::IpAddr::from_str(host)
+            && let Some(ip) = host_to_ip(host)
+            && is_blocked_ip(&server.app_state.config.load(), &ip)
         {
-            for cidr in server
-                .app_state
-                .config
-                .load()
-                .api
-                .remote_download_blocked_cidrs
-                .iter()
-            {
-                if cidr.contains(&ip) {
-                    tracing::warn!("blocking internal IP address in pull: {}", ip);
-                    return Err(anyhow::anyhow!("IP address {} is blocked", ip));
-                }
-            }
+            tracing::warn!("blocking internal IP address in pull: {}", ip);
+            return Err(anyhow::anyhow!("IP address {} is blocked", ip));
         }
 
         let response = get_download_client(&server.app_state.config)
@@ -169,53 +187,47 @@ impl Download {
             ));
         }
 
-        'header_check: {
-            if let Some(file_name) = file_name {
-                real_destination.push(file_name);
-            } else if use_header {
-                if let Some(header) = response.headers().get("Content-Disposition")
-                    && let Ok(header) = header.to_str()
-                    && let Some(filename) = crate::utils::parse_content_disposition_filename(header)
-                {
-                    real_destination.push(filename);
-                    break 'header_check;
+        let file_name = match file_name {
+            Some(file_name) => {
+                if !crate::utils::is_single_component_file_name(&file_name) {
+                    return Err(anyhow::anyhow!("file name must be a single path component"));
                 }
 
-                real_destination.push(
-                    response
-                        .url()
-                        .path_segments()
-                        .and_then(|mut segments| segments.next_back())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| {
-                            let random_string: String = rand::rng()
-                                .sample_iter(&rand::distr::Alphanumeric)
-                                .take(8)
-                                .map(char::from)
-                                .collect();
-
-                            format!("download_{random_string}")
-                        }),
-                );
-            } else {
-                real_destination.push(
-                    response
-                        .url()
-                        .path_segments()
-                        .and_then(|mut segments| segments.next_back())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| {
-                            let random_string: String = rand::rng()
-                                .sample_iter(&rand::distr::Alphanumeric)
-                                .take(8)
-                                .map(char::from)
-                                .collect();
-
-                            format!("download_{random_string}")
-                        }),
-                );
+                file_name.to_string()
             }
-        }
+            None => {
+                let header_file_name = if use_header {
+                    response
+                        .headers()
+                        .get("Content-Disposition")
+                        .and_then(|header| header.to_str().ok())
+                        .and_then(crate::utils::parse_content_disposition_filename)
+                        .filter(|file_name| crate::utils::is_single_component_file_name(file_name))
+                } else {
+                    None
+                };
+
+                header_file_name.unwrap_or_else(|| {
+                    response
+                        .url()
+                        .path_segments()
+                        .and_then(|mut segments| segments.next_back())
+                        .filter(|segment| crate::utils::is_single_component_file_name(segment))
+                        .map(|segment| segment.to_string())
+                        .unwrap_or_else(|| {
+                            let random_string: String = rand::rng()
+                                .sample_iter(&rand::distr::Alphanumeric)
+                                .take(8)
+                                .map(char::from)
+                                .collect();
+
+                            format!("download_{random_string}")
+                        })
+                })
+            }
+        };
+
+        real_destination.push(file_name);
 
         if filesystem.is_primary_server_fs()
             && server.filesystem.is_ignored(&real_destination, false)

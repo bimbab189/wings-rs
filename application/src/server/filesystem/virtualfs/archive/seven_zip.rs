@@ -11,8 +11,8 @@ use crate::{
         encode_mode,
         usage::SpaceDelta,
         virtualfs::{
-            AsyncFileRead, AsyncReadableFileStream, ByteRange, DirectoryListing,
-            DirectoryStreamWalk, DirectoryWalk, FileMetadata, FileRead, IsIgnoredFn,
+            AsyncDirectoryStreamWalk, AsyncDirectoryWalk, AsyncFileRead, AsyncReadableFileStream,
+            ByteRange, DirectoryListing, DirectoryWalk, FileMetadata, FileRead, IsIgnoredFn,
             VirtualReadableFilesystem,
         },
     },
@@ -166,6 +166,7 @@ impl VirtualSevenZipArchive {
             directory: true,
             file: false,
             symlink: false,
+            r#virtual: true,
             mime: detected_mime.mime,
             modified: Default::default(),
             created: *archive_created,
@@ -232,6 +233,7 @@ impl VirtualSevenZipArchive {
             directory: entry.is_directory(),
             file: !entry.is_directory(),
             symlink: false,
+            r#virtual: true,
             mime: detected_mime.mime,
             modified: if entry.has_last_modified_date {
                 std::time::SystemTime::from(entry.last_modified_date).into()
@@ -270,7 +272,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         if path_ref == Path::new("") || path_ref == Path::new("/") {
             return Ok(FileMetadata {
                 file_type: FileType::Dir,
-                permissions: PortablePermissions::from_mode(0o755),
+                permissions: PortablePermissions::from_mode_dir(0o755),
                 size: 0,
                 modified: None,
                 created: None,
@@ -287,9 +289,9 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
             return Ok(FileMetadata {
                 file_type: Self::seven_zip_entry_to_file_type(entry),
                 permissions: if entry.is_directory() {
-                    PortablePermissions::from_mode(0o755)
+                    PortablePermissions::from_mode_dir(0o755)
                 } else {
-                    PortablePermissions::from_mode(0o644)
+                    PortablePermissions::from_mode_file(0o644)
                 },
                 size: entry.size(),
                 modified: if entry.has_last_modified_date {
@@ -308,7 +310,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         if Self::is_virtual_directory(&self.sizes, path_ref) {
             return Ok(FileMetadata {
                 file_type: FileType::Dir,
-                permissions: PortablePermissions::from_mode(0o755),
+                permissions: PortablePermissions::from_mode_dir(0o755),
                 size: 0,
                 modified: None,
                 created: None,
@@ -717,23 +719,22 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         Ok(entries)
     }
 
-    async fn async_walk_dir<'a>(
+    fn walk_dir<'a>(
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
     ) -> Result<Box<dyn DirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
-        struct InMemoryWalkDir {
+        struct IgnoreWalkDir {
             path: PathBuf,
             archive: Arc<sevenz_rust2::Archive>,
             current_index: usize,
             is_ignored: IsIgnoredFn,
         }
 
-        #[async_trait::async_trait]
-        impl DirectoryWalk for InMemoryWalkDir {
-            async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
+        impl DirectoryWalk for IgnoreWalkDir {
+            fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
                 while self.current_index < self.archive.files.len() {
-                    let entry = &self.archive.files[self.current_index];
+                    let entry = self.archive.files.get(self.current_index)?;
                     self.current_index += 1;
 
                     let name = Path::new(entry.name());
@@ -752,7 +753,49 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
             }
         }
 
-        Ok(Box::new(InMemoryWalkDir {
+        Ok(Box::new(IgnoreWalkDir {
+            path: path.as_ref().to_path_buf(),
+            archive: self.archive.clone(),
+            current_index: 0,
+            is_ignored,
+        }))
+    }
+    async fn async_walk_dir<'a>(
+        &'a self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        is_ignored: IsIgnoredFn,
+    ) -> Result<Box<dyn AsyncDirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
+        struct AsyncIgnoreWalkDir {
+            path: PathBuf,
+            archive: Arc<sevenz_rust2::Archive>,
+            current_index: usize,
+            is_ignored: IsIgnoredFn,
+        }
+
+        #[async_trait::async_trait]
+        impl AsyncDirectoryWalk for AsyncIgnoreWalkDir {
+            async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
+                while self.current_index < self.archive.files.len() {
+                    let entry = self.archive.files.get(self.current_index)?;
+                    self.current_index += 1;
+
+                    let name = Path::new(entry.name());
+
+                    if !name.starts_with(&self.path) || name == self.path {
+                        continue;
+                    }
+
+                    let file_type = VirtualSevenZipArchive::seven_zip_entry_to_file_type(entry);
+
+                    if let Some(name) = (self.is_ignored)(file_type, name.to_path_buf()) {
+                        return Some(Ok((file_type, name)));
+                    }
+                }
+                None
+            }
+        }
+
+        Ok(Box::new(AsyncIgnoreWalkDir {
             path: path.as_ref().to_path_buf(),
             archive: self.archive.clone(),
             current_index: 0,
@@ -764,7 +807,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
-    ) -> Result<Box<dyn DirectoryStreamWalk + Send + Sync + 'a>, anyhow::Error> {
+    ) -> Result<Box<dyn AsyncDirectoryStreamWalk + Send + Sync + 'a>, anyhow::Error> {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
 
         let archive = self.archive.clone();
@@ -882,7 +925,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         }
 
         #[async_trait::async_trait]
-        impl DirectoryStreamWalk for ChannelStreamWalker {
+        impl AsyncDirectoryStreamWalk for ChannelStreamWalker {
             async fn next_entry(
                 &mut self,
             ) -> Option<Result<(FileType, PathBuf, AsyncReadableFileStream), anyhow::Error>>
@@ -1056,16 +1099,18 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
         let archive = self.archive.clone();
         let mut reader = self.reader.clone();
         let path = path.as_ref().to_path_buf();
 
         let (simplex_reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (simplex_reader, signal) =
+            crate::io::fallible_reader::FallibleReader::new(simplex_reader);
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let writer = tokio_util::io::SyncIoBridge::new(writer);
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
@@ -1172,7 +1217,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                         .file_compression_threads,
                 )?;
 
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let mut tar = tar::Builder::new(writer);
                     tar.mode(tar::HeaderMode::Complete);
 
@@ -1267,7 +1312,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                         .file_compression_threads,
                 )?;
 
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
                     let mut itaf_enc = ItafEncoder::new(
                         writer,
                         EncoderOptions {
@@ -1313,6 +1358,22 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                         let Some(name) = components.last() else {
                             continue;
                         };
+
+                        // 7z names come from the source archive rather than from
+                        // readdir, so they can hold bytes itaf rejects (NUL is
+                        // representable in 7z's UTF-16 names). Validate the whole
+                        // chain before touching dir_stack so a skip cannot leave
+                        // the encoder's directory nesting unbalanced.
+                        if let Some(invalid) = components
+                            .iter()
+                            .find(|c| itaf::spec::validate_name(c).is_err())
+                        {
+                            tracing::debug!(
+                                path = %relative.display(),
+                                "skipping 7z entry while creating itaf archive, invalid name component: {invalid:?}"
+                            );
+                            continue;
+                        }
 
                         let parent = components.get_slice(..components.len() - 1)?;
 
@@ -1386,7 +1447,12 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
 
                                     Ok(false)
                                 })
-                                .unwrap_or_default();
+                                // Not unwrap_or_default: a failure here can land
+                                // mid-entry, and swallowing it would let finish()
+                                // hand back a well-formed but silently wrong archive.
+                                .map_err(|err| {
+                                    anyhow::anyhow!("failed to write 7z entry to itaf: {err}")
+                                })?;
                         } else {
                             itaf_enc.add_file(name, &meta, size, &mut std::io::empty())?;
                         }

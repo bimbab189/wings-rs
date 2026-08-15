@@ -2,7 +2,7 @@ use clap::{Args, FromArgMatches};
 use colored::Colorize;
 use dialoguer::{Confirm, theme::ColorfulTheme};
 use serde::Deserialize;
-use std::{fmt::Write, path::Path};
+use std::fmt::Write;
 use tokio::{fs::File, io::AsyncBufReadExt};
 
 #[derive(Args)]
@@ -11,7 +11,7 @@ pub struct DiagnosticsArgs {
         short = 'l',
         long = "log-lines",
         help = "number of log lines to include in the report",
-        default_value_t = 100
+        default_value_t = 500
     )]
     pub log_lines: usize,
 }
@@ -93,6 +93,11 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
                 )?;
                 write_line(&mut output, "ssl certificate", &config.api.ssl.cert)?;
                 write_line(&mut output, "ssl key", &config.api.ssl.key)?;
+                write_line(
+                    &mut output,
+                    "ssl kernel tls",
+                    &format!("{}", config.api.ssl.ktls_enabled),
+                )?;
                 writeln!(output)?;
                 write_line(
                     &mut output,
@@ -118,18 +123,40 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
                     &format!("{}", !config.system.sftp.disable_password_auth),
                 )?;
                 writeln!(output)?;
-                write_line(&mut output, "root directory", &config.system.root_directory)?;
-                write_line(&mut output, "logs directory", &config.system.log_directory)?;
-                write_line(&mut output, "data directory", &config.system.data_directory)?;
+                write_line(
+                    &mut output,
+                    "root directory",
+                    &config.system.root_directory.as_str(&config),
+                )?;
+                write_line(
+                    &mut output,
+                    "logs directory",
+                    &config.system.log_directory.as_str(&config),
+                )?;
+                write_line(
+                    &mut output,
+                    "data directory",
+                    &config.system.data_directory.as_str(&config),
+                )?;
+                write_line(
+                    &mut output,
+                    "diffs directory",
+                    &config.system.diffs_directory.as_str(&config),
+                )?;
+                write_line(
+                    &mut output,
+                    "vmount directory",
+                    &config.system.vmount_directory.as_str(&config),
+                )?;
                 write_line(
                     &mut output,
                     "archive directory",
-                    &config.system.archive_directory,
+                    &config.system.archive_directory.as_str(&config),
                 )?;
                 write_line(
                     &mut output,
                     "backup directory",
-                    &config.system.backup_directory,
+                    &config.system.backup_directory.as_str(&config),
                 )?;
                 writeln!(output)?;
                 write_line(&mut output, "username", &config.system.username)?;
@@ -146,7 +173,15 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
                 write_line(&mut output, "debug mode", &format!("{}", config.debug))?;
 
                 write_header(&mut output, "latest wings-rs logs")?;
-                match File::open(Path::new(&config.system.log_directory).join("wings.log")).await {
+                match File::open(
+                    config
+                        .system
+                        .log_directory
+                        .as_path(&config)
+                        .join("wings.log"),
+                )
+                .await
+                {
                     Ok(file) => {
                         let mut reader = tokio::io::BufReader::new(
                             crate::io::tail::async_tail(file, args.log_lines).await?,

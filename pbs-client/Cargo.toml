@@ -17,6 +17,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 tokio-rustls = "0.26.4"
 rustls = { workspace = true }
+rustls-platform-verifier = "0.7"
 bytes = { workspace = true }
 sha2 = { workspace = true }
 crc32fast = { workspace = true }

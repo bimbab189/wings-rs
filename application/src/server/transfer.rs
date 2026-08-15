@@ -27,6 +27,8 @@ use tokio::{
 };
 use utoipa::ToSchema;
 
+pub const MAX_MULTIPLEX_STREAMS: usize = 16;
+
 #[derive(Clone, Copy, ToSchema, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 #[schema(rename_all = "snake_case")]
@@ -510,6 +512,35 @@ impl OutgoingServerTransfer {
                 );
             }
 
+            match server.diff.export_snapshot().await {
+                Ok(Some(diff_db)) => {
+                    bytes_total.fetch_add(diff_db.metadata().await.map(|m| m.len()).unwrap_or(0), Ordering::Relaxed);
+
+                    form = form.part(
+                        "diff-db",
+                        reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(
+                            tokio_util::io::ReaderStream::with_capacity(
+                                AsyncCountingReader::new_with_bytes_read(
+                                    diff_db,
+                                    Arc::clone(&bytes_archived),
+                                ),
+                                crate::TRANSFER_BUFFER_SIZE,
+                            ),
+                        ))
+                        .file_name("diffs.db")
+                        .mime_str("application/octet-stream")
+                        .expect("failed to set mime type for diff db"),
+                    );
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        server = %server.uuid,
+                        "failed to export file history for transfer: {err:#}"
+                    );
+                }
+            }
+
             let destination_capabilities = if backups.is_empty() {
                 None
             } else {
@@ -541,6 +572,23 @@ impl OutgoingServerTransfer {
             );
             for backup in &backups {
                 form = backup_sender.append_part(form, *backup).await;
+            }
+
+            let skipped_backups = backups.len().saturating_sub(backup_sender.sent().len());
+            if skipped_backups > 0 {
+                tracing::warn!(
+                    server = %server.uuid,
+                    "{skipped_backups} of {} backups could not be included in the transfer",
+                    backups.len()
+                );
+
+                Self::log(
+                    &server,
+                    &format!(
+                        "Warning: {skipped_backups} of {} backups could not be included in this transfer and will be left on this node.",
+                        backups.len()
+                    ),
+                );
             }
 
             let progress_task = Box::pin({
@@ -602,14 +650,12 @@ impl OutgoingServerTransfer {
                         let archive_percentage = (current_bytes_archived as f64 / bytes_total as f64) * 100.0;
                         let formatted_archive_percentage = format!("{:.2}%", archive_percentage);
 
-                        let time_estimate = if history.len() > 1 && current_bytes_archived < bytes_total {
-                            let Some(&(oldest_time, oldest_progress)) = history.front() else {
-                                return Cow::Borrowed("unknown");
-                            };
-                            let Some(&(newest_time, newest_progress)) = history.back() else {
-                                return Cow::Borrowed("unknown");
-                            };
-
+                        let time_estimate = if current_bytes_archived >= bytes_total {
+                            Cow::Borrowed("0s")
+                        } else if let (Some(&(oldest_time, oldest_progress)), Some(&(newest_time, newest_progress))) =
+                            (history.front(), history.back())
+                            && history.len() > 1
+                        {
                             let delta_progress = newest_progress.saturating_sub(oldest_progress) as f64;
                             let delta_time = newest_time.duration_since(oldest_time).as_secs_f64();
 
@@ -631,8 +677,6 @@ impl OutgoingServerTransfer {
                             } else {
                                 Cow::Borrowed("calculating...")
                             }
-                        } else if current_bytes_archived >= bytes_total {
-                            Cow::Borrowed("0s")
                         } else {
                             Cow::Borrowed("unknown")
                         };
@@ -788,6 +832,19 @@ impl OutgoingServerTransfer {
 
             Self::log(&server, "Streaming archive to destination...");
 
+            async fn check_response(response: reqwest::Response) -> Result<(), anyhow::Error> {
+                let status = response.status();
+                if status.is_success() {
+                    return Ok(());
+                }
+
+                let body = response.text().await.unwrap_or_default();
+
+                Err(anyhow::anyhow!(
+                    "destination node rejected the transfer with status {status}: {body}"
+                ))
+            }
+
             tokio::select! {
                 result = async {
                     tokio::try_join!(
@@ -795,8 +852,14 @@ impl OutgoingServerTransfer {
                         checksum_task,
                         file_collector_task,
                         futures::future::try_join_all(multiplex_tasks),
-                        async { Ok(response.await?) },
-                        async { Ok(futures::future::try_join_all(multiplex_responses).await?) }
+                        async { check_response(response.await?).await },
+                        async {
+                            for response in futures::future::try_join_all(multiplex_responses).await? {
+                                check_response(response).await?;
+                            }
+
+                            Ok::<_, anyhow::Error>(())
+                        }
                     )
                 } => {
                     if let Err(err) = result {
@@ -806,6 +869,8 @@ impl OutgoingServerTransfer {
                             err
                         );
 
+                        Self::log(&server, &format!("Transfer failed: {err}"));
+
                         backup_sender.finish().await;
                         Self::transfer_failure(&server).await;
                         return;
@@ -814,12 +879,13 @@ impl OutgoingServerTransfer {
                 _ = progress_task => {}
             };
 
+            let transferred_backups = backup_sender.sent().to_vec();
             backup_sender.finish().await;
 
             Self::log(&server, "Finished streaming archive to destination.");
 
             if delete_backups {
-                for backup in backups {
+                for backup in transferred_backups {
                     match backup_manager.find(&server.app_state, backup).await {
                         Ok(Some(backup)) => {
                             if let Err(err) = backup.delete(&server.app_state).await {
@@ -900,10 +966,10 @@ impl Drop for OutgoingServerTransfer {
 pub struct IncomingServerTransfer {
     pub main_handle: AbortHandle,
 
-    pub multiplex_handles: Vec<(
-        AbortHandle,
-        tokio::sync::oneshot::Receiver<Result<(), anyhow::Error>>,
-    )>,
+    pub expected_streams: usize,
+
+    pub multiplex_abort_handles: Vec<AbortHandle>,
+    pub multiplex_receivers: Vec<tokio::sync::oneshot::Receiver<Result<(), anyhow::Error>>>,
 }
 
 impl IncomingServerTransfer {
@@ -911,11 +977,19 @@ impl IncomingServerTransfer {
         &mut self,
         main: JoinHandle<Result<super::backup::transfer::ReceivedBackups, anyhow::Error>>,
     ) -> Result<super::backup::transfer::ReceivedBackups, anyhow::Error> {
-        let (backups, _) = tokio::try_join!(async { main.await? }, async {
-            Ok(futures::future::try_join_all(
-                self.multiplex_handles.drain(..).map(|h| h.1),
+        let (backups, _) = tokio::try_join!(
+            async { main.await? },
+            futures::future::try_join_all(self.multiplex_receivers.drain(..).map(
+                |receiver| async {
+                    match receiver.await {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::anyhow!(
+                            "multiplex stream closed without completing"
+                        )),
+                    }
+                },
             ))
-        })?;
+        )?;
 
         Ok(backups)
     }
@@ -925,8 +999,8 @@ impl Drop for IncomingServerTransfer {
     fn drop(&mut self) {
         self.main_handle.abort();
 
-        for handle in self.multiplex_handles.iter() {
-            handle.0.abort();
+        for handle in self.multiplex_abort_handles.iter() {
+            handle.abort();
         }
     }
 }

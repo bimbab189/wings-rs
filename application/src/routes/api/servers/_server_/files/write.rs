@@ -127,11 +127,7 @@ pub(crate) mod post {
                 .ok();
         }
 
-        let diff_key = server
-            .filesystem
-            .async_canonicalize(&path)
-            .await
-            .unwrap_or_else(|_| server.filesystem.relative_path(&path));
+        let diff_key = server.filesystem.diff_key(&path).await;
         let diff_key = diff_key.to_string_lossy();
         let config_guard = state.config.load();
         let history = &config_guard.system.file_history;
@@ -181,7 +177,10 @@ pub(crate) mod post {
         let mut file = filesystem.async_create_file(&path).await?;
         let mut stream = body.into_data_stream();
 
-        while let Some(Ok(chunk)) = stream.next().await {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|err| {
+                std::io::Error::other(format!("failed to read request body: {err}"))
+            })?;
             file.write_all(&chunk).await?;
         }
 

@@ -2,15 +2,23 @@ use crate::{
     remote::backups::RawServerBackup,
     response::ApiResponse,
     server::filesystem::{
-        archive::StreamableArchiveFormat,
+        archive::{ArchiveFormat, StreamableArchiveFormat},
         virtualfs::{ByteRange, VirtualReadableFilesystem},
     },
 };
+use serde::Serialize;
 use std::sync::{Arc, atomic::AtomicU64};
+use utoipa::ToSchema;
 
 pub mod adapters;
 pub mod manager;
 pub mod transfer;
+
+#[derive(Clone, ToSchema, Serialize)]
+pub struct BackupDownloadInfo {
+    pub archive_format: Option<ArchiveFormat>,
+    pub size: Option<u64>,
+}
 
 pub enum Backup {
     Wings(adapters::wings::WingsBackup),
@@ -48,6 +56,19 @@ impl Backup {
             Backup::Restic(_) => adapters::BackupAdapter::Restic,
             Backup::ProxmoxBackupServer(_) => adapters::BackupAdapter::ProxmoxBackupServer,
             Backup::Kopia(_) => adapters::BackupAdapter::Kopia,
+        }
+    }
+
+    pub async fn download_info(&self) -> Result<BackupDownloadInfo, anyhow::Error> {
+        match self {
+            Backup::Wings(backup) => backup.download_info().await,
+            Backup::S3(backup) => backup.download_info().await,
+            Backup::DdupBak(backup) => backup.download_info().await,
+            Backup::Btrfs(backup) => backup.download_info().await,
+            Backup::Zfs(backup) => backup.download_info().await,
+            Backup::Restic(backup) => backup.download_info().await,
+            Backup::ProxmoxBackupServer(backup) => backup.download_info().await,
+            Backup::Kopia(backup) => backup.download_info().await,
         }
     }
 
@@ -146,6 +167,13 @@ pub trait BackupCreateExt {
 #[async_trait::async_trait]
 pub trait BackupExt {
     fn uuid(&self) -> uuid::Uuid;
+
+    async fn download_info(&self) -> Result<BackupDownloadInfo, anyhow::Error> {
+        Ok(BackupDownloadInfo {
+            archive_format: None,
+            size: None,
+        })
+    }
 
     async fn download(
         &self,

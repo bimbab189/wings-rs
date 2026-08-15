@@ -175,6 +175,7 @@ pub struct AsyncWalkDir {
     cap_filesystem: super::CapFilesystem,
     stack: Vec<(PathBuf, AsyncReadDir)>,
     is_ignored: IsIgnoredFn,
+    reversed: bool,
 }
 
 impl AsyncWalkDir {
@@ -188,11 +189,18 @@ impl AsyncWalkDir {
             cap_filesystem,
             stack: vec![(path, read_dir)],
             is_ignored: IsIgnoredFn::default(),
+            reversed: false,
         })
     }
 
     pub fn with_is_ignored(mut self, is_ignored: IsIgnoredFn) -> Self {
         self.is_ignored = is_ignored;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn reversed(mut self) -> Self {
+        self.reversed = true;
         self
     }
 
@@ -211,13 +219,21 @@ impl AsyncWalkDir {
                             Ok(dir) => self.stack.push((full_path.clone(), dir)),
                             Err(err) => return Some(Err(err)),
                         };
+
+                        if self.reversed {
+                            continue 'stack;
+                        }
                     }
 
                     return Some(Ok((file_type, full_path)));
                 }
                 Some(Err(err)) => return Some(Err(err)),
                 None => {
-                    self.stack.pop();
+                    let (path, _) = self.stack.pop()?;
+
+                    if self.reversed && !self.stack.is_empty() {
+                        return Some(Ok((FileType::Dir, path)));
+                    }
                 }
             }
         }
@@ -225,15 +241,14 @@ impl AsyncWalkDir {
         None
     }
 
-    pub async fn run_multithreaded<F, Fut>(
+    pub async fn run_multithreaded<
+        F: Fn(FileType, PathBuf) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), anyhow::Error>> + Send + 'static,
+    >(
         &mut self,
         threads: usize,
         func: Arc<F>,
-    ) -> Result<(), anyhow::Error>
-    where
-        F: Fn(FileType, PathBuf) -> Fut + Send + Sync + 'static,
-        Fut: futures::Future<Output = Result<(), anyhow::Error>> + Send + 'static,
-    {
+    ) -> Result<(), anyhow::Error> {
         let semaphore = Arc::new(Semaphore::new(threads));
         let error = Arc::new(RwLock::new(None));
 
@@ -280,6 +295,7 @@ pub struct WalkDir {
     cap_filesystem: super::CapFilesystem,
     stack: Vec<(PathBuf, ReadDir)>,
     is_ignored: IsIgnoredFn,
+    reversed: bool,
 }
 
 impl WalkDir {
@@ -293,11 +309,17 @@ impl WalkDir {
             cap_filesystem,
             stack: vec![(path, read_dir)],
             is_ignored: IsIgnoredFn::default(),
+            reversed: false,
         })
     }
 
     pub fn with_is_ignored(mut self, is_ignored: IsIgnoredFn) -> Self {
         self.is_ignored = is_ignored;
+        self
+    }
+
+    pub fn reversed(mut self) -> Self {
+        self.reversed = true;
         self
     }
 
@@ -316,6 +338,10 @@ impl WalkDir {
                             Ok(dir) => self.stack.push((full_path.clone(), dir)),
                             Err(err) => return Some(Err(err)),
                         };
+
+                        if self.reversed {
+                            continue 'stack;
+                        }
                     }
 
                     return Some(Ok((file_type, full_path)));
@@ -324,11 +350,63 @@ impl WalkDir {
                     return Some(Err(err));
                 }
                 None => {
-                    self.stack.pop();
+                    let (path, _) = self.stack.pop()?;
+
+                    if self.reversed && !self.stack.is_empty() {
+                        return Some(Ok((FileType::Dir, path)));
+                    }
                 }
             }
         }
 
         None
+    }
+
+    pub fn run_multithreaded<
+        F: Fn(FileType, PathBuf) -> Result<(), anyhow::Error> + Send + Sync + 'static,
+    >(
+        &mut self,
+        threads: usize,
+        func: Arc<F>,
+    ) -> Result<(), anyhow::Error> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()?;
+        let error = Arc::new(RwLock::new(None));
+
+        pool.in_place_scope(|scope| {
+            while let Some(entry) = self.next_entry() {
+                match entry {
+                    Ok((file_type, path)) => {
+                        if crate::unlikely(error.read().is_some()) {
+                            break;
+                        }
+
+                        let error = Arc::clone(&error);
+                        let func = Arc::clone(&func);
+
+                        scope.spawn(move |_| {
+                            if crate::unlikely(error.read().is_some()) {
+                                return;
+                            }
+
+                            if let Err(err) = func(file_type, path) {
+                                *error.write() = Some(err);
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        *error.write() = Some(err.into());
+                        break;
+                    }
+                }
+            }
+        });
+
+        if let Some(err) = error.write().take() {
+            return Err(err);
+        }
+
+        Ok(())
     }
 }

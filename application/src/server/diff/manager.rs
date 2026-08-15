@@ -32,18 +32,8 @@ pub struct DiffManager {
 
 impl DiffManager {
     pub fn new(server: uuid::Uuid, config: &Arc<crate::config::Config>) -> Self {
-        let dir = std::path::Path::new(&config.load().system.root_directory).join("diffs");
-        let db_path = dir.join(format!("{server}.db"));
-
-        if config.load().system.file_history.enabled
-            && let Err(err) = std::fs::create_dir_all(&dir)
-        {
-            tracing::error!(
-                server = %server,
-                "failed to create diff directory {}: {err:#}",
-                dir.display()
-            );
-        }
+        let diffs_directory = config.resolve_as_path(|cfg| &cfg.system.diffs_directory);
+        let db_path = diffs_directory.join(format!("{server}.db"));
 
         let storage: Arc<Mutex<Option<Storage>>> = Arc::new(Mutex::new(None));
         let pending_forgets: Arc<Mutex<HashMap<compact_str::CompactString, PendingForget>>> =
@@ -271,6 +261,23 @@ impl DiffManager {
         .await?
     }
 
+    pub async fn revision_path(&self, revision_id: i64) -> Result<Option<String>, anyhow::Error> {
+        if !self.ensure_open().await {
+            return Ok(None);
+        }
+
+        let storage = Arc::clone(&self.storage);
+        tokio::task::spawn_blocking(move || -> Result<Option<String>, anyhow::Error> {
+            let guard = storage.blocking_lock();
+            let Some(storage) = guard.as_ref() else {
+                return Ok(None);
+            };
+
+            storage.revision_path(revision_id)
+        })
+        .await?
+    }
+
     pub async fn get_content(&self, revision_id: i64) -> Result<Option<Vec<u8>>, anyhow::Error> {
         if !self.ensure_open().await {
             return Ok(None);
@@ -412,6 +419,63 @@ impl DiffManager {
             Ok(())
         })
         .await?
+    }
+
+    pub async fn export_snapshot(&self) -> Result<Option<tokio::fs::File>, anyhow::Error> {
+        let db_path = self.db_path.clone();
+        let zstd_level = self.config.load().system.file_history.zstd_level;
+        let storage = Arc::clone(&self.storage);
+
+        let temp_path =
+            tokio::task::spawn_blocking(move || -> Result<Option<PathBuf>, anyhow::Error> {
+                let guard = storage.blocking_lock();
+
+                let mut temp = db_path.clone().into_os_string();
+                temp.push(".transfer");
+                let temp_path = PathBuf::from(temp);
+                std::fs::remove_file(&temp_path).ok();
+
+                match guard.as_ref() {
+                    Some(s) => s.vacuum_into(&temp_path)?,
+                    None => {
+                        if !db_path.exists() {
+                            return Ok(None);
+                        }
+
+                        Storage::open(&db_path, zstd_level)?.vacuum_into(&temp_path)?;
+                    }
+                }
+
+                Ok(Some(temp_path))
+            })
+            .await??;
+
+        match temp_path {
+            Some(path) => {
+                let file = tokio::fs::File::open(&path).await?;
+                tokio::fs::remove_file(&path).await.ok();
+
+                Ok(Some(file))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn prepare_import(&self) -> Result<tokio::fs::File, anyhow::Error> {
+        let mut guard = self.storage.lock().await;
+        *guard = None;
+
+        if let Some(parent) = self.db_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        for ext in ["-wal", "-shm"] {
+            let mut s = self.db_path.clone().into_os_string();
+            s.push(ext);
+            tokio::fs::remove_file(PathBuf::from(s)).await.ok();
+        }
+
+        Ok(tokio::fs::File::create(&self.db_path).await?)
     }
 
     pub async fn close(&self) {

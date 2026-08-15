@@ -5,6 +5,8 @@ use utoipa_axum::{
     routes,
 };
 
+const MAX_CHECKSUM_LEN: usize = 1024;
+
 pub(crate) mod _server_;
 pub(crate) mod files;
 mod capabilities;
@@ -138,7 +140,8 @@ pub(crate) mod post {
         let is_multiplex = headers.contains_key("Multiplex-Stream");
         let multiplex_stream_count: usize = headers
             .get("Multiplex-Stream-Count")
-            .map_or(Ok(0), |v| v.to_str().unwrap_or_default().parse())?;
+            .map_or(Ok(0), |v| v.to_str().unwrap_or_default().parse::<usize>())?
+            .min(crate::server::transfer::MAX_MULTIPLEX_STREAMS);
 
         let server = if !is_multiplex {
             if state.server_manager.get_server(subject).await.is_some() {
@@ -150,39 +153,35 @@ pub(crate) mod post {
             let server_data = state.config.client.server(subject).await?;
             let server = state
                 .server_manager
-                .create_server(&state, server_data, false)
+                .create_server(
+                    &state,
+                    server_data,
+                    crate::server::manager::ServerCreation::Transferred,
+                )
                 .await;
 
             server.transferring.store(true, Ordering::SeqCst);
             server
         } else {
             let mut tries = 0;
-            let mut server;
 
             loop {
-                server = state.server_manager.get_server(subject).await;
+                if let Some(server) = state.server_manager.get_server(subject).await
+                    && server.transferring.load(Ordering::SeqCst)
+                    && server.incoming_transfer.read().await.is_some()
+                {
+                    break server;
+                }
+
                 tries += 1;
 
-                if server.is_none() {
-                    if tries >= 10 {
-                        return ApiResponse::error("unable to find transfer for multiplex")
-                            .with_status(StatusCode::CONFLICT)
-                            .ok();
-                    } else {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            match server {
-                Some(server) => server,
-                None => {
-                    return ApiResponse::error("server not found")
-                        .with_status(StatusCode::NOT_FOUND)
+                if tries >= 40 {
+                    return ApiResponse::error("unable to find transfer for multiplex")
+                        .with_status(StatusCode::CONFLICT)
                         .ok();
                 }
+
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         };
 
@@ -200,14 +199,26 @@ pub(crate) mod post {
                         anyhow::Error,
                     > {
                         let mut archive_checksum = None;
+                        let mut archive_received = false;
                         let mut backup_receiver =
                             crate::server::backup::transfer::BackupReceiver::new(
                                 state.0.clone(),
                                 listener.clone(),
                             );
 
-                        while let Ok(Some(mut field)) = runtime.block_on(multipart.next_field()) {
+                        loop {
+                            let mut field = match runtime.block_on(multipart.next_field()) {
+                                Ok(Some(field)) => field,
+                                Ok(None) => break,
+                                Err(err) => {
+                                    return Err(anyhow::anyhow!(
+                                        "failed to read transfer multipart field: {err}"
+                                    ));
+                                }
+                            };
+
                             if field.name() == Some("archive") {
+                                archive_received = true;
                                 let file_name =
                                     field.file_name().unwrap_or("archive.tar.gz").to_string();
                                 let reader = tokio_util::io::StreamReader::new(
@@ -243,14 +254,13 @@ pub(crate) mod post {
                                     let archive = itaf::decoder::ItafDecoder::new(&mut reader)?;
                                     let mut directory_entries = chunked_vec::ChunkedVec::new();
                                     let mut last_parent = None;
-                                    let mut entries = archive.entries();
+                                    let entries = archive.entries();
 
                                     let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
-                                    while let Some(Ok(mut entry)) = entries.next() {
+                                    for entry in entries {
+                                        let mut entry = entry?;
                                         let destination_path = entry.enclosed_path();
-                                        if destination_path.as_os_str().is_empty()
-                                            || destination_path.is_absolute()
-                                        {
+                                        if destination_path.as_os_str().is_empty() {
                                             continue;
                                         }
 
@@ -263,7 +273,7 @@ pub(crate) mod post {
                                                 let meta = dir.metadata();
                                                 server.filesystem.set_permissions(
                                                     &destination_path,
-                                                    PortablePermissions::from_mode(meta.mode),
+                                                    PortablePermissions::from_mode_dir(meta.mode),
                                                 )?;
 
                                                 if directory_entries.len() < Archive::MAX_DIRECTORY_MTIME_ENTRIES {
@@ -285,7 +295,7 @@ pub(crate) mod post {
                                                     crate::server::filesystem::file::ServerFile::new(
                                                         server.clone(),
                                                         &destination_path,
-                                                        Some(PortablePermissions::from_mode(meta.mode)),
+                                                        Some(PortablePermissions::from_mode_file(meta.mode)),
                                                         Some(meta.modified),
                                                     )?
                                                     .ignorant();
@@ -328,9 +338,7 @@ pub(crate) mod post {
                                             }
                                             itaf::decoder::ArchiveEntry::Hardlink(link) => {
                                                 let target_path = link.enclosed_target();
-                                                if target_path.as_os_str().is_empty()
-                                                    || target_path.is_absolute()
-                                                {
+                                                if target_path.as_os_str().is_empty() {
                                                     tracing::debug!(
                                                         path = %destination_path.display(),
                                                         "skipping hardlink with invalid target: {}",
@@ -382,17 +390,18 @@ pub(crate) mod post {
                                     let mut archive = tar::Archive::new(reader);
                                     let mut directory_entries = chunked_vec::ChunkedVec::new();
                                     let mut last_parent = None;
-                                    let mut entries = archive.entries()?;
+                                    let entries = archive.entries()?;
 
                                     let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
-                                    while let Some(Ok(mut entry)) = entries.next() {
-                                        let path = entry.path()?;
+                                    for entry in entries {
+                                        let mut entry = entry?;
+                                        let path = server.filesystem.relative_path(&entry.path()?);
 
-                                        if path.is_absolute() {
+                                        if path.as_os_str().is_empty() {
                                             continue;
                                         }
 
-                                        let destination_path = path.as_ref();
+                                        let destination_path = path.as_path();
                                         let header = entry.header();
 
                                         match header.entry_type() {
@@ -402,7 +411,7 @@ pub(crate) mod post {
                                                     .create_chowned_dir_all(destination_path)?;
                                                 if let Ok(permissions) = header
                                                     .mode()
-                                                    .map(PortablePermissions::from_mode)
+                                                    .map(PortablePermissions::from_mode_dir)
                                                 {
                                                     server.filesystem.set_permissions(
                                                         destination_path,
@@ -431,7 +440,7 @@ pub(crate) mod post {
                                                 crate::server::filesystem::file::ServerFile::new(
                                                     server.clone(),
                                                     destination_path,
-                                                    header.mode().map(PortablePermissions::from_mode).ok(),
+                                                    header.mode().map(PortablePermissions::from_mode_file).ok(),
                                                     header
                                                         .mtime()
                                                         .map(|t| std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
@@ -502,7 +511,12 @@ pub(crate) mod post {
                                         ));
                                     }
                                 };
-                                let checksum = runtime.block_on(field.text())?;
+                                let checksum = runtime.block_on(
+                                    crate::utils::read_limited_multipart_field(
+                                        &mut field,
+                                        super::MAX_CHECKSUM_LEN,
+                                    ),
+                                )?;
 
                                 if archive_checksum != checksum {
                                     return Err(anyhow::anyhow!(
@@ -538,12 +552,51 @@ pub(crate) mod post {
                                         err
                                     );
                                 }
+                            } else if field.name() == Some("diff-db") {
+                                let file = match runtime.block_on(server.diff.prepare_import()) {
+                                    Ok(file) => file,
+                                    Err(err) => {
+                                        tracing::error!(
+                                            "failed to create file history database: {:#?}",
+                                            err
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let mut file = runtime.block_on(file.into_std());
+
+                                while let Some(chunk) = runtime.block_on(field.chunk())? {
+                                    if let Err(err) = file.write_all(&chunk) {
+                                        tracing::error!(
+                                            "failed to write file history database chunk: {:#?}",
+                                            err
+                                        );
+                                        break;
+                                    }
+                                }
+
+                                if let Err(err) = file.flush() {
+                                    tracing::error!(
+                                        "failed to flush file history database: {:#?}",
+                                        err
+                                    );
+                                }
                             } else if field.name().is_some_and(|n| n.starts_with("backup-")) {
                                 backup_receiver.handle_field(&runtime, field)?;
                             }
                         }
 
-                        Ok(backup_receiver.into_received())
+                        if !archive_received {
+                            return Err(anyhow::anyhow!("transfer did not contain an archive"));
+                        }
+
+                        if archive_checksum.is_some() {
+                            return Err(anyhow::anyhow!(
+                                "transfer did not contain an archive checksum, cannot verify integrity"
+                            ));
+                        }
+
+                        backup_receiver.into_received()
                     },
                 );
 
@@ -556,34 +609,30 @@ pub(crate) mod post {
 
         if is_multiplex {
             let (sender, receiver) = tokio::sync::oneshot::channel();
-            let mut tries = 0;
 
-            loop {
+            {
                 let mut server_transfer = server.incoming_transfer.write().await;
 
-                tries += 1;
-
                 let incoming_transfer = match &mut *server_transfer {
-                    Some(transfer) => transfer,
-                    None => {
-                        if tries > 10 {
-                            return ApiResponse::error(
-                                "unable to get incoming transfer for multiplex",
-                            )
+                    Some(transfer)
+                        if transfer.multiplex_receivers.len() < transfer.expected_streams =>
+                    {
+                        transfer
+                    }
+                    _ => {
+                        drop(server_transfer);
+                        handle.abort();
+
+                        return ApiResponse::error("unable to get incoming transfer for multiplex")
                             .with_status(StatusCode::CONFLICT)
                             .ok();
-                        } else {
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            continue;
-                        }
                     }
                 };
 
                 incoming_transfer
-                    .multiplex_handles
-                    .push((handle.abort_handle(), receiver));
-
-                break;
+                    .multiplex_abort_handles
+                    .push(handle.abort_handle());
+                incoming_transfer.multiplex_receivers.push(receiver);
             }
 
             match handle.await {
@@ -592,6 +641,8 @@ pub(crate) mod post {
                         server = %server.uuid,
                         "server transfer completed successfully"
                     );
+
+                    sender.send(Ok(())).ok();
                 }
                 Ok(Err(err)) => {
                     tracing::error!(
@@ -624,7 +675,9 @@ pub(crate) mod post {
             server.incoming_transfer.write().await.replace(
                 crate::server::transfer::IncomingServerTransfer {
                     main_handle: handle.abort_handle(),
-                    multiplex_handles: vec![],
+                    expected_streams: multiplex_stream_count,
+                    multiplex_abort_handles: vec![],
+                    multiplex_receivers: vec![],
                 },
             );
 
@@ -641,7 +694,7 @@ pub(crate) mod post {
                             {
                                 let guard = server.incoming_transfer.read().await;
                                 if guard.as_ref().is_some_and(|t| {
-                                    t.multiplex_handles.len() >= multiplex_stream_count
+                                    t.multiplex_receivers.len() >= multiplex_stream_count
                                 }) {
                                     break;
                                 }

@@ -13,7 +13,6 @@ use sha1::Digest;
 use std::{
     collections::BTreeMap,
     io::Write,
-    path::Path,
     pin::Pin,
     str::FromStr,
     sync::{
@@ -22,6 +21,9 @@ use std::{
     },
 };
 use tokio::sync::Mutex;
+
+const MAX_CHECKSUM_LEN: usize = 1024;
+const MAX_IGNORE_LEN: usize = 64 * 1024;
 
 pub struct BackupSender {
     state: crate::routes::State,
@@ -32,6 +34,8 @@ pub struct BackupSender {
 
     btrfs_parent: Option<std::path::PathBuf>,
     btrfs_cleanup_dirs: Vec<std::path::PathBuf>,
+
+    sent: Vec<uuid::Uuid>,
 }
 
 impl BackupSender {
@@ -50,7 +54,13 @@ impl BackupSender {
             bytes_total: Arc::clone(bytes_total),
             btrfs_parent: None,
             btrfs_cleanup_dirs: Vec::new(),
+            sent: Vec::new(),
         }
+    }
+
+    #[inline]
+    pub fn sent(&self) -> &[uuid::Uuid] {
+        &self.sent
     }
 
     pub async fn finish(self) {
@@ -256,6 +266,8 @@ impl BackupSender {
             );
         }
 
+        self.sent.push(uuid);
+
         form
     }
 }
@@ -266,6 +278,7 @@ pub struct BackupMigration {
     pub checksum_type: compact_str::CompactString,
     pub browsable: bool,
     pub streaming: bool,
+    pub adapter: super::adapters::BackupAdapter,
 }
 
 #[derive(Debug, Default)]
@@ -293,15 +306,20 @@ impl BackupReceiver {
         }
     }
 
-    #[inline]
-    pub fn into_received(self) -> ReceivedBackups {
-        self.received
+    pub fn into_received(self) -> Result<ReceivedBackups, anyhow::Error> {
+        if self.checksum.is_some() {
+            return Err(anyhow::anyhow!(
+                "a transferred backup was not followed by a checksum, cannot verify integrity"
+            ));
+        }
+
+        Ok(self.received)
     }
 
     pub fn handle_field(
         &mut self,
         runtime: &tokio::runtime::Handle,
-        field: axum::extract::multipart::Field<'_>,
+        mut field: axum::extract::multipart::Field<'_>,
     ) -> Result<(), anyhow::Error> {
         tracing::debug!(
             "processing backup field: {}",
@@ -327,7 +345,10 @@ impl BackupReceiver {
                             ));
                         }
                     };
-                    let expected = runtime.block_on(field.text())?;
+                    let expected = runtime.block_on(crate::utils::read_limited_multipart_field(
+                        &mut field,
+                        MAX_CHECKSUM_LEN,
+                    ))?;
 
                     if checksum != expected {
                         return Err(anyhow::anyhow!(
@@ -352,7 +373,10 @@ impl BackupReceiver {
                             &self.state.config,
                             uuid,
                         );
-                    let contents = runtime.block_on(field.text())?;
+                    let contents = runtime.block_on(crate::utils::read_limited_multipart_field(
+                        &mut field,
+                        MAX_IGNORE_LEN,
+                    ))?;
 
                     if let Err(err) = std::fs::create_dir_all(&backup_path)
                         .and_then(|_| std::fs::write(&ignore_path, contents))
@@ -391,8 +415,11 @@ impl BackupReceiver {
                     return Ok(());
                 };
 
-                let file_name =
-                    Path::new(&self.state.config.load().system.backup_directory).join(file_name);
+                let file_name = self
+                    .state
+                    .config
+                    .resolve_as_path(|cfg| &cfg.system.backup_directory)
+                    .join(file_name);
                 let reader =
                     tokio_util::io::StreamReader::new(field.into_stream().map_err(|err| {
                         std::io::Error::other(format!("failed to read multipart field: {err}"))
@@ -451,6 +478,7 @@ impl BackupReceiver {
                             ArchiveFormat::Zip | ArchiveFormat::SevenZip
                         ),
                         streaming: false,
+                        adapter: crate::server::backup::adapters::BackupAdapter::Wings,
                     },
                 );
                 self.checksum = Some(checksum);
@@ -580,6 +608,7 @@ impl BackupReceiver {
                             checksum_type: "btrfs-subvolume".into(),
                             browsable: true,
                             streaming: true,
+                            adapter: crate::server::backup::adapters::BackupAdapter::Btrfs,
                         },
                     );
 

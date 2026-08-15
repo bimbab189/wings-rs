@@ -30,13 +30,8 @@ pub struct ConfigureArgs {
     #[arg(long = "node", help = "the node id to configure")]
     pub node: Option<usize>,
 
-    #[arg(
-        short = 'c',
-        long = "config",
-        help = "path to the config file",
-        default_value = crate::DEFAULT_CONFIG_PATH
-    )]
-    pub config: String,
+    #[arg(short = 'c', long = "config", help = "path to the config file")]
+    pub config: Option<String>,
 }
 
 pub struct ConfigureCommand;
@@ -50,6 +45,12 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
         Box::new(|env, arg_matches| {
             Box::pin(async move {
                 let args = ConfigureArgs::from_arg_matches(&arg_matches)?;
+
+                let config_path = args
+                    .config
+                    .as_deref()
+                    .or_else(|| crate::config::Config::find())
+                    .unwrap_or(crate::config::Config::DEFAULT_PATH);
 
                 if env.is_some() && !args.r#override {
                     let confirm = Confirm::with_theme(&ColorfulTheme::default())
@@ -84,7 +85,7 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
                         }
                     };
 
-                    crate::config::Config::save_new(&args.config, response)?;
+                    crate::config::Config::save_new(config_path, response)?;
 
                     println!("{}", "successfully configured wings.".green());
 
@@ -165,7 +166,7 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
                         }
                     };
 
-                    crate::config::Config::save_new(&args.config, response)?;
+                    crate::config::Config::save_new(config_path, response)?;
 
                     println!("{}", "successfully configured wings.".green());
 

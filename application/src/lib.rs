@@ -1,6 +1,6 @@
 #![recursion_limit = "512"]
 
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::OnceLock};
 
 pub mod bins;
 pub mod commands;
@@ -32,6 +32,8 @@ pub const TARGET: &str = match option_env!("CARGO_TARGET") {
     Some(value) => value,
     None => "unknown-unknown",
 };
+
+pub static CLAP_COMMAND: OnceLock<clap::Command> = OnceLock::new();
 
 #[cfg(unix)]
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/pterodactyl/config.yml";
@@ -65,6 +67,28 @@ pub fn spawn_blocking_handled<
             }
             Err(err) => {
                 tracing::error!("spawned blocking task panicked: {:?}", err);
+            }
+        }
+    });
+}
+
+pub fn spawn_blocking_signalled<
+    F: FnOnce() -> Result<(), E> + Send + 'static,
+    E: Debug + Send + 'static,
+>(
+    signal: crate::io::fallible_reader::FallibleSignal,
+    f: F,
+) {
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(f).await {
+            Ok(Ok(())) => signal.succeed(),
+            Ok(Err(err)) => {
+                tracing::error!("spawned blocking task failed: {:?}", err);
+                signal.fail(format!("{err:?}"));
+            }
+            Err(err) => {
+                tracing::error!("spawned blocking task panicked: {:?}", err);
+                signal.fail(format!("task panicked: {err:?}"));
             }
         }
     });

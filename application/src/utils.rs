@@ -32,6 +32,15 @@ pub fn draw_progress_bar(width: usize, current: f64, total: f64) -> String {
     format!("[{bar}] {formatted_percentage}")
 }
 
+pub fn is_single_component_file_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(component)), None) => component.to_str() == Some(name),
+        _ => false,
+    }
+}
+
 pub fn parse_content_disposition_filename(header: &str) -> Option<String> {
     static RE_STAR: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"(?i)filename\*=utf-8''([^;]+)").expect("Failed to compile regex")
@@ -156,6 +165,20 @@ pub fn is_valid_utf8_slice(s: &[u8]) -> bool {
     }
 }
 
+pub async fn read_limited_multipart_field(
+    field: &mut axum::extract::multipart::Field<'_>,
+    max_len: usize,
+) -> Result<String, anyhow::Error> {
+    let mut buf = String::new();
+    while let Some(chunk) = field.chunk().await? {
+        if buf.len().saturating_add(chunk.len()) > max_len {
+            anyhow::bail!("multipart field exceeds maximum length of {max_len} bytes");
+        }
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    Ok(buf)
+}
+
 pub fn strip_paths(value: &mut serde_json::Value, paths: &[&str]) {
     for path in paths {
         let mut cursor = &mut *value;
@@ -171,6 +194,11 @@ pub fn strip_paths(value: &mut serde_json::Value, paths: &[&str]) {
                 break;
             }
 
+            if map.get(part).is_some_and(|next| !next.is_object()) {
+                map.remove(part);
+                break;
+            }
+
             match map.get_mut(part) {
                 Some(next) => cursor = next,
                 None => break,
@@ -179,23 +207,58 @@ pub fn strip_paths(value: &mut serde_json::Value, paths: &[&str]) {
     }
 }
 
+pub(crate) trait IntoMode {
+    fn into_mode(self) -> u16;
+}
+macro_rules! impl_into_mode {
+    ($($t:ty),*) => {
+        $(impl IntoMode for $t {
+            fn into_mode(self) -> u16 {
+                self as u16
+            }
+        })*
+    };
+}
+impl_into_mode!(i32, u16, u32, u64, usize);
+
+/// PortablePermissions is a wrapper around a u32 representing file permissions in a portable way.
+/// It only covers the lower 9 bits of the mode, which correspond to the standard Unix permission bits (rwx for user, group, and others).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PortablePermissions {
-    pub mode: u32,
+    mode: u16,
 }
 
 impl PortablePermissions {
-    pub fn from_mode(mode: u32) -> Self {
+    /// Creates a new `PortablePermissions` from a given mode, masking to the lower 9 bits.
+    /// This variant specifically sets the file permissions to be at least readable and writable by the owner (0o600).
+    #[inline]
+    pub fn from_mode_file(mode: impl IntoMode) -> Self {
         Self {
-            mode: mode & 0o0777,
+            mode: mode.into_mode() & 0o777 | 0o600,
         }
     }
 
+    /// Creates a new `PortablePermissions` from a given mode, masking to the lower 9 bits.
+    /// This variant specifically sets the directory permissions to be at least readable, writable, and executable by the owner (0o700).
+    #[inline]
+    pub fn from_mode_dir(mode: impl IntoMode) -> Self {
+        Self {
+            mode: mode.into_mode() & 0o777 | 0o700,
+        }
+    }
+
+    /// Returns the underlying mode of the `PortablePermissions`.
+    #[inline]
+    pub fn mode(&self) -> u16 {
+        self.mode
+    }
+
+    #[inline]
     pub fn into_std_permissions(self) -> Option<std::fs::Permissions> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            Some(std::fs::Permissions::from_mode(self.mode))
+            Some(std::fs::Permissions::from_mode(self.mode as _))
         }
         #[cfg(windows)]
         None
@@ -206,7 +269,7 @@ impl PortablePermissions {
 impl From<std::fs::Permissions> for PortablePermissions {
     fn from(perms: std::fs::Permissions) -> Self {
         Self {
-            mode: std::os::unix::fs::PermissionsExt::mode(&perms),
+            mode: std::os::unix::fs::PermissionsExt::mode(&perms) as u16 & 0o777,
         }
     }
 }
@@ -215,7 +278,7 @@ impl From<std::fs::Permissions> for PortablePermissions {
 impl From<cap_std::fs::Permissions> for PortablePermissions {
     fn from(perms: cap_std::fs::Permissions) -> Self {
         Self {
-            mode: cap_std::fs::PermissionsExt::mode(&perms),
+            mode: cap_std::fs::PermissionsExt::mode(&perms) as u16 & 0o777,
         }
     }
 }
@@ -247,7 +310,7 @@ impl PortablePermissionsApplier for std::fs::File {
     fn apply_permissions(&self, new_permissions: PortablePermissions) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        let permissions = std::fs::Permissions::from_mode(new_permissions.mode);
+        let permissions = std::fs::Permissions::from_mode(new_permissions.mode as _);
         self.set_permissions(permissions)
     }
 }
@@ -257,7 +320,7 @@ impl PortablePermissionsApplier for cap_std::fs::File {
     fn apply_permissions(&self, new_permissions: PortablePermissions) -> std::io::Result<()> {
         use cap_std::fs::PermissionsExt;
 
-        let permissions = cap_std::fs::Permissions::from_mode(new_permissions.mode);
+        let permissions = cap_std::fs::Permissions::from_mode(new_permissions.mode as _);
         self.set_permissions(permissions)
     }
 }
@@ -391,6 +454,42 @@ impl CmpExt for Path {
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+
+    // is_single_component_file_name
+
+    #[test]
+    fn single_component_accepts_plain_file_names() {
+        assert!(is_single_component_file_name("loot.txt"));
+        assert!(is_single_component_file_name("wings.log"));
+        assert!(is_single_component_file_name("wings.log.gz"));
+        assert!(is_single_component_file_name("server.tar.gz"));
+        assert!(is_single_component_file_name(".env"));
+        assert!(is_single_component_file_name("..hidden"));
+    }
+
+    #[test]
+    fn single_component_rejects_traversal_and_separators() {
+        assert!(!is_single_component_file_name("../protected.jar"));
+        assert!(!is_single_component_file_name("../protected.jar/."));
+        assert!(!is_single_component_file_name("a/b"));
+        assert!(!is_single_component_file_name("protected.jar/"));
+    }
+
+    #[test]
+    fn single_component_rejects_the_decoded_log_traversals() {
+        // what `%2Fetc%2Fshadow` and `%2Froot%2F.ssh%2Fid_rsa` decode to before the join
+        assert!(!is_single_component_file_name("/etc/shadow"));
+        assert!(!is_single_component_file_name("/root/.ssh/id_rsa"));
+        assert!(!is_single_component_file_name("/proc/self/environ"));
+    }
+
+    #[test]
+    fn single_component_rejects_empty_and_dot_names() {
+        assert!(!is_single_component_file_name(""));
+        assert!(!is_single_component_file_name("."));
+        assert!(!is_single_component_file_name(".."));
+        assert!(!is_single_component_file_name("./x"));
+    }
 
     // draw_progress_bar
 
@@ -539,10 +638,29 @@ mod tests {
     }
 
     #[test]
-    fn strip_paths_through_non_object_is_noop() {
+    fn strip_paths_removes_a_non_object_standing_in_for_a_parent() {
         let mut v = serde_json::json!({"a": 5});
         strip_paths(&mut v, &["a.b"]);
-        assert_eq!(v, serde_json::json!({"a": 5}));
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    fn strip_paths_removes_a_nulled_parent() {
+        // `json_patch::merge` treats null as a delete, so a nulled parent would drop the
+        // protected leaf and let it come back as a serde default
+        let mut v = serde_json::json!({"system": null});
+        strip_paths(&mut v, &["system.user.uid"]);
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    fn strip_paths_removes_a_nulled_intermediate() {
+        let mut v = serde_json::json!({"system": {"user": null, "sftp": {"bind_port": 2022}}});
+        strip_paths(&mut v, &["system.user.uid"]);
+        assert_eq!(
+            v,
+            serde_json::json!({"system": {"sftp": {"bind_port": 2022}}})
+        );
     }
 
     #[test]
@@ -563,16 +681,31 @@ mod tests {
 
     #[test]
     fn portable_permissions_from_mode_masks_to_lower_nine_bits() {
-        assert_eq!(PortablePermissions::from_mode(0o7755).mode, 0o755);
-        assert_eq!(PortablePermissions::from_mode(0o644).mode, 0o644);
-        assert_eq!(PortablePermissions::from_mode(0o1777).mode, 0o777);
+        assert_eq!(PortablePermissions::from_mode_file(0o7755).mode(), 0o755);
+        assert_eq!(PortablePermissions::from_mode_file(0o644).mode(), 0o644);
+        assert_eq!(PortablePermissions::from_mode_file(0o1777).mode(), 0o777);
+    }
+
+    #[test]
+    fn portable_permissions_from_mode_file_sets_owner_read_write() {
+        assert_eq!(PortablePermissions::from_mode_file(0o000).mode(), 0o600);
+        assert_eq!(PortablePermissions::from_mode_file(0o400).mode(), 0o600);
+        assert_eq!(PortablePermissions::from_mode_file(0o200).mode(), 0o600);
+    }
+
+    #[test]
+    fn portable_permissions_from_mode_dir_sets_owner_read_write_execute() {
+        assert_eq!(PortablePermissions::from_mode_dir(0o000).mode(), 0o700);
+        assert_eq!(PortablePermissions::from_mode_dir(0o400).mode(), 0o700);
+        assert_eq!(PortablePermissions::from_mode_dir(0o200).mode(), 0o700);
+        assert_eq!(PortablePermissions::from_mode_dir(0o100).mode(), 0o700);
     }
 
     #[cfg(unix)]
     #[test]
     fn portable_permissions_into_std_roundtrips_on_unix() {
         use std::os::unix::fs::PermissionsExt;
-        let perms = PortablePermissions::from_mode(0o640)
+        let perms = PortablePermissions::from_mode_file(0o640)
             .into_std_permissions()
             .unwrap();
         assert_eq!(perms.mode() & 0o777, 0o640);

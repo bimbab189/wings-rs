@@ -47,7 +47,8 @@ impl WingsBackup {
         uuid: uuid::Uuid,
         format: ArchiveFormat,
     ) -> PathBuf {
-        Path::new(&config.load().system.backup_directory)
+        config
+            .resolve_as_path(|cfg| &cfg.system.backup_directory)
             .join(format!("{uuid}.{}", format.extension()))
     }
 
@@ -322,6 +323,20 @@ impl BackupExt for WingsBackup {
         self.uuid
     }
 
+    async fn download_info(
+        &self,
+    ) -> Result<crate::server::backup::BackupDownloadInfo, anyhow::Error> {
+        let size = tokio::fs::metadata(&self.path)
+            .await
+            .ok()
+            .map(|metadata| metadata.len());
+
+        Ok(crate::server::backup::BackupDownloadInfo {
+            archive_format: Some(self.format),
+            size,
+        })
+    }
+
     async fn download(
         &self,
         _state: &crate::routes::State,
@@ -413,24 +428,25 @@ impl BackupExt for WingsBackup {
 
                     let mut archive = tar::Archive::new(reader);
                     let mut directory_entries = Vec::new();
-                    let mut entries = archive.entries()?;
+                    let entries = archive.entries()?;
 
                     let mut read_buffer = vec![0; crate::BUFFER_SIZE];
-                    while let Some(Ok(mut entry)) = entries.next() {
-                        let path = entry.path()?;
+                    for entry in entries {
+                        let mut entry = entry?;
+                        let path = server.filesystem.relative_path(&entry.path()?);
 
-                        if path.is_absolute() {
+                        if path.as_os_str().is_empty() {
                             continue;
                         }
 
-                        let destination_path = path.as_ref();
+                        let destination_path = path.as_path();
                         let header = entry.header();
 
                         match header.entry_type() {
                             tar::EntryType::Directory => {
                                 server.filesystem.create_chowned_dir_all(destination_path)?;
                                 if let Ok(permissions) =
-                                    header.mode().map(PortablePermissions::from_mode)
+                                    header.mode().map(PortablePermissions::from_mode_dir)
                                 {
                                     server
                                         .filesystem
@@ -455,7 +471,7 @@ impl BackupExt for WingsBackup {
                                 let mut writer = crate::server::filesystem::file::ServerFile::new(
                                     server.clone(),
                                     destination_path,
-                                    header.mode().map(PortablePermissions::from_mode).ok(),
+                                    header.mode().map(PortablePermissions::from_mode_file).ok(),
                                     header
                                         .mtime()
                                         .map(|t| {
@@ -569,15 +585,11 @@ impl BackupExt for WingsBackup {
                                         None => continue,
                                     };
 
-                                    if path.is_absolute() {
-                                        continue;
-                                    }
-
                                     if entry.is_dir() {
                                         server.filesystem.create_chowned_dir_all(&path)?;
                                         server.filesystem.set_permissions(
                                             &path,
-                                            PortablePermissions::from_mode(
+                                            PortablePermissions::from_mode_dir(
                                                 entry.unix_mode().unwrap_or(0o755),
                                             ),
                                         )?;
@@ -591,7 +603,7 @@ impl BackupExt for WingsBackup {
                                         let mut writer = crate::server::filesystem::file::ServerFile::new(
                                             server.clone(),
                                             &path,
-                                            entry.unix_mode().map(PortablePermissions::from_mode),
+                                            entry.unix_mode().map(PortablePermissions::from_mode_file),
                                             crate::server::filesystem::archive::zip_entry_get_modified_time(&entry),
                                         )?;
                                         let mut reader = progress.counting_reader(entry);
@@ -647,10 +659,6 @@ impl BackupExt for WingsBackup {
                                 Some(path) => path,
                                 None => continue,
                             };
-
-                            if path.is_absolute() {
-                                continue;
-                            }
 
                             if server
                                 .filesystem

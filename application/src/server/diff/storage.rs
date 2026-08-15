@@ -142,6 +142,19 @@ impl Storage {
             .optional()?)
     }
 
+    pub fn revision_path(&self, revision_id: i64) -> Result<Option<String>, anyhow::Error> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT f.path FROM revisions r
+                JOIN files f ON f.id = r.file_id
+                WHERE r.id = ?",
+                params![revision_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
     pub fn latest_revision(&self, file_id: i64) -> Result<Option<RevisionRow>, anyhow::Error> {
         let row = self
             .conn
@@ -493,6 +506,14 @@ impl Storage {
         Ok(())
     }
 
+    pub fn vacuum_into(&self, path: &Path) -> Result<(), anyhow::Error> {
+        self.conn.execute(
+            "VACUUM INTO ?",
+            params![path.to_string_lossy().into_owned()],
+        )?;
+        Ok(())
+    }
+
     pub fn vacuum(&mut self) -> Result<(), anyhow::Error> {
         self.conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -566,6 +587,27 @@ mod tests {
         assert_ne!(s.upsert_file("q").unwrap(), a);
         assert_eq!(s.find_file("p").unwrap(), Some(a));
         assert_eq!(s.find_file("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn revision_path_resolves_owning_file() {
+        let (_d, mut s) = storage();
+        let f = s.upsert_file("config/server.properties").unwrap();
+        let id = s.insert_snapshot(f, None, b"x", 1).unwrap();
+        assert_eq!(
+            s.revision_path(id).unwrap().as_deref(),
+            Some("config/server.properties")
+        );
+        assert_eq!(s.revision_path(id + 1000).unwrap(), None);
+    }
+
+    #[test]
+    fn revision_path_follows_rename() {
+        let (_d, mut s) = storage();
+        let f = s.upsert_file("old.txt").unwrap();
+        let id = s.insert_snapshot(f, None, b"x", 1).unwrap();
+        s.rename_file("old.txt", "new.txt").unwrap();
+        assert_eq!(s.revision_path(id).unwrap().as_deref(), Some("new.txt"));
     }
 
     #[test]

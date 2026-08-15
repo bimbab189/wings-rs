@@ -1,5 +1,5 @@
 use crate::utils::PortablePermissions;
-use positioned_io::ReadAt;
+use positioned_io::{ReadAt, WriteAt};
 use std::{
     future::Future,
     io::{Read, Seek, SeekFrom, Write},
@@ -66,6 +66,7 @@ impl ServerFile {
         server: crate::server::Server,
         destination: &Path,
         file: std::fs::File,
+        initial_size: u64,
     ) -> Result<Self, anyhow::Error> {
         let parent_path = destination.parent().ok_or_else(|| {
             std::io::Error::new(
@@ -86,7 +87,7 @@ impl ServerFile {
             accumulated_bytes: 0,
             modified: None,
             current_position: 0,
-            highest_position: 0,
+            highest_position: initial_size,
         })
     }
 
@@ -94,6 +95,16 @@ impl ServerFile {
     pub fn ignorant(mut self) -> Self {
         self.ignorant = true;
         self
+    }
+
+    pub fn sync_all(&mut self) -> std::io::Result<()> {
+        self.allocate_accumulated()?;
+
+        let Some(file) = self.file.as_ref() else {
+            return Err(std::io::Error::other("file is not available"));
+        };
+
+        file.sync_all()
     }
 
     fn allocate_accumulated(&mut self) -> std::io::Result<()> {
@@ -146,7 +157,7 @@ impl Write for ServerFile {
             return Err(std::io::Error::other("file is not available"));
         };
 
-        file.flush()
+        Write::flush(file)
     }
 }
 
@@ -186,9 +197,62 @@ impl ReadAt for ServerFile {
     }
 }
 
+impl WriteAt for ServerFile {
+    fn write_at(&mut self, pos: u64, buf: &[u8]) -> std::io::Result<usize> {
+        let Some(file) = self.file.as_mut() else {
+            return Err(std::io::Error::other("file is not available"));
+        };
+
+        let written = file.write_at(pos, buf)?;
+        let end = pos.saturating_add(written as u64);
+
+        if crate::likely(end > self.highest_position) {
+            self.accumulated_bytes = self
+                .accumulated_bytes
+                .saturating_add(i64::try_from(end - self.highest_position).unwrap_or(i64::MAX));
+            self.highest_position = end;
+        }
+
+        if crate::unlikely(self.accumulated_bytes >= ALLOCATION_THRESHOLD) {
+            self.allocate_accumulated()?;
+        }
+
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.allocate_accumulated()?;
+
+        let Some(file) = self.file.as_mut() else {
+            return Err(std::io::Error::other("file is not available"));
+        };
+
+        Write::flush(file)
+    }
+}
+
 impl Drop for ServerFile {
     fn drop(&mut self) {
-        self.allocate_accumulated().ok();
+        if self.accumulated_bytes > 0 {
+            let server = self.server.clone();
+            let parent = self.parent.clone();
+            let bytes = self.accumulated_bytes;
+            let ignorant = self.ignorant;
+            self.accumulated_bytes = 0;
+
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::spawn(async move {
+                    server
+                        .filesystem
+                        .async_allocate_in_path_iterator(&parent, bytes, ignorant)
+                        .await;
+                });
+            } else {
+                server
+                    .filesystem
+                    .allocate_in_path_iterator(&parent, bytes, ignorant);
+            }
+        }
 
         if let Some(modified) = self.modified
             && let Some(file) = self.file.take()
@@ -257,6 +321,7 @@ impl AsyncServerFile {
         server: crate::server::Server,
         destination: &Path,
         file: tokio::fs::File,
+        initial_size: u64,
     ) -> Result<Self, anyhow::Error> {
         let parent_path = destination.parent().ok_or_else(|| {
             std::io::Error::new(
@@ -279,7 +344,7 @@ impl AsyncServerFile {
             modified: None,
             allocation_in_progress: None,
             current_position: 0,
-            highest_position: 0,
+            highest_position: initial_size,
         })
     }
 
@@ -319,6 +384,7 @@ impl AsyncServerFile {
                 }
                 Poll::Ready(false) => {
                     self.allocation_in_progress = None;
+                    self.accumulated_bytes += self.allocating_bytes;
                     self.allocating_bytes = 0;
                     Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::StorageFull,
@@ -359,10 +425,10 @@ impl AsyncWrite for AsyncServerFile {
                 let additional_space = (self.current_position - self.highest_position) as i64;
                 self.accumulated_bytes += additional_space;
                 self.highest_position = self.current_position;
+            }
 
-                if self.accumulated_bytes >= ALLOCATION_THRESHOLD {
-                    self.start_allocation();
-                }
+            if self.accumulated_bytes >= ALLOCATION_THRESHOLD {
+                self.start_allocation();
             }
         }
 

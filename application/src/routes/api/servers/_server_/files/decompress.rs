@@ -65,6 +65,17 @@ pub(crate) mod post {
                 .ok();
         }
 
+        let (destination_root, destination_filesystem) =
+            server.filesystem.resolve_writable_fs(&server, &root).await;
+
+        if destination_filesystem.is_primary_server_fs()
+            && server.filesystem.is_ignored(&root, true)
+        {
+            return ApiResponse::error("root not found")
+                .with_status(StatusCode::NOT_FOUND)
+                .ok();
+        }
+
         let source = root.join(data.file);
 
         if server.filesystem.is_ignored(
@@ -96,6 +107,7 @@ pub(crate) mod post {
 
         let progress = Arc::new(AtomicU64::new(0));
         let total = Arc::new(AtomicU64::new(0));
+        let files_processed = Arc::new(AtomicU64::new(0));
 
         let (identifier, task) = server
             .filesystem
@@ -107,11 +119,20 @@ pub(crate) mod post {
                     start_time: chrono::Utc::now(),
                     bytes_processed: progress.clone(),
                     bytes_total: total.clone(),
+                    files_processed: files_processed.clone(),
                 },
-                {
-                    let root = root.clone();
-
-                    async move { archive.extract(root, Some(progress), Some(total)).await }
+                async move {
+                    archive
+                        .extract(
+                            destination_root,
+                            destination_filesystem,
+                            crate::server::filesystem::archive::create::ArchiveProgress::new(
+                                progress,
+                                files_processed,
+                            ),
+                            Some(total),
+                        )
+                        .await
                 },
             )
             .await;

@@ -1,14 +1,18 @@
 use super::{
-    AsyncFileRead, AsyncReadableFileStream, AsyncWritableSeekableFileStream, ByteRange,
-    DirectoryListing, DirectoryStreamWalk, DirectoryWalk, FileMetadata, FileRead, FileType,
+    AsyncDirectoryStreamWalk, AsyncDirectoryWalk, AsyncFileRead, AsyncReadableFileStream,
+    AsyncWritableSeekableFileStream, ByteRange, DirectoryListing, FileMetadata, FileRead, FileType,
     IsIgnoredFn, WritableSeekableFileStream,
 };
 use crate::{
     io::compression::CompressionLevel,
     models::DirectoryEntry,
     server::filesystem::{
+        DirectoryEntryOptions,
         archive::StreamableArchiveFormat,
-        virtualfs::{AsyncReadableWritableSeekableFileStream, ReadableWritableSeekableFileStream},
+        virtualfs::{
+            AsyncReadableWritableSeekableFileStream, DirectoryWalk,
+            ReadableWritableSeekableFileStream,
+        },
     },
     utils::{CmpExt, PortablePermissions},
 };
@@ -61,6 +65,20 @@ impl VirtualCapFilesystem {
         } else {
             Ok(())
         }
+    }
+
+    async fn async_prepare_directory_entry(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+    ) -> Result<crate::server::filesystem::PreparedDirectoryEntry, anyhow::Error> {
+        let metadata = self.inner.async_symlink_metadata(path).await?;
+        let path = self.check_ignored(metadata.file_type().into(), path.as_ref())?;
+
+        Ok(self
+            .server
+            .filesystem
+            .prepare_api_entry_cap(&self.inner, path, metadata)
+            .await)
     }
 }
 
@@ -137,7 +155,12 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         Ok(self
             .server
             .filesystem
-            .to_api_entry_cap(&self.inner, path, metadata, !self.is_primary_server_fs)
+            .to_api_entry_cap(
+                &self.inner,
+                path,
+                metadata,
+                DirectoryEntryOptions::server_fs(self.is_primary_server_fs),
+            )
             .await)
     }
 
@@ -156,7 +179,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
             .to_api_entry_buffer(
                 path,
                 &metadata,
-                !self.is_primary_server_fs,
+                DirectoryEntryOptions::server_fs(self.is_primary_server_fs),
                 Some(buffer),
                 None,
                 None,
@@ -240,34 +263,76 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                     entries,
                 })
             } else {
-                let mut entries = Vec::new();
-                for entry in directory_entries.into_iter().chain(other_entries) {
-                    if let Ok(entry) =
-                        runtime.block_on(this.async_directory_entry(&path.join(&entry)))
-                    {
-                        entries.push(entry);
+                let options = DirectoryEntryOptions::server_fs(this.is_primary_server_fs);
+
+                let prepare_group = |names: Vec<String>| {
+                    let mut out = Vec::with_capacity(names.len());
+                    for entry in names {
+                        let Ok(prepared) = runtime
+                            .block_on(this.async_prepare_directory_entry(&path.join(&entry)))
+                        else {
+                            continue;
+                        };
+
+                        let key: i128 = match sort {
+                            SizeAsc | SizeDesc => runtime
+                                .block_on(
+                                    this.server
+                                        .filesystem
+                                        .prepared_entry_sort_size(&prepared, options),
+                                )
+                                .0
+                                .into(),
+                            PhysicalSizeAsc | PhysicalSizeDesc => runtime
+                                .block_on(
+                                    this.server
+                                        .filesystem
+                                        .prepared_entry_sort_size(&prepared, options),
+                                )
+                                .1
+                                .into(),
+                            ModifiedAsc | ModifiedDesc => prepared.modified_secs().into(),
+                            CreatedAsc | CreatedDesc => prepared.created_secs().into(),
+                            NameAsc | NameDesc => 0,
+                        };
+
+                        out.push((key, prepared));
                     }
-                }
+                    out
+                };
 
-                entries.sort_by(|a, b| match (a.directory, b.directory) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    _ => match sort {
-                        SizeAsc => a.size.cmp(&b.size),
-                        SizeDesc => b.size.cmp(&a.size),
-                        PhysicalSizeAsc => a.size_physical.cmp(&b.size_physical),
-                        PhysicalSizeDesc => b.size_physical.cmp(&a.size_physical),
-                        ModifiedAsc => a.modified.cmp(&b.modified),
-                        ModifiedDesc => b.modified.cmp(&a.modified),
-                        CreatedAsc => a.created.cmp(&b.created),
-                        CreatedDesc => b.created.cmp(&a.created),
-                        NameAsc | NameDesc => std::cmp::Ordering::Equal,
-                    },
-                });
+                let mut dir_keyed = prepare_group(directory_entries);
+                let mut file_keyed = prepare_group(other_entries);
 
-                if let Some(per_page) = per_page {
+                let ascending =
+                    matches!(sort, SizeAsc | PhysicalSizeAsc | ModifiedAsc | CreatedAsc);
+                let cmp = |a: &(i128, _), b: &(i128, _)| {
+                    if ascending {
+                        a.0.cmp(&b.0)
+                    } else {
+                        b.0.cmp(&a.0)
+                    }
+                };
+                dir_keyed.sort_by(cmp);
+                file_keyed.sort_by(cmp);
+
+                let merged = dir_keyed.into_iter().chain(file_keyed).map(|(_, p)| p);
+                let paged: Vec<_> = if let Some(per_page) = per_page {
                     let start = (page - 1) * per_page;
-                    entries = entries.into_iter().skip(start).take(per_page).collect();
+                    merged.skip(start).take(per_page).collect()
+                } else {
+                    merged.collect()
+                };
+
+                let mut entries = Vec::with_capacity(paged.len());
+                for prepared in paged {
+                    entries.push(
+                        runtime.block_on(this.server.filesystem.finish_api_entry_cap(
+                            &this.inner,
+                            prepared,
+                            options,
+                        )),
+                    );
                 }
 
                 Ok(DirectoryListing {
@@ -279,11 +344,38 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         .await?
     }
 
-    async fn async_walk_dir<'a>(
+    fn walk_dir<'a>(
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
     ) -> Result<Box<dyn DirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
+        let walk_dir = self.inner.walk_dir(path)?.with_is_ignored(
+            if let Some(existing_is_ignored) = &self.is_ignored {
+                existing_is_ignored.clone().merge(is_ignored)
+            } else {
+                is_ignored
+            },
+        );
+
+        struct IgnoreWalkDir {
+            inner: crate::server::filesystem::cap::WalkDir,
+        }
+
+        impl DirectoryWalk for IgnoreWalkDir {
+            fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
+                self.inner
+                    .next_entry()
+                    .map(|res| res.map_err(|err| err.into()))
+            }
+        }
+
+        Ok(Box::new(IgnoreWalkDir { inner: walk_dir }))
+    }
+    async fn async_walk_dir<'a>(
+        &'a self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        is_ignored: IsIgnoredFn,
+    ) -> Result<Box<dyn AsyncDirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
         let walk_dir = self.inner.async_walk_dir(path).await?.with_is_ignored(
             if let Some(existing_is_ignored) = &self.is_ignored {
                 existing_is_ignored.clone().merge(is_ignored)
@@ -297,7 +389,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         }
 
         #[async_trait::async_trait]
-        impl DirectoryWalk for IgnoreAsyncWalkDir {
+        impl AsyncDirectoryWalk for IgnoreAsyncWalkDir {
             async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
                 self.inner
                     .next_entry()
@@ -313,7 +405,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
-    ) -> Result<Box<dyn DirectoryStreamWalk + Send + Sync + 'a>, anyhow::Error> {
+    ) -> Result<Box<dyn AsyncDirectoryStreamWalk + Send + Sync + 'a>, anyhow::Error> {
         let walk_dir = self.inner.async_walk_dir(path).await?.with_is_ignored(
             if let Some(existing_is_ignored) = &self.is_ignored {
                 existing_is_ignored.clone().merge(is_ignored)
@@ -328,7 +420,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         }
 
         #[async_trait::async_trait]
-        impl<'a> DirectoryStreamWalk for IgnoreAsyncWalkDir<'a> {
+        impl<'a> AsyncDirectoryStreamWalk for IgnoreAsyncWalkDir<'a> {
             async fn next_entry(
                 &mut self,
             ) -> Option<Result<(FileType, PathBuf, AsyncReadableFileStream), anyhow::Error>>
@@ -406,7 +498,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
         let names = self.inner.async_read_dir_all(path).await?;
         let file_compression_threads = self
             .server
@@ -416,6 +508,7 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
             .api
             .file_compression_threads;
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
         tokio::spawn({
             let filesystem = self.inner.clone();
@@ -446,12 +539,14 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                         {
                             Ok(inner) => {
                                 inner.into_inner().shutdown().await.ok();
+                                signal.succeed();
                             }
                             Err(err) => {
                                 tracing::error!(
                                     "failed to create zip archive for cap vfs: {}",
                                     err
                                 );
+                                signal.fail(err);
                             }
                         }
                     }
@@ -473,12 +568,14 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                         {
                             Ok(inner) => {
                                 inner.into_inner().shutdown().await.ok();
+                                signal.succeed();
                             }
                             Err(err) => {
                                 tracing::error!(
                                     "failed to create tar archive for cap vfs: {}",
                                     err
                                 );
+                                signal.fail(err);
                             }
                         }
                     }
@@ -501,12 +598,14 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                         {
                             Ok(inner) => {
                                 inner.into_inner().shutdown().await.ok();
+                                signal.succeed();
                             }
                             Err(err) => {
                                 tracing::error!(
                                     "failed to create itaf archive for cap vfs: {}",
                                     err
                                 );
+                                signal.fail(err);
                             }
                         }
                     }
@@ -515,6 +614,10 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
                             "unsupported archive format for cap vfs: {}",
                             archive_format.extension()
                         );
+                        signal.fail(format!(
+                            "unsupported archive format: {}",
+                            archive_format.extension()
+                        ));
                     }
                 }
             }
@@ -695,6 +798,7 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
                 self.server.clone(),
                 &path,
                 file,
+                0,
             )?;
 
             Ok(Box::new(file))
@@ -717,6 +821,7 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
                 self.server.clone(),
                 &path,
                 file,
+                0,
             )?;
 
             Ok(Box::new(file))
@@ -746,6 +851,35 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         let path = self.check_ignored(FileType::File, path.as_ref())?;
 
         self.inner.async_set_permissions(path, permissions).await?;
+
+        Ok(())
+    }
+
+    fn set_times(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        modification_time: std::time::SystemTime,
+        access_time: Option<std::time::SystemTime>,
+    ) -> Result<(), anyhow::Error> {
+        self.check_writable()?;
+        let path = self.check_ignored(FileType::File, path.as_ref())?;
+
+        self.inner.set_times(path, modification_time, access_time)?;
+
+        Ok(())
+    }
+    async fn async_set_times(
+        &self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        modification_time: std::time::SystemTime,
+        access_time: Option<std::time::SystemTime>,
+    ) -> Result<(), anyhow::Error> {
+        self.check_writable()?;
+        let path = self.check_ignored(FileType::File, path.as_ref())?;
+
+        self.inner
+            .async_set_times(path, modification_time, access_time)
+            .await?;
 
         Ok(())
     }

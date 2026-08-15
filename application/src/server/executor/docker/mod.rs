@@ -1,7 +1,9 @@
-use crate::io::{SafeSliceExt, line_buffer::LineBuffer};
+use crate::{
+    io::{SafeSliceExt, line_buffer::LineBuffer},
+    server::resources::ResourceUsageWatchExt,
+};
 use bollard::errors::Error::DockerResponseServerError;
 use futures::StreamExt;
-use parking_lot::RwLock;
 use rand::distr::SampleString;
 use std::{
     collections::HashMap,
@@ -12,6 +14,8 @@ use std::{
 };
 use tokio::io::{AsyncWriteExt, ReadBuf};
 
+pub mod host_mounts;
+
 #[inline]
 pub fn string_to_option(s: &str) -> Option<String> {
     if s.is_empty() {
@@ -21,12 +25,76 @@ pub fn string_to_option(s: &str) -> Option<String> {
     }
 }
 
+enum HostBinding {
+    Wildcard,
+    Address(std::net::IpAddr),
+    Unbound,
+}
+
+impl HostBinding {
+    fn resolve(network: &crate::config::DockerNetwork, ip: std::net::IpAddr) -> Self {
+        if network.disable_interface_binding {
+            return Self::Wildcard;
+        }
+
+        if ip == std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+            if network.ispn {
+                return Self::Unbound;
+            }
+
+            return match network.interface.parse::<std::net::IpAddr>() {
+                Ok(interface) if interface.is_unspecified() => Self::Wildcard,
+                Ok(interface) => Self::Address(interface),
+                Err(_) => Self::Wildcard,
+            };
+        }
+
+        if ip.is_unspecified() {
+            return Self::Wildcard;
+        }
+
+        Self::Address(ip)
+    }
+
+    fn collides_with(&self, host_ip: Option<&str>) -> bool {
+        let address = match self {
+            Self::Unbound => return false,
+            Self::Wildcard => return true,
+            Self::Address(address) => address,
+        };
+
+        match host_ip.and_then(|host_ip| host_ip.parse::<std::net::IpAddr>().ok()) {
+            Some(host_ip) => host_ip.is_unspecified() || host_ip == *address,
+            None => true,
+        }
+    }
+}
+
+fn container_server(names: Option<&[String]>) -> Option<uuid::Uuid> {
+    for name in names.unwrap_or_default() {
+        let name = name.trim_start_matches('/');
+
+        if let Ok(uuid) = name.parse::<uuid::Uuid>() {
+            return Some(uuid);
+        }
+
+        if let Some((_, uuid)) = name.rsplit_once('.')
+            && let Ok(uuid) = uuid.parse::<uuid::Uuid>()
+        {
+            return Some(uuid);
+        }
+    }
+
+    None
+}
+
 #[async_trait::async_trait]
 trait DockerServerConfigurationExt {
     async fn convert_mounts(
         &self,
         config: &crate::config::Config,
         filesystem: &crate::server::filesystem::Filesystem,
+        host_mounts: Option<&host_mounts::HostMountTable>,
     ) -> Vec<bollard::plugin::Mount>;
 
     #[cfg(unix)]
@@ -44,6 +112,7 @@ trait DockerServerConfigurationExt {
         config: &crate::config::Config,
         client: &bollard::Docker,
         filesystem: &crate::server::filesystem::Filesystem,
+        host_mounts: Option<&host_mounts::HostMountTable>,
     ) -> Result<bollard::plugin::ContainerCreateBody, anyhow::Error>;
     fn container_update_config(
         &self,
@@ -59,6 +128,7 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
         &self,
         config: &crate::config::Config,
         filesystem: &crate::server::filesystem::Filesystem,
+        host_mounts: Option<&host_mounts::HostMountTable>,
     ) -> Vec<bollard::models::Mount> {
         self.mounts(config, filesystem)
             .await
@@ -66,7 +136,7 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
             .map(|mount| bollard::models::Mount {
                 typ: Some(bollard::plugin::MountType::BIND),
                 target: Some(mount.target.into()),
-                source: Some(mount.source.into()),
+                source: Some(host_mounts::translate_source(host_mounts, &mount.source)),
                 read_only: Some(mount.read_only),
                 ..Default::default()
             })
@@ -125,29 +195,27 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
         let iface = &config.docker.network.interface;
         let mut map = self.convert_allocations_bindings();
 
-        for (_port, binds_option) in map.iter_mut() {
-            if let Some(binds) = binds_option {
-                let mut i = 0;
-                while i < binds.len() {
-                    let Some(binding) = binds.get_mut(i) else {
-                        break;
-                    };
-                    if config.docker.network.disable_interface_binding {
-                        binding.host_ip = None;
-                    }
-
-                    if binding.host_ip.as_deref() == Some("127.0.0.1") {
-                        if config.docker.network.ispn {
-                            binds.remove(i);
-
-                            continue;
-                        } else {
-                            binding.host_ip = Some(iface.clone());
-                        }
-                    }
-
-                    i += 1;
+        for binds in map.values_mut().flatten() {
+            let mut i = 0;
+            while i < binds.len() {
+                let Some(binding) = binds.get_mut(i) else {
+                    break;
+                };
+                if config.docker.network.disable_interface_binding {
+                    binding.host_ip = None;
                 }
+
+                if binding.host_ip.as_deref() == Some("127.0.0.1") {
+                    if config.docker.network.ispn {
+                        binds.remove(i);
+
+                        continue;
+                    } else {
+                        binding.host_ip = Some(iface.clone());
+                    }
+                }
+
+                i += 1;
             }
         }
 
@@ -172,6 +240,7 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
         config: &crate::config::Config,
         client: &bollard::Docker,
         filesystem: &crate::server::filesystem::Filesystem,
+        host_mounts: Option<&host_mounts::HostMountTable>,
     ) -> Result<bollard::plugin::ContainerCreateBody, anyhow::Error> {
         let mut labels = self.labels.clone();
         labels.insert("Service".into(), config.load().app_name.clone());
@@ -248,11 +317,12 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
                 oom_kill_disable: resources.oom_kill_disable,
 
                 port_bindings: Some(self.convert_allocations_docker_bindings(config)),
-                mounts: Some(self.convert_mounts(config, filesystem).await),
+                mounts: Some(self.convert_mounts(config, filesystem, host_mounts).await),
                 #[cfg(unix)]
                 devices: Some(self.convert_devices()),
                 network_mode: Some(network_mode),
                 dns: Some(config.load().docker.network.dns.clone()),
+                dns_options: Some(config.load().docker.network.dns_options.clone()),
                 tmpfs: Some(HashMap::from([(
                     "/tmp".to_string(),
                     format!("rw,exec,nosuid,size={}M", config.load().docker.tmpfs_size),
@@ -366,11 +436,66 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
 pub struct DockerExecutor {
     docker: Arc<bollard::Docker>,
     app_config: Arc<crate::config::Config>,
+    host_mounts: std::sync::OnceLock<Option<host_mounts::HostMountTable>>,
+    host_gateway: std::sync::OnceLock<Option<std::net::IpAddr>>,
 }
 
 impl DockerExecutor {
     pub fn new(docker: Arc<bollard::Docker>, app_config: Arc<crate::config::Config>) -> Self {
-        Self { docker, app_config }
+        Self {
+            docker,
+            app_config,
+            host_mounts: std::sync::OnceLock::new(),
+            host_gateway: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[inline]
+    fn host_mounts(&self) -> Option<&host_mounts::HostMountTable> {
+        self.host_mounts.get().and_then(Option::as_ref)
+    }
+
+    /// Returns the host gateway address to route through when wings itself is
+    /// running inside a container. `None` means wings is running on the host (or
+    /// the gateway could not be determined), in which case the game server's
+    /// internal docker network IP is reachable directly.
+    #[inline]
+    fn host_gateway(&self) -> Option<std::net::IpAddr> {
+        *self.host_gateway.get_or_init(Self::detect_host_gateway)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn detect_host_gateway() -> Option<std::net::IpAddr> {
+        // Only reroute when wings is running inside a container. On the host the
+        // default route points at the LAN router, which must never receive game
+        // server traffic.
+        if !Path::new("/.dockerenv").exists() {
+            return None;
+        }
+
+        let routes = std::fs::read_to_string("/proc/net/route").ok()?;
+        for line in routes.lines().skip(1) {
+            let mut fields = line.split_whitespace();
+            let _iface = fields.next()?;
+            let destination = fields.next()?;
+            let gateway = fields.next()?;
+
+            // The default route has a zero destination and a non-zero gateway.
+            // Both fields are little-endian hex of the raw IPv4 address.
+            if destination == "00000000" && gateway != "00000000" {
+                let raw = u32::from_str_radix(gateway, 16).ok()?;
+                return Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                    raw.to_le_bytes(),
+                )));
+            }
+        }
+
+        None
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn detect_host_gateway() -> Option<std::net::IpAddr> {
+        None
     }
 
     async fn image_exists(&self, image_name: &str) -> bool {
@@ -397,7 +522,17 @@ impl DockerExecutor {
             return Ok(());
         }
 
-        let (image_name, tag) = image.split_once(':').unwrap_or((image, "latest"));
+        let (image_name, tag) = match image.rsplit_once(':') {
+            Some((name, tag)) if !tag.is_empty() => {
+                let colon_is_tag_sep = image.rfind('/').is_none_or(|slash| slash < name.len());
+                if colon_is_tag_sep {
+                    (name, tag)
+                } else {
+                    (image, "latest")
+                }
+            }
+            _ => (image, "latest"),
+        };
 
         let pull_cache = {
             type InnerMap = HashMap<
@@ -658,7 +793,8 @@ struct DockerProcessHandle {
     server: Weak<super::super::InnerServer>,
     app_config: Arc<crate::config::Config>,
 
-    resource_usage: Arc<RwLock<super::super::resources::ResourceUsage>>,
+    resource_usage: tokio::sync::watch::Sender<super::super::resources::ResourceUsage>,
+    publish_resource_usage: bool,
     stdin_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     stdout_ratelimited_rx: tokio::sync::broadcast::Receiver<Arc<compact_str::CompactString>>,
     stdout_rx: tokio::sync::broadcast::Receiver<Arc<compact_str::CompactString>>,
@@ -674,10 +810,8 @@ impl DockerProcessHandle {
         docker: Arc<bollard::Docker>,
         server: &super::super::Server,
         app_config: Arc<crate::config::Config>,
-        status_tx: tokio::sync::mpsc::Sender<(
-            super::ProcessStatus,
-            super::super::resources::ResourceUsage,
-        )>,
+        status_tx: tokio::sync::mpsc::Sender<super::ProcessStatus>,
+        publish_resource_usage: bool,
     ) -> Result<Self, anyhow::Error> {
         let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(150);
         let (stdout_ratelimited_tx, stdout_ratelimited_rx) =
@@ -688,11 +822,14 @@ impl DockerProcessHandle {
             Arc<compact_str::CompactString>,
         >(app_config.load().system.websocket_log_count * 2);
 
-        let resource_usage = Arc::new(RwLock::new(super::super::resources::ResourceUsage {
-            disk_bytes: server.filesystem.limiter_usage().await,
-            state: server.state.get_state(),
-            ..Default::default()
-        }));
+        let resource_usage = server.resource_usage.clone();
+        if publish_resource_usage {
+            let disk_bytes = server.filesystem.limiter_usage().await;
+            resource_usage.send_modify(|usage| {
+                usage.wipe(server.state.get_state());
+                usage.disk_bytes = disk_bytes;
+            });
+        }
 
         let mut attach = docker
             .attach_container(
@@ -790,10 +927,14 @@ impl DockerProcessHandle {
 
         let stats_docker = Arc::clone(&docker);
         let stats_id = container_id.clone();
-        let stats_usage = Arc::clone(&resource_usage);
+        let stats_usage = resource_usage.clone();
         let stats_server = server.clone();
 
         let stats_task = tokio::spawn(async move {
+            if !publish_resource_usage {
+                return;
+            }
+
             let mut prev_cpu_total = 0;
             let mut prev_instant = None;
 
@@ -828,67 +969,67 @@ impl DockerProcessHandle {
                     }
                 };
 
-                let mut usage = stats_usage.write();
+                stats_usage.send_modify(|usage| {
+                    if let Some(memory_stats) = &stats.memory_stats {
+                        let mut memory_bytes = memory_stats.usage.unwrap_or(0);
 
-                if let Some(memory_stats) = &stats.memory_stats {
-                    let mut memory_bytes = memory_stats.usage.unwrap_or(0);
-
-                    if let Some(stats) = &memory_stats.stats {
-                        if let Some(&inactive_file) = stats.get("total_inactive_file")
-                            && inactive_file < memory_bytes
-                        {
-                            memory_bytes -= inactive_file;
-                        } else if let Some(&inactive_file) = stats.get("inactive_file")
-                            && inactive_file < memory_bytes
-                        {
-                            memory_bytes -= inactive_file;
+                        if let Some(stats) = &memory_stats.stats {
+                            if let Some(&inactive_file) = stats.get("total_inactive_file")
+                                && inactive_file < memory_bytes
+                            {
+                                memory_bytes -= inactive_file;
+                            } else if let Some(&inactive_file) = stats.get("inactive_file")
+                                && inactive_file < memory_bytes
+                            {
+                                memory_bytes -= inactive_file;
+                            }
                         }
+
+                        usage.memory_bytes = memory_bytes;
+                        usage.memory_limit_bytes = memory_stats.limit.unwrap_or(0);
                     }
 
-                    usage.memory_bytes = memory_bytes;
-                    usage.memory_limit_bytes = memory_stats.limit.unwrap_or(0);
-                }
+                    usage.disk_bytes = disk_bytes;
+                    usage.state = stats_server.state.get_state();
 
-                usage.disk_bytes = disk_bytes;
-                usage.state = stats_server.state.get_state();
+                    if let Some(networks) = &stats.networks
+                        && let Some(net) = networks.values().next()
+                    {
+                        usage.network.rx_bytes = net.rx_bytes.unwrap_or(0);
+                        usage.network.rx_packets = net.rx_packets.unwrap_or(0);
+                        usage.network.tx_bytes = net.tx_bytes.unwrap_or(0);
+                        usage.network.tx_packets = net.tx_packets.unwrap_or(0);
+                    }
 
-                if let Some(networks) = &stats.networks
-                    && let Some(net) = networks.values().next()
-                {
-                    usage.network.rx_bytes = net.rx_bytes.unwrap_or(0);
-                    usage.network.rx_packets = net.rx_packets.unwrap_or(0);
-                    usage.network.tx_bytes = net.tx_bytes.unwrap_or(0);
-                    usage.network.tx_packets = net.tx_packets.unwrap_or(0);
-                }
+                    if let Some(cpu_stats) = &stats.cpu_stats
+                        && let Some(cpu_usage) = &cpu_stats.cpu_usage
+                    {
+                        let total_usage = cpu_usage.total_usage.unwrap_or(0);
+                        let now = std::time::Instant::now();
 
-                if let Some(cpu_stats) = &stats.cpu_stats
-                    && let Some(cpu_usage) = &cpu_stats.cpu_usage
-                {
-                    let total_usage = cpu_usage.total_usage.unwrap_or(0);
-                    let now = std::time::Instant::now();
+                        usage.cpu_absolute = if let Some(prev) = prev_instant {
+                            let cpu_delta_ns = total_usage.saturating_sub(prev_cpu_total) as f64;
+                            let wall_delta_ns = now.duration_since(prev).as_nanos() as f64;
 
-                    usage.cpu_absolute = if let Some(prev) = prev_instant {
-                        let cpu_delta_ns = total_usage.saturating_sub(prev_cpu_total) as f64;
-                        let wall_delta_ns = now.duration_since(prev).as_nanos() as f64;
-
-                        if wall_delta_ns > 0.0 && cpu_delta_ns > 0.0 {
-                            ((cpu_delta_ns / wall_delta_ns) * 100.0 * 1000.0).round() / 1000.0
+                            if wall_delta_ns > 0.0 && cpu_delta_ns > 0.0 {
+                                ((cpu_delta_ns / wall_delta_ns) * 100.0 * 1000.0).round() / 1000.0
+                            } else {
+                                0.0
+                            }
                         } else {
                             0.0
-                        }
-                    } else {
-                        0.0
-                    };
+                        };
 
-                    prev_cpu_total = total_usage;
-                    prev_instant = Some(now);
-                }
+                        prev_cpu_total = total_usage;
+                        prev_instant = Some(now);
+                    }
+                });
             }
         });
 
         let state_docker = Arc::clone(&docker);
         let state_id = container_id.clone();
-        let state_usage = Arc::clone(&resource_usage);
+        let state_usage = resource_usage.clone();
 
         let state_task = tokio::spawn(async move {
             loop {
@@ -919,15 +1060,19 @@ impl DockerProcessHandle {
                                 .signed_duration_since(started_at.with_timezone(&chrono::Utc))
                                 .num_milliseconds()
                                 .max(0) as u64;
-                            state_usage.write().uptime = uptime;
-                            if let Some(host_config) = inspect.host_config
-                                && let Some(cpu_quota) = host_config.cpu_quota
-                                && cpu_quota > 0
-                            {
-                                state_usage.write().cpu_limit_absolute = (cpu_quota / 1000) as u32;
-                            } else {
-                                state_usage.write().cpu_limit_absolute =
-                                    rayon::current_num_threads() as u32 * 100;
+                            if publish_resource_usage {
+                                state_usage.send_modify(|usage| {
+                                    usage.uptime = uptime;
+                                    if let Some(host_config) = inspect.host_config
+                                        && let Some(cpu_quota) = host_config.cpu_quota
+                                        && cpu_quota > 0
+                                    {
+                                        usage.cpu_limit_absolute = (cpu_quota / 1000) as u32;
+                                    } else {
+                                        usage.cpu_limit_absolute =
+                                            rayon::current_num_threads() as u32 * 100;
+                                    }
+                                });
                             }
                         }
                         super::ProcessStatus::Running
@@ -936,7 +1081,9 @@ impl DockerProcessHandle {
                         super::ProcessStatus::Paused
                     }
                     _ => {
-                        state_usage.write().uptime = 0;
+                        if publish_resource_usage {
+                            state_usage.send_modify(|usage| usage.uptime = 0);
+                        }
                         super::ProcessStatus::Stopped {
                             exit_code: state.exit_code.unwrap_or(-1) as i32,
                             oom_killed: state.oom_killed.unwrap_or(false),
@@ -944,9 +1091,7 @@ impl DockerProcessHandle {
                     }
                 };
 
-                let usage = *state_usage.read();
-
-                if status_tx.send((process_status, usage)).await.is_err() {
+                if status_tx.send(process_status).await.is_err() {
                     break;
                 }
             }
@@ -958,6 +1103,7 @@ impl DockerProcessHandle {
             server: Arc::downgrade(&**server),
             app_config,
             resource_usage,
+            publish_resource_usage,
             stdin_tx,
             stdout_ratelimited_rx,
             stdout_rx,
@@ -980,6 +1126,12 @@ impl Drop for DockerProcessHandle {
         self.state_task.abort();
         self.stats_task.abort();
         self.stdin_task.abort();
+
+        if self.publish_resource_usage
+            && let Some(server) = self.server.upgrade()
+        {
+            self.resource_usage.wipe(server.state.get_state());
+        }
     }
 }
 
@@ -988,13 +1140,6 @@ impl super::ProcessHandle for DockerProcessHandle {
     async fn container_id(&self) -> Option<String> {
         Some(self.container_id.clone())
     }
-
-    async fn resource_usage(
-        &self,
-    ) -> Result<super::super::resources::ResourceUsage, anyhow::Error> {
-        Ok(*self.resource_usage.read())
-    }
-
     async fn logs(
         &self,
         lines: Option<usize>,
@@ -1131,35 +1276,31 @@ impl super::ProcessHandle for DockerProcessHandle {
     }
 }
 
-type StatusReceiver =
-    tokio::sync::mpsc::Receiver<(super::ProcessStatus, super::super::resources::ResourceUsage)>;
+type StatusReceiver = tokio::sync::mpsc::Receiver<super::ProcessStatus>;
 
 async fn find_running_container(
     docker: &bollard::Docker,
     name_filter: &str,
-    exclude_name: Option<&str>,
+    container_type: Option<&str>,
 ) -> Option<String> {
+    let mut filters = HashMap::from([("name".to_string(), vec![name_filter.to_string()])]);
+    if let Some(container_type) = container_type {
+        filters.insert(
+            "label".to_string(),
+            vec![format!("ContainerType={container_type}")],
+        );
+    }
+
     let containers = docker
         .list_containers(Some(bollard::query_parameters::ListContainersOptions {
             all: true,
-            filters: Some(HashMap::from([(
-                "name".to_string(),
-                vec![name_filter.to_string()],
-            )])),
+            filters: Some(filters),
             ..Default::default()
         }))
         .await
         .unwrap_or_default();
 
     for c in containers {
-        if let Some(ref excl) = exclude_name
-            && c.names
-                .as_ref()
-                .is_some_and(|names| names.iter().any(|n| n.contains(excl)))
-        {
-            continue;
-        }
-
         if c.state != Some(bollard::plugin::ContainerSummaryStateEnum::RUNNING) {
             continue;
         }
@@ -1175,7 +1316,42 @@ async fn find_running_container(
 #[async_trait::async_trait]
 impl super::ServerExecutor for DockerExecutor {
     async fn boot(&self) -> Result<(), anyhow::Error> {
-        self.app_config.ensure_docker_network(&self.docker).await
+        self.app_config.ensure_docker_network(&self.docker).await?;
+
+        if std::env::var("OCI_CONTAINER").is_ok() {
+            match host_mounts::HostMountTable::discover(&self.docker).await {
+                Ok(table) => {
+                    table.validate_directories(&self.app_config.load())?;
+
+                    tracing::info!(
+                        "running in container {}, translating bind mount sources to host paths",
+                        table.container_id().get(..12).unwrap_or_default()
+                    );
+                    for (destination, source) in table.mounts() {
+                        if destination != source {
+                            tracing::info!(
+                                "translating bind mount sources under {} to {}",
+                                destination.display(),
+                                source.display()
+                            );
+                        }
+                    }
+
+                    let _ = self.host_mounts.set(Some(table));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "running in a container, but failed to inspect own container: {err:#}"
+                    );
+                    tracing::warn!(
+                        "bind mount sources will be passed to the container engine untranslated, host paths must match the wings container's paths exactly"
+                    );
+                    let _ = self.host_mounts.set(None);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn setup_server_process(
@@ -1206,7 +1382,12 @@ impl super::ServerExecutor for DockerExecutor {
             .configuration
             .read()
             .await
-            .container_config(&self.app_config, &self.docker, &server.filesystem)
+            .container_config(
+                &self.app_config,
+                &self.docker,
+                &server.filesystem,
+                self.host_mounts(),
+            )
             .await?;
         server
             .configuration
@@ -1234,6 +1415,7 @@ impl super::ServerExecutor for DockerExecutor {
                 server,
                 Arc::clone(&self.app_config),
                 status_tx,
+                true,
             )
             .await?,
         );
@@ -1245,10 +1427,13 @@ impl super::ServerExecutor for DockerExecutor {
         &self,
         server: &super::super::Server,
     ) -> Result<(Arc<dyn super::ProcessHandle>, StatusReceiver), anyhow::Error> {
-        let container_id =
-            find_running_container(&self.docker, &server.uuid.to_string(), Some("installer"))
-                .await
-                .ok_or_else(|| anyhow::anyhow!("no running server container found"))?;
+        let container_id = find_running_container(
+            &self.docker,
+            &server.uuid.to_string(),
+            Some("server_process"),
+        )
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no running server container found"))?;
 
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
         let handle = Arc::new(
@@ -1258,6 +1443,7 @@ impl super::ServerExecutor for DockerExecutor {
                 server,
                 Arc::clone(&self.app_config),
                 status_tx,
+                true,
             )
             .await?,
         );
@@ -1330,8 +1516,7 @@ impl super::ServerExecutor for DockerExecutor {
 
         drop(server_config);
 
-        let tmp_dir =
-            Path::new(&self.app_config.load().system.tmp_directory).join(server.uuid.to_string());
+        let tmp_dir = self.app_config.tmp_data_path(server.uuid);
         tokio::fs::create_dir_all(&tmp_dir).await?;
         tokio::fs::write(
             tmp_dir.join("install.sh"),
@@ -1359,19 +1544,26 @@ impl super::ServerExecutor for DockerExecutor {
                 mounts: Some(vec![
                     bollard::plugin::Mount {
                         typ: Some(bollard::plugin::MountType::BIND),
-                        source: Some(server.filesystem.base().into()),
+                        source: Some(host_mounts::translate_source(
+                            self.host_mounts(),
+                            &server.filesystem.base(),
+                        )),
                         target: Some("/mnt/server".to_string()),
                         ..Default::default()
                     },
                     bollard::plugin::Mount {
                         typ: Some(bollard::plugin::MountType::BIND),
-                        source: Some(tmp_dir.to_string_lossy().into_owned()),
+                        source: Some(host_mounts::translate_source(
+                            self.host_mounts(),
+                            &tmp_dir.to_string_lossy(),
+                        )),
                         target: Some("/mnt/install".to_string()),
                         ..Default::default()
                     },
                 ]),
                 network_mode: Some(self.app_config.load().docker.network.mode.clone()),
                 dns: Some(self.app_config.load().docker.network.dns.clone()),
+                dns_options: Some(self.app_config.load().docker.network.dns_options.clone()),
                 tmpfs: Some(HashMap::from([(
                     "/tmp".to_string(),
                     format!(
@@ -1436,6 +1628,7 @@ impl super::ServerExecutor for DockerExecutor {
                 server,
                 Arc::clone(&self.app_config),
                 status_tx,
+                true,
             )
             .await?,
         );
@@ -1447,10 +1640,13 @@ impl super::ServerExecutor for DockerExecutor {
         &self,
         server: &super::super::Server,
     ) -> Result<(Arc<dyn super::ProcessHandle>, StatusReceiver), anyhow::Error> {
-        let container_id =
-            find_running_container(&self.docker, &format!("{}_installer", server.uuid), None)
-                .await
-                .ok_or_else(|| anyhow::anyhow!("no running installer container found"))?;
+        let container_id = find_running_container(
+            &self.docker,
+            &format!("{}_installer", server.uuid),
+            Some("server_installer"),
+        )
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no running installer container found"))?;
 
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
         let handle = Arc::new(
@@ -1460,6 +1656,7 @@ impl super::ServerExecutor for DockerExecutor {
                 server,
                 Arc::clone(&self.app_config),
                 status_tx,
+                true,
             )
             .await?,
         );
@@ -1532,8 +1729,7 @@ impl super::ServerExecutor for DockerExecutor {
 
         drop(server_config);
 
-        let tmp_dir =
-            Path::new(&self.app_config.load().system.tmp_directory).join(server.uuid.to_string());
+        let tmp_dir = self.app_config.tmp_data_path(server.uuid);
         tokio::fs::create_dir_all(&tmp_dir).await?;
         tokio::fs::write(
             tmp_dir.join("script.sh"),
@@ -1561,19 +1757,26 @@ impl super::ServerExecutor for DockerExecutor {
                 mounts: Some(vec![
                     bollard::plugin::Mount {
                         typ: Some(bollard::plugin::MountType::BIND),
-                        source: Some(server.filesystem.base().into()),
+                        source: Some(host_mounts::translate_source(
+                            self.host_mounts(),
+                            &server.filesystem.base(),
+                        )),
                         target: Some("/mnt/server".to_string()),
                         ..Default::default()
                     },
                     bollard::plugin::Mount {
                         typ: Some(bollard::plugin::MountType::BIND),
-                        source: Some(tmp_dir.to_string_lossy().into_owned()),
+                        source: Some(host_mounts::translate_source(
+                            self.host_mounts(),
+                            &tmp_dir.to_string_lossy(),
+                        )),
                         target: Some("/mnt/script".to_string()),
                         ..Default::default()
                     },
                 ]),
                 network_mode: Some(self.app_config.load().docker.network.mode.clone()),
                 dns: Some(self.app_config.load().docker.network.dns.clone()),
+                dns_options: Some(self.app_config.load().docker.network.dns_options.clone()),
                 tmpfs: Some(HashMap::from([(
                     "/tmp".to_string(),
                     format!(
@@ -1643,10 +1846,120 @@ impl super::ServerExecutor for DockerExecutor {
                 server,
                 Arc::clone(&self.app_config),
                 status_tx,
+                false,
             )
             .await?,
         );
 
         Ok((handle, status_rx))
+    }
+
+    async fn resolve_internal_target(
+        &self,
+        server: &super::super::Server,
+        port: u16,
+    ) -> Result<Option<std::net::SocketAddr>, anyhow::Error> {
+        let container_id = match find_running_container(
+            &self.docker,
+            &server.uuid.to_string(),
+            Some("server_process"),
+        )
+        .await
+        {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        if let Some(gateway) = self.host_gateway() {
+            let binding = {
+                let configuration = server.configuration.read().await;
+                configuration
+                    .allocations
+                    .mappings
+                    .iter()
+                    .find(|(_, ports)| ports.contains(&port))
+                    .and_then(|(ip, _)| ip.parse::<std::net::IpAddr>().ok())
+            };
+
+            if let Some(binding_ip) = binding {
+                let target_ip = if binding_ip.is_unspecified() || binding_ip.is_loopback() {
+                    gateway
+                } else {
+                    binding_ip
+                };
+
+                return Ok(Some(std::net::SocketAddr::new(target_ip, port)));
+            }
+        }
+
+        let inspect = self.docker.inspect_container(&container_id, None).await?;
+
+        let network_name = self.app_config.load().docker.network.name.clone();
+        match inspect
+            .network_settings
+            .and_then(|settings| settings.networks)
+            .and_then(|mut networks| networks.remove(&network_name))
+            .and_then(|endpoint| endpoint.ip_address)
+            .filter(|ip| !ip.is_empty())
+        {
+            Some(ip) => Ok(Some(std::net::SocketAddr::new(ip.parse()?, port))),
+            None => Ok(None),
+        }
+    }
+
+    async fn used_ports(
+        &self,
+        ips: &[std::net::IpAddr],
+    ) -> Result<HashMap<std::net::IpAddr, Vec<super::UsedPort>>, anyhow::Error> {
+        if ips.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let config = self.app_config.load();
+        let bindings: Vec<(std::net::IpAddr, HostBinding)> = ips
+            .iter()
+            .map(|ip| (*ip, HostBinding::resolve(&config.docker.network, *ip)))
+            .collect();
+        let mut used: HashMap<std::net::IpAddr, HashMap<u16, Option<uuid::Uuid>>> =
+            ips.iter().map(|ip| (*ip, HashMap::new())).collect();
+
+        let containers = self
+            .docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: false,
+                ..Default::default()
+            }))
+            .await?;
+
+        for container in containers {
+            let server = container_server(container.names.as_deref());
+
+            for port in container.ports.unwrap_or_default() {
+                let Some(public_port) = port.public_port else {
+                    continue;
+                };
+
+                for (ip, binding) in &bindings {
+                    if binding.collides_with(port.ip.as_deref())
+                        && let Some(ports) = used.get_mut(ip)
+                    {
+                        ports.entry(public_port).or_insert(server);
+                    }
+                }
+            }
+        }
+
+        Ok(used
+            .into_iter()
+            .map(|(ip, ports)| {
+                let mut ports: Vec<super::UsedPort> = ports
+                    .into_iter()
+                    .map(|(port, server)| super::UsedPort { port, server })
+                    .collect();
+                ports.sort_unstable_by_key(|port| port.port);
+
+                (ip, ports)
+            })
+            .collect())
     }
 }

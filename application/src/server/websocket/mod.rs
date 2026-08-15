@@ -30,6 +30,8 @@ pub struct WebsocketJwtPayload {
     pub base: crate::remote::jwt::BasePayload,
 
     pub user_uuid: uuid::Uuid,
+    pub user_name: Option<compact_str::CompactString>,
+    pub user_avatar: Option<String>,
     pub server_uuid: uuid::Uuid,
     pub permissions: Permissions,
     pub ignored_files: Option<Vec<compact_str::CompactString>>,
@@ -96,6 +98,8 @@ pub enum WebsocketEvent {
     ServerBackupProgress,
     #[serde(rename = "backup completed")]
     ServerBackupCompleted,
+    #[serde(rename = "backup deleted")]
+    ServerBackupDeleted,
     #[serde(rename = "backup restore started")]
     ServerBackupRestoreStarted,
     #[serde(rename = "backup restore progress")]
@@ -122,11 +126,35 @@ pub enum WebsocketEvent {
     ServerOperationError,
     #[serde(rename = "operation completed")]
     ServerOperationCompleted,
+
+    #[serde(rename = "file collab subscribe")]
+    FileCollabSubscribe,
+    #[serde(rename = "file collab unsubscribe")]
+    FileCollabUnsubscribe,
+    #[serde(rename = "file collab update")]
+    FileCollabUpdate,
+    #[serde(rename = "file collab awareness")]
+    FileCollabAwareness,
+    #[serde(rename = "file collab save")]
+    FileCollabSave,
+    #[serde(rename = "file collab sync")]
+    FileCollabSync,
+    #[serde(rename = "file collab participants")]
+    FileCollabParticipants,
+    #[serde(rename = "file collab saved")]
+    FileCollabSaved,
+    #[serde(rename = "file collab reload")]
+    FileCollabReload,
+    #[serde(rename = "file collab conflict")]
+    FileCollabConflict,
+    #[serde(rename = "file collab error")]
+    FileCollabError,
 }
 
 #[derive(Debug, Clone)]
 pub struct TargetedWebsocketMessage {
     user_uuids: Arc<HashSet<uuid::Uuid>>,
+    connection_uuids: Arc<HashSet<uuid::Uuid>>,
     permissions: Arc<Permissions>,
     message: WebsocketMessage,
 }
@@ -139,13 +167,33 @@ impl TargetedWebsocketMessage {
     ) -> Self {
         Self {
             user_uuids: Arc::new(user_uuids),
+            connection_uuids: Arc::new(HashSet::new()),
             permissions: Arc::new(permissions),
             message,
         }
     }
 
-    pub fn matches(&self, user_uuid: &uuid::Uuid, permissions: &Permissions) -> bool {
+    pub fn new_connections(
+        connection_uuids: HashSet<uuid::Uuid>,
+        permissions: Permissions,
+        message: WebsocketMessage,
+    ) -> Self {
+        Self {
+            user_uuids: Arc::new(HashSet::new()),
+            connection_uuids: Arc::new(connection_uuids),
+            permissions: Arc::new(permissions),
+            message,
+        }
+    }
+
+    pub fn matches(
+        &self,
+        connection_id: &uuid::Uuid,
+        user_uuid: &uuid::Uuid,
+        permissions: &Permissions,
+    ) -> bool {
         (self.user_uuids.is_empty() || self.user_uuids.contains(user_uuid))
+            && (self.connection_uuids.is_empty() || self.connection_uuids.contains(connection_id))
             && self
                 .permissions
                 .iter()
@@ -271,6 +319,7 @@ where
 pub type SocketJwt = Arc<RwLock<Option<Arc<WebsocketJwtPayload>>>>;
 
 pub struct ServerWebsocketHandler {
+    pub connection_id: uuid::Uuid,
     sender: Arc<Mutex<SplitSink<WebSocket, Message>>>,
     state: crate::routes::State,
     socket_jwt: SocketJwt,
@@ -285,6 +334,7 @@ impl ServerWebsocketHandler {
         socket_jwt: SocketJwt,
     ) -> Self {
         Self {
+            connection_id: uuid::Uuid::new_v4(),
             sender,
             state,
             socket_jwt,
@@ -365,7 +415,7 @@ impl ServerWebsocketHandler {
         }
     }
 
-    async fn send_message(&self, message: WebsocketMessage) {
+    pub async fn send_message(&self, message: WebsocketMessage) {
         if self.closed.load(Ordering::Relaxed) {
             return;
         }

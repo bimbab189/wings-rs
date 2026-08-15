@@ -254,7 +254,7 @@ impl ShellSession {
                 }
             },
             Some("stats") => {
-                let resource_usage = self.server.resource_usage().await;
+                let resource_usage = self.server.resource_usage();
 
                 writeln("Server Statistics:").await;
                 writeln(&format!(

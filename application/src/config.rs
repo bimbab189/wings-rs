@@ -5,6 +5,7 @@ use compact_str::ToCompactString;
 use serde::{Deserialize, Serialize};
 use serde_default::DefaultFromSerde;
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap},
     fs::File,
     io::BufRead,
@@ -22,14 +23,7 @@ use tracing_subscriber::{
 use utoipa::ToSchema;
 
 fn app_name() -> String {
-    #[cfg(unix)]
-    {
-        "Pterodactyl".to_string()
-    }
-    #[cfg(windows)]
-    {
-        "Calagopus".to_string()
-    }
+    "Calagopus".to_string()
 }
 fn api_host() -> String {
     "0.0.0.0".to_string()
@@ -161,85 +155,88 @@ fn web_ide_max_sessions_per_server() -> usize {
     8
 }
 
-fn system_root_directory() -> String {
+fn system_root_directory() -> SystemPath {
     #[cfg(unix)]
     {
-        "/var/lib/pterodactyl".to_string()
+        SystemPath::new("/var/lib/calagopus-wings")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings".to_string()
+        SystemPath::new("C:\\ProgramData\\Calagopus-Wings")
     }
 }
-fn system_log_directory() -> String {
+fn system_log_directory() -> SystemPath {
     #[cfg(unix)]
     {
-        "/var/log/pterodactyl".to_string()
+        SystemPath::new("/var/log/calagopus-wings")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\logs".to_string()
+        SystemPath::new("{root_directory}\\logs")
     }
 }
-fn system_vmount_directory() -> String {
+fn system_data_directory() -> SystemPath {
     #[cfg(unix)]
     {
-        "/var/lib/pterodactyl/vmounts".to_string()
+        SystemPath::new("{root_directory}/volumes")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\vmounts".to_string()
+        SystemPath::new("{root_directory}\\volumes")
     }
 }
-fn system_data() -> String {
+fn system_diffs_directory() -> SystemPath {
     #[cfg(unix)]
     {
-        "/var/lib/pterodactyl/volumes".to_string()
+        SystemPath::new("{root_directory}/diffs")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\volumes".to_string()
+        SystemPath::new("{root_directory}\\diffs")
     }
 }
-fn system_archive_directory() -> String {
+fn system_vmount_directory() -> SystemPath {
     #[cfg(unix)]
     {
-        "/var/lib/pterodactyl/archives".to_string()
+        SystemPath::new("{root_directory}/vmounts")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\archives".to_string()
+        SystemPath::new("{root_directory}\\vmounts")
     }
 }
-fn system_backup_directory() -> String {
+fn system_archive_directory() -> SystemPath {
     #[cfg(unix)]
     {
-        "/var/lib/pterodactyl/backups".to_string()
+        SystemPath::new("{root_directory}/archives")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\backups".to_string()
+        SystemPath::new("{root_directory}\\archives")
     }
 }
-fn system_tmp_directory() -> String {
+fn system_backup_directory() -> SystemPath {
     #[cfg(unix)]
     {
-        "/tmp/pterodactyl".to_string()
+        SystemPath::new("{root_directory}/backups")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\tmp".to_string()
+        SystemPath::new("{root_directory}\\backups")
+    }
+}
+fn system_tmp_directory() -> SystemPath {
+    #[cfg(unix)]
+    {
+        SystemPath::new("/tmp/calagopus-wings")
+    }
+    #[cfg(windows)]
+    {
+        SystemPath::new("{root_directory}\\tmp")
     }
 }
 fn system_username() -> compact_str::CompactString {
-    #[cfg(unix)]
-    {
-        "pterodactyl".into()
-    }
-    #[cfg(windows)]
-    {
-        "calagopus-wings".into()
-    }
+    "calagopus".into()
 }
 fn system_timezone() -> compact_str::CompactString {
     if let Ok(tz) = std::env::var("TZ") {
@@ -255,8 +252,8 @@ fn system_timezone() -> compact_str::CompactString {
     chrono::Local::now().offset().to_compact_string()
 }
 #[cfg(unix)]
-fn system_passwd_directory() -> String {
-    "/run/wings/etc".to_string()
+fn system_passwd_directory() -> SystemPath {
+    SystemPath::new("/run/calagopus-wings/etc")
 }
 #[cfg(unix)]
 fn system_machine_id_enabled() -> bool {
@@ -374,6 +371,28 @@ fn system_file_history_maintenance_interval() -> u64 {
     3600
 }
 
+fn system_file_collaboration_enabled() -> bool {
+    true
+}
+fn system_file_collaboration_file_size_cap() -> u64 {
+    1024 * 1024
+}
+fn system_file_collaboration_max_sessions_per_server() -> u64 {
+    16
+}
+fn system_file_collaboration_max_sessions_per_connection() -> u64 {
+    8
+}
+fn system_file_collaboration_max_editors_per_session() -> u64 {
+    32
+}
+fn system_file_collaboration_max_cursors_per_connection() -> u64 {
+    64
+}
+fn system_file_collaboration_session_grace_period() -> u64 {
+    30
+}
+
 fn system_backup_mounting_enabled() -> bool {
     true
 }
@@ -402,24 +421,24 @@ fn system_backup_ddup_bak_create_threads() -> usize {
     4
 }
 
-fn system_backup_restic_repository() -> String {
+fn system_backup_restic_repository() -> SystemPath {
     #[cfg(unix)]
     {
-        "/var/lib/pterodactyl/backups/restic".to_string()
+        SystemPath::new("{root_directory}/backups/restic")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\backups\\restic".to_string()
+        SystemPath::new("{root_directory}\\backups\\restic")
     }
 }
-fn system_backup_restic_password_file() -> String {
+fn system_backup_restic_password_file() -> SystemPath {
     #[cfg(unix)]
     {
-        "/var/lib/pterodactyl/backups/restic_password".to_string()
+        SystemPath::new("{root_directory}/backups/restic_password")
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus-Wings\\backups\\restic_password".to_string()
+        SystemPath::new("{root_directory}\\backups\\restic_password")
     }
 }
 fn system_backup_restic_retry_lock_seconds() -> u64 {
@@ -434,6 +453,13 @@ fn system_backup_btrfs_create_read_only() -> bool {
 }
 
 fn system_backup_zfs_restore_threads() -> usize {
+    4
+}
+
+fn system_backup_pbs_create_threads() -> usize {
+    4
+}
+fn system_backup_pbs_download_concurrency() -> usize {
     4
 }
 
@@ -457,28 +483,22 @@ fn docker_network_interface() -> String {
 fn docker_network_dns() -> Vec<String> {
     vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()]
 }
+fn docker_network_dns_options() -> Vec<String> {
+    vec![
+        "ndots:0".to_string(),
+        "timeout:2".to_string(),
+        "attempts:3".to_string(),
+        "single-request-reopen".to_string(),
+    ]
+}
 fn docker_network_name() -> String {
-    #[cfg(unix)]
-    {
-        "pterodactyl_nw".to_string()
-    }
-    #[cfg(windows)]
-    {
-        "calagopus_nw".to_string()
-    }
+    "calagopus_nw".to_string()
 }
 fn docker_network_driver() -> String {
     "bridge".to_string()
 }
 fn docker_network_mode() -> String {
-    #[cfg(unix)]
-    {
-        "pterodactyl_nw".to_string()
-    }
-    #[cfg(windows)]
-    {
-        "calagopus_nw".to_string()
-    }
+    "calagopus_nw".to_string()
 }
 fn docker_network_enable_icc() -> bool {
     true
@@ -487,11 +507,17 @@ fn docker_network_network_mtu() -> u64 {
     1500
 }
 
+fn docker_network_interfaces_v4_enabled() -> bool {
+    true
+}
 fn docker_network_interfaces_v4_subnet() -> String {
     "172.18.0.0/16".to_string()
 }
 fn docker_network_interfaces_v4_gateway() -> String {
     "172.18.0.1".to_string()
+}
+fn docker_network_interfaces_v6_enabled() -> bool {
+    true
 }
 fn docker_network_interfaces_v6_subnet() -> String {
     "fdba:17c8:6c94::/64".to_string()
@@ -597,6 +623,38 @@ impl From<i64> for MiB {
     }
 }
 
+#[derive(ToSchema, Deserialize, Serialize, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct SystemPath(String);
+
+impl SystemPath {
+    pub fn new(value: impl Into<String>) -> Self {
+        SystemPath(value.into())
+    }
+
+    pub fn as_str(&self, cfg: &InnerConfig) -> Cow<'_, str> {
+        if self.0.contains("{root_directory}") {
+            Cow::Owned(
+                self.0
+                    .replace("{root_directory}", &cfg.system.root_directory.0),
+            )
+        } else {
+            Cow::Borrowed(&self.0)
+        }
+    }
+
+    pub fn as_path(&self, cfg: &InnerConfig) -> PathBuf {
+        PathBuf::from(self.as_str(cfg).into_owned())
+    }
+}
+
+impl From<String> for SystemPath {
+    fn from(value: String) -> Self {
+        SystemPath(value)
+    }
+}
+
 nestify::nest! {
     #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)]
     pub struct InnerConfig {
@@ -625,6 +683,8 @@ nestify::nest! {
             pub ssl: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct ApiSsl {
                 #[serde(default)]
                 pub enabled: bool,
+                #[serde(default)]
+                pub ktls_enabled: bool,
                 #[serde(default)]
                 pub cert: String,
                 #[serde(default)]
@@ -765,19 +825,21 @@ nestify::nest! {
         #[schema(inline)]
         pub system: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct System {
             #[serde(default = "system_root_directory")]
-            pub root_directory: String,
+            pub root_directory: SystemPath,
             #[serde(default = "system_log_directory")]
-            pub log_directory: String,
+            pub log_directory: SystemPath,
+            #[serde(default = "system_data_directory", rename = "data")]
+            pub data_directory: SystemPath,
+            #[serde(default = "system_diffs_directory")]
+            pub diffs_directory: SystemPath,
             #[serde(default = "system_vmount_directory")]
-            pub vmount_directory: String,
-            #[serde(default = "system_data", rename = "data")]
-            pub data_directory: String,
+            pub vmount_directory: SystemPath,
             #[serde(default = "system_archive_directory")]
-            pub archive_directory: String,
+            pub archive_directory: SystemPath,
             #[serde(default = "system_backup_directory")]
-            pub backup_directory: String,
+            pub backup_directory: SystemPath,
             #[serde(default = "system_tmp_directory")]
-            pub tmp_directory: String,
+            pub tmp_directory: SystemPath,
 
             #[serde(default = "system_username")]
             pub username: compact_str::CompactString,
@@ -813,7 +875,7 @@ nestify::nest! {
                 pub enabled: bool,
                 #[cfg(unix)]
                 #[serde(default = "system_passwd_directory")]
-                pub directory: String,
+                pub directory: SystemPath,
             },
 
             #[cfg(unix)]
@@ -952,6 +1014,28 @@ nestify::nest! {
 
             #[serde(default)]
             #[schema(inline)]
+            pub file_collaboration: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemFileCollaboration {
+                #[serde(default = "system_file_collaboration_enabled")]
+                pub enabled: bool,
+
+                #[serde(default = "system_file_collaboration_file_size_cap")]
+                pub file_size_cap: u64,
+
+                #[serde(default = "system_file_collaboration_max_sessions_per_server")]
+                pub max_sessions_per_server: u64,
+                #[serde(default = "system_file_collaboration_max_sessions_per_connection")]
+                pub max_sessions_per_connection: u64,
+                #[serde(default = "system_file_collaboration_max_editors_per_session")]
+                pub max_editors_per_session: u64,
+                #[serde(default = "system_file_collaboration_max_cursors_per_connection")]
+                pub max_cursors_per_connection: u64,
+
+                #[serde(default = "system_file_collaboration_session_grace_period")]
+                pub session_grace_period: u64,
+            },
+
+            #[serde(default)]
+            #[schema(inline)]
             pub backups: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemBackups {
                 #[serde(default)]
                 pub write_limit: MiB,
@@ -1009,9 +1093,9 @@ nestify::nest! {
                 #[schema(inline)]
                 pub restic: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemBackupsRestic {
                     #[serde(default = "system_backup_restic_repository")]
-                    pub repository: String,
+                    pub repository: SystemPath,
                     #[serde(default = "system_backup_restic_password_file")]
-                    pub password_file: String,
+                    pub password_file: SystemPath,
 
                     #[serde(default = "system_backup_restic_retry_lock_seconds")]
                     pub retry_lock_seconds: u64,
@@ -1032,6 +1116,14 @@ nestify::nest! {
                 pub zfs: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemBackupsZfs {
                     #[serde(default = "system_backup_zfs_restore_threads")]
                     pub restore_threads: usize,
+                },
+                #[serde(default)]
+                #[schema(inline)]
+                pub pbs: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemBackupsPbs {
+                    #[serde(default = "system_backup_pbs_create_threads")]
+                    pub create_threads: usize,
+                    #[serde(default = "system_backup_pbs_download_concurrency")]
+                    pub download_concurrency: usize,
                 },
             },
 
@@ -1061,6 +1153,8 @@ nestify::nest! {
                 pub disable_interface_binding: bool,
                 #[serde(default = "docker_network_dns")]
                 pub dns: Vec<String>,
+                #[serde(default = "docker_network_dns_options")]
+                pub dns_options: Vec<String>,
 
                 #[serde(default = "docker_network_name")]
                 pub name: String,
@@ -1083,6 +1177,8 @@ nestify::nest! {
                     #[serde(default)]
                     #[schema(inline)]
                     pub v4: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerNetworkInterfacesV4 {
+                        #[serde(default = "docker_network_interfaces_v4_enabled")]
+                        pub enabled: bool,
                         #[serde(default = "docker_network_interfaces_v4_subnet")]
                         pub subnet: String,
                         #[serde(default = "docker_network_interfaces_v4_gateway")]
@@ -1091,6 +1187,8 @@ nestify::nest! {
                     #[serde(default)]
                     #[schema(inline)]
                     pub v6: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerNetworkInterfacesV6 {
+                        #[serde(default = "docker_network_interfaces_v6_enabled")]
+                        pub enabled: bool,
                         #[serde(default = "docker_network_interfaces_v6_subnet")]
                         pub subnet: String,
                         #[serde(default = "docker_network_interfaces_v6_gateway")]
@@ -1224,12 +1322,10 @@ impl DockerOverhead {
             return 1.05;
         }
 
-        for (m, v) in self.multipliers.iter().rev() {
-            if memory > *m {
-                continue;
+        for (m, v) in self.multipliers.iter() {
+            if memory <= *m {
+                return *v;
             }
-
-            return *v;
         }
 
         self.default_multiplier
@@ -1251,8 +1347,9 @@ pub const FORBIDDEN_PATHS: &[&str] = &[
     "remote_headers",
     "system.root_directory",
     "system.log_directory",
-    "system.vmount_directory",
     "system.data",
+    "system.diffs_directory",
+    "system.vmount_directory",
     "system.archive_directory",
     "system.backup_directory",
     "system.tmp_directory",
@@ -1296,12 +1393,36 @@ pub struct Config {
 
     pub path: String,
     pub ignore_certificate_errors: bool,
-    pub disk_check_concurrency_semaphore: tokio::sync::Semaphore,
+    pub disk_check_concurrency_semaphore: ArcSwap<tokio::sync::Semaphore>,
     pub client: crate::remote::client::Client,
     pub jwt: crate::remote::jwt::JwtClient,
 }
 
 impl Config {
+    #[cfg(unix)]
+    pub const DEFAULT_PATH: &'static str = "/etc/calagopus-wings/config.yml";
+    #[cfg(windows)]
+    pub const DEFAULT_PATH: &'static str = "C:\\ProgramData\\Calagopus-Wings\\config.yml";
+
+    pub fn find() -> Option<&'static str> {
+        let paths = [
+            #[cfg(unix)]
+            "/etc/calagopus-wings/config.yml",
+            #[cfg(unix)]
+            "/etc/pterodactyl/config.yml",
+            #[cfg(unix)]
+            "/etc/pelican/config.yml",
+            #[cfg(windows)]
+            "C:\\ProgramData\\Calagopus-Wings\\config.yml",
+            "./config.yml",
+        ];
+
+        paths
+            .iter()
+            .find(|path| std::path::Path::new(path).exists())
+            .copied()
+    }
+
     pub fn open(
         path: &str,
         debug: bool,
@@ -1317,7 +1438,7 @@ impl Config {
 
         let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
 
-        let latest_log_path = Path::new(&inner.system.log_directory).join("wings.log");
+        let latest_log_path = inner.system.log_directory.as_path(&inner).join("wings.log");
         let latest_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1329,7 +1450,7 @@ impl Config {
             .filename_suffix("log")
             .max_log_files(30)
             .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .build(&inner.system.log_directory)
+            .build(inner.system.log_directory.as_path(&inner))
             .context("failed to create rolling log file appender")?;
 
         let (file_appender, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
@@ -1370,8 +1491,9 @@ impl Config {
             .try_init()
             .context("failed to install tracing subscriber")?;
 
-        let disk_check_concurrency_semaphore =
-            tokio::sync::Semaphore::new(inner.system.disk_check_concurrency);
+        let disk_check_concurrency_semaphore = ArcSwap::from_pointee(tokio::sync::Semaphore::new(
+            inner.system.disk_check_concurrency,
+        ));
         let client = crate::remote::client::Client::new(&inner, ignore_certificate_errors);
         let jwt = crate::remote::jwt::JwtClient::new(&inner);
 
@@ -1400,7 +1522,7 @@ impl Config {
             log_reload_handle: tracing_subscriber::reload::Layer::new(log_filter(false)).1,
             path: String::new(),
             ignore_certificate_errors: false,
-            disk_check_concurrency_semaphore: tokio::sync::Semaphore::new(1),
+            disk_check_concurrency_semaphore: ArcSwap::from_pointee(tokio::sync::Semaphore::new(1)),
             client,
             jwt,
         }
@@ -1417,6 +1539,8 @@ impl Config {
 
         let old_debug = self.load().debug;
         let new_debug = new.debug;
+        let old_concurrency = self.load().system.disk_check_concurrency;
+        let new_concurrency = new.system.disk_check_concurrency;
 
         self.inner.store(Arc::new(new));
 
@@ -1424,6 +1548,11 @@ impl Config {
             self.log_reload_handle
                 .modify(|filter| *filter = log_filter(new_debug))
                 .context("failed to reload tracing level filter")?;
+        }
+
+        if new_concurrency != old_concurrency {
+            self.disk_check_concurrency_semaphore
+                .store(Arc::new(tokio::sync::Semaphore::new(new_concurrency)));
         }
 
         Ok(())
@@ -1484,7 +1613,9 @@ impl Config {
         let trusted = headers
             .get("X-Real-Ip-Token")
             .and_then(|token| token.to_str().ok())
-            == Some(cfg.token.as_str())
+            .is_some_and(|token| {
+                constant_time_eq::constant_time_eq(token.as_bytes(), cfg.token.as_bytes())
+            })
             || cfg
                 .api
                 .trusted_proxies
@@ -1545,6 +1676,13 @@ impl Config {
                 std::thread::sleep(std::time::Duration::from_secs(10));
             }
             tracing::warn!("you are treading on thin ice. proceed at your own risk.");
+        }
+
+        #[cfg(unix)]
+        if cfg.system.user.uid == 0 || cfg.system.user.gid == 0 {
+            return Err(anyhow::anyhow!(
+                "refusing to use user with UID or GID of 0 (root), please check your wings config and change system.username to a non-root user"
+            ));
         }
 
         if cfg.remote.is_empty() {
@@ -1686,25 +1824,31 @@ impl Config {
 
         // Do not allow directory paths with less than 1 segment (e.g. "/")
         const MIN_DIRECTORY_SEGMENTS: usize = 1;
-        let directories = &[
-            (&cfg.system.root_directory, "root_directory"),
-            (&cfg.system.log_directory, "log_directory"),
-            (&cfg.system.vmount_directory, "vmount_directory"),
-            (&cfg.system.data_directory, "data_directory"),
-            (&cfg.system.archive_directory, "archive_directory"),
-            (&cfg.system.backup_directory, "backup_directory"),
-            (&cfg.system.tmp_directory, "tmp_directory"),
-            (&cfg.web_ide.runtime_directory, "web_ide.runtime_directory"),
-            (&cfg.web_ide.memory_directory, "web_ide.memory_directory"),
+        let directories = [
+            (cfg.system.root_directory.as_path(cfg), "root_directory"),
+            (cfg.system.log_directory.as_path(cfg), "log_directory"),
+            (cfg.system.data_directory.as_path(cfg), "data_directory"),
+            (cfg.system.diffs_directory.as_path(cfg), "diffs_directory"),
+            (cfg.system.vmount_directory.as_path(cfg), "vmount_directory"),
+            (cfg.system.archive_directory.as_path(cfg), "archive_directory"),
+            (cfg.system.backup_directory.as_path(cfg), "backup_directory"),
+            (cfg.system.tmp_directory.as_path(cfg), "tmp_directory"),
             (
-                &cfg.web_ide.persistent_data_directory,
+                PathBuf::from(&cfg.web_ide.runtime_directory),
+                "web_ide.runtime_directory",
+            ),
+            (
+                PathBuf::from(&cfg.web_ide.memory_directory),
+                "web_ide.memory_directory",
+            ),
+            (
+                PathBuf::from(&cfg.web_ide.persistent_data_directory),
                 "web_ide.persistent_data_directory",
             ),
         ];
 
         for (dir, name) in directories {
-            let path = Path::new(dir);
-            let segments = path
+            let segments = dir
                 .components()
                 .filter(|c| matches!(c, std::path::Component::Normal(_)))
                 .count();
@@ -1712,7 +1856,7 @@ impl Config {
                 return Err(anyhow::anyhow!(
                     "the {} '{}' must have at least {} segment(s)",
                     name,
-                    dir,
+                    dir.display(),
                     MIN_DIRECTORY_SEGMENTS
                 ));
             }
@@ -1725,32 +1869,34 @@ impl Config {
         let directories = vec![
             &cfg.system.root_directory,
             &cfg.system.log_directory,
-            &cfg.system.vmount_directory,
             &cfg.system.data_directory,
+            &cfg.system.diffs_directory,
+            &cfg.system.vmount_directory,
             &cfg.system.archive_directory,
             &cfg.system.backup_directory,
             &cfg.system.tmp_directory,
         ];
 
         for dir in directories {
-            if !Path::new(dir).exists() {
-                std::fs::create_dir_all(dir)?;
+            let path = dir.as_path(cfg);
+            if !path.exists() {
+                std::fs::create_dir_all(&path)?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
                 }
             }
         }
 
         #[cfg(unix)]
-        if cfg.system.passwd.enabled && !Path::new(&cfg.system.passwd.directory).exists() {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::create_dir_all(&cfg.system.passwd.directory)?;
-            std::fs::set_permissions(
-                &cfg.system.passwd.directory,
-                std::fs::Permissions::from_mode(0o755),
-            )?;
+        {
+            let passwd_dir = cfg.system.passwd.directory.as_path(cfg);
+            if cfg.system.passwd.enabled && !passwd_dir.exists() {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::create_dir_all(&passwd_dir)?;
+                std::fs::set_permissions(&passwd_dir, std::fs::Permissions::from_mode(0o755))?;
+            }
         }
 
         Ok(())
@@ -1793,15 +1939,9 @@ impl Config {
                     }
 
                     cfg.system.user.uid = **user;
-                    if cfg.system.user.rootless.container_uid == 0 {
-                        cfg.system.user.rootless.container_uid = cfg.system.user.uid;
-                    }
                 }
                 if let Some(group) = process.group_id() {
                     cfg.system.user.gid = *group;
-                    if cfg.system.user.rootless.container_gid == 0 {
-                        cfg.system.user.rootless.container_gid = cfg.system.user.gid;
-                    }
                 }
 
                 if cfg.system.user.uid == 0 || cfg.system.user.gid == 0 {
@@ -1909,8 +2049,10 @@ impl Config {
         use std::os::unix::fs::PermissionsExt;
 
         if cfg.system.passwd.enabled {
+            let passwd_dir = cfg.system.passwd.directory.as_path(cfg);
+
             std::fs::write(
-                Path::new(&cfg.system.passwd.directory).join("group"),
+                passwd_dir.join("group"),
                 format!(
                     "root:x:0:\ncontainer:x:{}:\nnogroup:x:65534:",
                     cfg.system.user.gid
@@ -1918,23 +2060,19 @@ impl Config {
             )
             .context(format!(
                 "failed to write group file {}",
-                Path::new(&cfg.system.passwd.directory)
-                    .join("group")
-                    .display()
+                passwd_dir.join("group").display()
             ))?;
             std::fs::set_permissions(
-                Path::new(&cfg.system.passwd.directory).join("group"),
+                passwd_dir.join("group"),
                 std::fs::Permissions::from_mode(0o644),
             )
             .context(format!(
                 "failed to set permissions for group file {}",
-                Path::new(&cfg.system.passwd.directory)
-                    .join("group")
-                    .display()
+                passwd_dir.join("group").display()
             ))?;
 
             std::fs::write(
-                Path::new(&cfg.system.passwd.directory).join("passwd"),
+                passwd_dir.join("passwd"),
                 format!(
                     "root:x:0:0::/root:/bin/sh\ncontainer:x:{}:{}::/home/container:/bin/sh\nnobody:x:65534:65534::/var/empty:/bin/sh\n",
                     cfg.system.user.uid, cfg.system.user.gid
@@ -1942,17 +2080,15 @@ impl Config {
             )
             .context(format!(
                 "failed to write passwd file {}",
-                Path::new(&cfg.system.passwd.directory).join("passwd").display()
+                passwd_dir.join("passwd").display()
             ))?;
             std::fs::set_permissions(
-                Path::new(&cfg.system.passwd.directory).join("passwd"),
+                passwd_dir.join("passwd"),
                 std::fs::Permissions::from_mode(0o644),
             )
             .context(format!(
                 "failed to set permissions for passwd file {}",
-                Path::new(&cfg.system.passwd.directory)
-                    .join("passwd")
-                    .display()
+                passwd_dir.join("passwd").display()
             ))?;
         }
 
@@ -1960,11 +2096,18 @@ impl Config {
     }
 
     pub fn vmount_path(&self, server_uuid: uuid::Uuid) -> PathBuf {
-        Path::new(&self.load().system.vmount_directory).join(server_uuid.to_compact_string())
+        self.resolve_as_path(|cfg| &cfg.system.vmount_directory)
+            .join(server_uuid.to_compact_string())
     }
 
     pub fn data_path(&self, server_uuid: uuid::Uuid) -> PathBuf {
-        Path::new(&self.load().system.data_directory).join(server_uuid.to_compact_string())
+        self.resolve_as_path(|cfg| &cfg.system.data_directory)
+            .join(server_uuid.to_compact_string())
+    }
+
+    pub fn tmp_data_path(&self, server_uuid: uuid::Uuid) -> PathBuf {
+        self.resolve_as_path(|cfg| &cfg.system.tmp_directory)
+            .join(server_uuid.to_compact_string())
     }
 
     pub fn daemon_prelude(&self) -> compact_str::CompactString {
@@ -1972,6 +2115,18 @@ impl Config {
             .bold()
             .paint(format!("[{} Daemon]:", self.load().app_name))
             .to_compact_string()
+    }
+
+    #[inline]
+    pub fn resolve_as_str(&self, path: impl FnOnce(&InnerConfig) -> &SystemPath) -> String {
+        let cfg = self.load();
+        path(&cfg).as_str(&cfg).into_owned()
+    }
+
+    #[inline]
+    pub fn resolve_as_path(&self, path: impl FnOnce(&InnerConfig) -> &SystemPath) -> PathBuf {
+        let cfg = self.load();
+        path(&cfg).as_path(&cfg)
     }
 
     pub async fn ensure_docker_network(
@@ -1986,25 +2141,32 @@ impl Config {
                 client: &bollard::Docker,
                 cfg: &InnerConfig,
             ) -> Result<(), bollard::errors::Error> {
+                let mut ipam_config = Vec::new();
+
+                if cfg.docker.network.interfaces.v4.enabled {
+                    ipam_config.push(bollard::models::IpamConfig {
+                        subnet: Some(cfg.docker.network.interfaces.v4.subnet.clone()),
+                        gateway: Some(cfg.docker.network.interfaces.v4.gateway.clone()),
+                        ..Default::default()
+                    });
+                }
+                if cfg.docker.network.interfaces.v6.enabled {
+                    ipam_config.push(bollard::models::IpamConfig {
+                        subnet: Some(cfg.docker.network.interfaces.v6.subnet.clone()),
+                        gateway: Some(cfg.docker.network.interfaces.v6.gateway.clone()),
+                        ..Default::default()
+                    });
+                }
+
                 client
                     .create_network(bollard::plugin::NetworkCreateRequest {
                         name: cfg.docker.network.name.to_string(),
                         driver: Some(cfg.docker.network.driver.to_string()),
-                        enable_ipv6: Some(true),
+                        enable_ipv4: Some(cfg.docker.network.interfaces.v4.enabled),
+                        enable_ipv6: Some(cfg.docker.network.interfaces.v6.enabled),
                         internal: Some(cfg.docker.network.is_internal),
                         ipam: Some(bollard::models::Ipam {
-                            config: Some(vec![
-                                bollard::models::IpamConfig {
-                                    subnet: Some(cfg.docker.network.interfaces.v4.subnet.clone()),
-                                    gateway: Some(cfg.docker.network.interfaces.v4.gateway.clone()),
-                                    ..Default::default()
-                                },
-                                bollard::models::IpamConfig {
-                                    subnet: Some(cfg.docker.network.interfaces.v6.subnet.clone()),
-                                    gateway: Some(cfg.docker.network.interfaces.v6.gateway.clone()),
-                                    ..Default::default()
-                                },
-                            ]),
+                            config: Some(ipam_config),
                             ..Default::default()
                         }),
                         options: Some(HashMap::from([
@@ -2039,6 +2201,15 @@ impl Config {
                     .await?;
 
                 Ok(())
+            }
+
+            if !self.load().docker.network.interfaces.v4.enabled
+                && !self.load().docker.network.interfaces.v6.enabled
+            {
+                return Err(anyhow::anyhow!(
+                    "docker network {} has both v4 and v6 disabled, aborting creation",
+                    self.load().docker.network.name
+                ));
             }
 
             let initial_result = create_network(client, &self.load()).await;

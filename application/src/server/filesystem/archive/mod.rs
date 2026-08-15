@@ -1,9 +1,7 @@
 use crate::{
     io::{
-        ReadSeek,
         abort::{AbortGuard, AbortListener, AbortReader, AbortWriter},
         compression::{CompressionType, reader::CompressionReaderMt},
-        counting_reader::CountingReader,
         counting_writer::CountingWriter,
     },
     utils::PortablePermissions,
@@ -26,6 +24,23 @@ use utoipa::ToSchema;
 
 pub mod create;
 pub mod multi_reader;
+
+fn resolve_entry_path(destination: &Path, path: &Path) -> Option<PathBuf> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+
+    Some(super::cap::CapFilesystem::resolve_path(
+        &destination.join(path),
+    ))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum ArchiveType {
@@ -412,7 +427,8 @@ impl Archive {
     pub async fn extract(
         mut self,
         destination: PathBuf,
-        progress: Option<Arc<AtomicU64>>,
+        destination_filesystem: Arc<dyn super::virtualfs::VirtualWritableFilesystem>,
+        progress: create::ArchiveProgress,
         total: Option<Arc<AtomicU64>>,
     ) -> Result<(), anyhow::Error> {
         self.file.seek(SeekFrom::Start(0)).await?;
@@ -424,18 +440,19 @@ impl Archive {
                     None => return Err(anyhow::anyhow!("Invalid file name")),
                 };
 
+                if destination_filesystem.is_primary_server_fs()
+                    && self.server.filesystem.is_ignored(&file_name, false)
+                {
+                    return Err(anyhow::anyhow!("Destination file is ignored"));
+                }
+
                 let metadata = self.server.filesystem.async_metadata(&self.path).await?;
 
                 let file = self.file.into_std().await;
                 let (guard, listener) = AbortGuard::new();
 
                 tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
-                    let reader: Box<dyn ReadSeek + Send> = match progress {
-                        Some(progress) => {
-                            Box::new(CountingReader::new_with_bytes_read(file, progress))
-                        }
-                        None => Box::new(file),
-                    };
+                    let reader = progress.counting_reader(file);
                     let reader = CompressionReaderMt::new(
                         reader,
                         self.compression,
@@ -448,15 +465,19 @@ impl Archive {
                     )?;
                     let mut reader = AbortReader::new(reader, listener);
 
-                    let mut writer = super::file::ServerFile::new(
-                        self.server.clone(),
-                        &file_name,
-                        Some(metadata.permissions().into()),
-                        metadata.modified().map(|t| t.into_std()).ok(),
-                    )?;
+                    let mut writer = destination_filesystem.create_file(&file_name)?;
 
                     crate::io::copy(&mut reader, &mut writer)?;
                     writer.flush()?;
+                    drop(writer);
+
+                    destination_filesystem
+                        .set_permissions(&file_name, metadata.permissions().into())?;
+                    if let Ok(modified) = metadata.modified() {
+                        destination_filesystem.set_times(&file_name, modified.into_std(), None)?;
+                    }
+
+                    progress.increment_files();
 
                     Ok(())
                 })
@@ -469,12 +490,7 @@ impl Archive {
                 let (guard, listener) = AbortGuard::new();
 
                 tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
-                    let reader: Box<dyn ReadSeek + Send> = match progress {
-                        Some(progress) => {
-                            Box::new(CountingReader::new_with_bytes_read(file, progress))
-                        }
-                        None => Box::new(file),
-                    };
+                    let reader = progress.counting_reader(file);
                     let reader = CompressionReaderMt::new(
                         reader,
                         self.compression,
@@ -496,77 +512,91 @@ impl Archive {
                     let mut archive = tar::Archive::new(reader);
                     archive.set_ignore_zeros(true);
                     let mut directory_entries = chunked_vec::ChunkedVec::new();
-                    let mut entries = archive.entries()?;
+                    let entries = archive.entries()?;
 
                     let mut read_buffer = vec![0; crate::BUFFER_SIZE];
                     let mut last_parent = None;
-                    while let Some(Ok(mut entry)) = entries.next() {
+                    for entry in entries {
+                        let mut entry = entry?;
                         let path = entry.path()?;
 
-                        if path.is_absolute() {
+                        let Some(destination_path) =
+                            resolve_entry_path(&destination, path.as_ref())
+                        else {
                             continue;
-                        }
-
-                        let destination_path = destination.join(path.as_ref());
+                        };
                         let header = entry.header();
 
-                        if self
-                            .server
-                            .filesystem
-                            .is_ignored(&destination_path, header.entry_type().is_dir())
+                        if destination_filesystem.is_primary_server_fs()
+                            && self
+                                .server
+                                .filesystem
+                                .is_ignored(&destination_path, header.entry_type().is_dir())
                         {
                             continue;
                         }
 
                         match header.entry_type() {
                             tar::EntryType::Directory => {
-                                self.server
-                                    .filesystem
-                                    .create_chowned_dir_all(&destination_path)?;
+                                destination_filesystem.create_dir_all(&destination_path)?;
                                 if let Ok(permissions) =
-                                    header.mode().map(PortablePermissions::from_mode)
+                                    header.mode().map(PortablePermissions::from_mode_dir)
                                 {
-                                    self.server
-                                        .filesystem
+                                    destination_filesystem
                                         .set_permissions(&destination_path, permissions)?;
                                 }
 
                                 if let Ok(modified_time) = header.mtime()
                                     && directory_entries.len() < Self::MAX_DIRECTORY_MTIME_ENTRIES
+                                    && std::time::UNIX_EPOCH
+                                        .checked_add(std::time::Duration::from_secs(modified_time))
+                                        .is_some()
                                 {
                                     directory_entries.push((destination_path, modified_time));
                                 }
                             }
                             tar::EntryType::Regular => {
+                                let permissions =
+                                    header.mode().map(PortablePermissions::from_mode_file).ok();
+                                let modified_time = header.mtime().ok().and_then(|t| {
+                                    std::time::UNIX_EPOCH
+                                        .checked_add(std::time::Duration::from_secs(t))
+                                });
+
                                 if let Some(parent) = destination_path.parent()
                                     && last_parent.as_deref() != Some(parent)
                                 {
-                                    self.server.filesystem.create_chowned_dir_all(parent)?;
+                                    destination_filesystem.create_dir_all(&parent)?;
                                     last_parent = Some(parent.to_path_buf());
                                 }
 
-                                let mut writer = super::file::ServerFile::new(
-                                    self.server.clone(),
-                                    &destination_path,
-                                    header.mode().map(PortablePermissions::from_mode).ok(),
-                                    header
-                                        .mtime()
-                                        .map(|t| {
-                                            std::time::UNIX_EPOCH
-                                                + std::time::Duration::from_secs(t)
-                                        })
-                                        .ok(),
-                                )?;
+                                let mut writer =
+                                    destination_filesystem.create_file(&destination_path)?;
 
                                 crate::io::copy_shared(&mut read_buffer, &mut entry, &mut writer)?;
                                 writer.flush()?;
+                                drop(writer);
+
+                                if let Some(permissions) = permissions {
+                                    destination_filesystem
+                                        .set_permissions(&destination_path, permissions)?;
+                                }
+                                if let Some(modified_time) = modified_time {
+                                    destination_filesystem.set_times(
+                                        &destination_path,
+                                        modified_time,
+                                        None,
+                                    )?;
+                                }
+
+                                progress.increment_files();
                             }
                             tar::EntryType::Symlink => {
                                 let link =
                                     entry.link_name().unwrap_or_default().unwrap_or_default();
 
                                 if let Err(err) =
-                                    self.server.filesystem.symlink(link, &destination_path)
+                                    destination_filesystem.create_symlink(&link, &destination_path)
                                 {
                                     tracing::debug!(
                                         path = %path.display(),
@@ -574,10 +604,13 @@ impl Archive {
                                         err
                                     );
                                 } else if let Ok(modified_time) = header.mtime() {
-                                    self.server.filesystem.set_times(
+                                    destination_filesystem.set_times(
                                         &destination_path,
                                         std::time::UNIX_EPOCH
-                                            + std::time::Duration::from_secs(modified_time),
+                                            .checked_add(std::time::Duration::from_secs(
+                                                modified_time,
+                                            ))
+                                            .unwrap_or_else(std::time::SystemTime::now),
                                         None,
                                     )?;
                                 }
@@ -587,9 +620,11 @@ impl Archive {
                     }
 
                     for (destination_path, modified_time) in directory_entries {
-                        self.server.filesystem.set_times(
+                        destination_filesystem.set_times(
                             &destination_path,
-                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified_time),
+                            std::time::UNIX_EPOCH
+                                .checked_add(std::time::Duration::from_secs(modified_time))
+                                .unwrap_or_else(std::time::SystemTime::now),
                             None,
                         )?;
                     }
@@ -637,6 +672,7 @@ impl Archive {
                         let archive = archive.clone();
                         let destination = destination.clone();
                         let server = self.server.clone();
+                        let destination_filesystem = destination_filesystem.clone();
                         let error_clone = Arc::clone(&error);
 
                         scope.spawn_broadcast(move |_, _| {
@@ -646,6 +682,7 @@ impl Archive {
                             let error_clone2 = Arc::clone(&error_clone);
                             let destination = destination.clone();
                             let server = server.clone();
+                            let destination_filesystem = destination_filesystem.clone();
 
                             let mut run = move || -> Result<(), anyhow::Error> {
                                 let mut read_buffer = vec![0; crate::BUFFER_SIZE];
@@ -667,26 +704,25 @@ impl Archive {
                                         None => continue,
                                     };
 
-                                    if path.is_absolute() {
+                                    let Some(destination_path) =
+                                        resolve_entry_path(&destination, &path)
+                                    else {
                                         continue;
-                                    }
+                                    };
 
-                                    let destination_path = destination.join(path);
-
-                                    if server
-                                        .filesystem
-                                        .is_ignored(&destination_path, entry.is_dir())
+                                    if destination_filesystem.is_primary_server_fs()
+                                        && server
+                                            .filesystem
+                                            .is_ignored(&destination_path, entry.is_dir())
                                     {
                                         continue;
                                     }
 
                                     if entry.is_dir() {
-                                        server
-                                            .filesystem
-                                            .create_chowned_dir_all(&destination_path)?;
-                                        server.filesystem.set_permissions(
+                                        destination_filesystem.create_dir_all(&destination_path)?;
+                                        destination_filesystem.set_permissions(
                                             &destination_path,
-                                            PortablePermissions::from_mode(
+                                            PortablePermissions::from_mode_dir(
                                                 entry.unix_mode().unwrap_or(0o755),
                                             ),
                                         )?;
@@ -694,26 +730,20 @@ impl Archive {
                                         if let Some(parent) = destination_path.parent()
                                             && last_parent.as_deref() != Some(parent)
                                         {
-                                            server.filesystem.create_chowned_dir_all(parent)?;
+                                            destination_filesystem.create_dir_all(&parent)?;
                                             last_parent = Some(parent.to_path_buf());
                                         }
 
-                                        let mut writer = super::file::ServerFile::new(
-                                            server.clone(),
-                                            &destination_path,
-                                            entry.unix_mode().map(PortablePermissions::from_mode),
-                                            zip_entry_get_modified_time(&entry),
-                                        )?;
+                                        let permissions = entry
+                                            .unix_mode()
+                                            .map(PortablePermissions::from_mode_file);
+                                        let modified_time = zip_entry_get_modified_time(&entry);
 
-                                        let mut reader: Box<dyn Read> = match &progress {
-                                            Some(progress) => {
-                                                Box::new(CountingReader::new_with_bytes_read(
-                                                    entry,
-                                                    Arc::clone(progress),
-                                                ))
-                                            }
-                                            None => Box::new(entry),
-                                        };
+                                        let mut writer = destination_filesystem
+                                            .create_file(&destination_path)?;
+
+                                        let mut reader: Box<dyn Read> =
+                                            Box::new(progress.counting_reader(entry));
 
                                         crate::io::copy_shared(
                                             &mut read_buffer,
@@ -721,14 +751,29 @@ impl Archive {
                                             &mut writer,
                                         )?;
                                         writer.flush()?;
+                                        drop(writer);
+
+                                        if let Some(permissions) = permissions {
+                                            destination_filesystem
+                                                .set_permissions(&destination_path, permissions)?;
+                                        }
+                                        if let Some(modified_time) = modified_time {
+                                            destination_filesystem.set_times(
+                                                &destination_path,
+                                                modified_time,
+                                                None,
+                                            )?;
+                                        }
+
+                                        progress.increment_files();
                                     } else if entry.is_symlink()
                                         && (1..=2048).contains(&entry.size())
                                     {
                                         let link =
                                             std::io::read_to_string(&mut entry).unwrap_or_default();
 
-                                        if let Err(err) =
-                                            server.filesystem.symlink(link, &destination_path)
+                                        if let Err(err) = destination_filesystem
+                                            .create_symlink(&link, &destination_path)
                                         {
                                             tracing::debug!(
                                                 path = %destination_path.display(),
@@ -738,16 +783,14 @@ impl Archive {
                                         } else if let Some(modified_time) =
                                             zip_entry_get_modified_time(&entry)
                                         {
-                                            server.filesystem.set_times(
+                                            destination_filesystem.set_times(
                                                 &destination_path,
                                                 modified_time,
                                                 None,
                                             )?;
                                         }
 
-                                        if let Some(progress) = &progress {
-                                            progress.fetch_add(entry.size(), Ordering::Relaxed);
-                                        }
+                                        progress.increment_bytes(entry.size());
                                     }
                                 }
                             };
@@ -770,22 +813,23 @@ impl Archive {
                                     None => continue,
                                 };
 
-                                if path.is_absolute() {
+                                let Some(destination_path) =
+                                    resolve_entry_path(&destination, &path)
+                                else {
                                     continue;
-                                }
+                                };
 
-                                let destination_path = destination.join(path);
-
-                                if self
-                                    .server
-                                    .filesystem
-                                    .is_ignored(&destination_path, entry.is_dir())
+                                if destination_filesystem.is_primary_server_fs()
+                                    && self
+                                        .server
+                                        .filesystem
+                                        .is_ignored(&destination_path, entry.is_dir())
                                 {
                                     continue;
                                 }
 
                                 if let Some(modified_time) = zip_entry_get_modified_time(&entry) {
-                                    self.server.filesystem.set_times(
+                                    destination_filesystem.set_times(
                                         &destination_path,
                                         modified_time,
                                         None,
@@ -858,16 +902,18 @@ impl Archive {
                             None => break,
                         };
 
-                        let path = &entry.entry().filename;
-                        if path.is_absolute() {
+                        let Some(destination_path) =
+                            resolve_entry_path(&destination, &entry.entry().filename)
+                        else {
                             archive = entry.skip()?;
                             continue;
-                        }
+                        };
 
-                        if self
-                            .server
-                            .filesystem
-                            .is_ignored(path, entry.entry().is_directory())
+                        if destination_filesystem.is_primary_server_fs()
+                            && self
+                                .server
+                                .filesystem
+                                .is_ignored(&destination_path, entry.entry().is_directory())
                         {
                             archive = entry.skip()?;
                             continue;
@@ -877,12 +923,8 @@ impl Archive {
                             return Err(anyhow::anyhow!("operation aborted"));
                         }
 
-                        let destination_path = destination.join(path);
-
                         if entry.entry().is_directory() {
-                            self.server
-                                .filesystem
-                                .create_chowned_dir_all(&destination_path)?;
+                            destination_filesystem.create_dir_all(&destination_path)?;
 
                             if let Some(modified_time) = dos_time_to_unix(entry.entry().file_time)
                                 && directory_entries.len() < Self::MAX_DIRECTORY_MTIME_ENTRIES
@@ -896,24 +938,22 @@ impl Archive {
                             if let Some(parent) = destination_path.parent()
                                 && last_parent.as_deref() != Some(parent)
                             {
-                                self.server.filesystem.create_chowned_dir_all(parent)?;
+                                destination_filesystem.create_dir_all(&parent)?;
                                 last_parent = Some(parent.to_path_buf());
                             }
 
-                            let writer = super::file::ServerFile::new(
-                                self.server.clone(),
-                                &destination_path,
-                                None,
+                            let modified_time =
                                 dos_time_to_unix(entry.entry().file_time).map(|secs| {
                                     std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
-                                }),
-                            )?;
+                                });
+
+                            let writer = destination_filesystem.create_file(&destination_path)?;
                             let writer = AbortWriter::new(writer, listener.clone());
-                            let writer: Box<dyn Write + Send + Sync> = match &progress {
-                                Some(progress) => Box::new(CountingWriter::new_with_bytes_written(
-                                    writer,
-                                    Arc::clone(progress),
-                                )),
+                            let writer: Box<dyn Write + Send + Sync> = match progress.clone_bytes()
+                            {
+                                Some(bytes_processed) => Box::new(
+                                    CountingWriter::new_with_bytes_written(writer, bytes_processed),
+                                ),
                                 None => Box::new(writer),
                             };
 
@@ -927,14 +967,26 @@ impl Archive {
                                 return Err(err.into());
                             }
 
+                            if let Some(modified_time) = modified_time {
+                                destination_filesystem.set_times(
+                                    &destination_path,
+                                    modified_time,
+                                    None,
+                                )?;
+                            }
+
+                            progress.increment_files();
+
                             archive = processed_archive;
                         }
                     }
 
                     for (destination_path, modified_time) in directory_entries {
-                        self.server.filesystem.set_times(
+                        destination_filesystem.set_times(
                             &destination_path,
-                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified_time),
+                            std::time::UNIX_EPOCH
+                                .checked_add(std::time::Duration::from_secs(modified_time))
+                                .unwrap_or_else(std::time::SystemTime::now),
                             None,
                         )?;
                     }
@@ -982,6 +1034,7 @@ impl Archive {
                             let mut reader = reader.clone();
                             let destination = destination.clone();
                             let server = self.server.clone();
+                            let destination_filesystem = destination_filesystem.clone();
                             let error_clone = Arc::clone(&error);
 
                             scope.spawn(move |_| {
@@ -1006,19 +1059,23 @@ impl Archive {
                                         return Ok(true);
                                     }
 
-                                    let destination_path = destination.join(path);
+                                    let Some(destination_path) =
+                                        resolve_entry_path(&destination, Path::new(path))
+                                    else {
+                                        return Ok(true);
+                                    };
 
-                                    if server
-                                        .filesystem
-                                        .is_ignored(&destination_path, entry.is_directory())
+                                    if destination_filesystem.is_primary_server_fs()
+                                        && server
+                                            .filesystem
+                                            .is_ignored(&destination_path, entry.is_directory())
                                     {
                                         return Ok(true);
                                     }
 
                                     if entry.is_directory() {
-                                        if let Err(err) = server
-                                            .filesystem
-                                            .create_chowned_dir_all(&destination_path)
+                                        if let Err(err) =
+                                            destination_filesystem.create_dir_all(&destination_path)
                                         {
                                             return Err(sevenz_rust2::Error::Other(
                                                 err.to_string().into(),
@@ -1029,7 +1086,7 @@ impl Archive {
                                             && last_parent.as_deref() != Some(parent)
                                         {
                                             if let Err(err) =
-                                                server.filesystem.create_chowned_dir_all(parent)
+                                                destination_filesystem.create_dir_all(&parent)
                                             {
                                                 return Err(sevenz_rust2::Error::Other(
                                                     err.to_string().into(),
@@ -1038,27 +1095,18 @@ impl Archive {
                                             last_parent = Some(parent.to_path_buf());
                                         }
 
-                                        let mut writer = super::file::ServerFile::new(
-                                            server.clone(),
-                                            &destination_path,
-                                            None,
-                                            if entry.has_last_modified_date {
-                                                Some(entry.last_modified_date.into())
-                                            } else {
-                                                None
-                                            },
-                                        )
-                                        .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-                                        let mut reader: Box<dyn Read> = match &progress {
-                                            Some(progress) => {
-                                                Box::new(CountingReader::new_with_bytes_read(
-                                                    reader,
-                                                    Arc::clone(progress),
-                                                ))
-                                            }
-                                            None => Box::new(reader),
+                                        let modified_time = if entry.has_last_modified_date {
+                                            Some(entry.last_modified_date.into())
+                                        } else {
+                                            None
                                         };
+
+                                        let mut writer = destination_filesystem
+                                            .create_file(&destination_path)
+                                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+                                        let mut reader: Box<dyn Read> =
+                                            Box::new(progress.counting_reader(reader));
 
                                         crate::io::copy_shared(
                                             &mut read_buffer,
@@ -1066,6 +1114,17 @@ impl Archive {
                                             &mut writer,
                                         )?;
                                         writer.flush()?;
+                                        drop(writer);
+
+                                        if let Some(modified_time) = modified_time {
+                                            destination_filesystem
+                                                .set_times(&destination_path, modified_time, None)
+                                                .map_err(|e| {
+                                                    std::io::Error::other(e.to_string())
+                                                })?;
+                                        }
+
+                                        progress.increment_files();
                                     }
 
                                     Ok(true)
@@ -1086,17 +1145,22 @@ impl Archive {
                                     continue;
                                 }
 
-                                let destination_path = destination.join(path);
+                                let Some(destination_path) =
+                                    resolve_entry_path(&destination, Path::new(path))
+                                else {
+                                    continue;
+                                };
 
-                                if self
-                                    .server
-                                    .filesystem
-                                    .is_ignored(&destination_path, entry.is_directory())
+                                if destination_filesystem.is_primary_server_fs()
+                                    && self
+                                        .server
+                                        .filesystem
+                                        .is_ignored(&destination_path, entry.is_directory())
                                 {
                                     continue;
                                 }
 
-                                self.server.filesystem.set_times(
+                                destination_filesystem.set_times(
                                     &destination_path,
                                     entry.last_modified_date.into(),
                                     None,
@@ -1147,18 +1211,33 @@ impl Archive {
                         )
                         .build()?;
 
+                    #[allow(clippy::too_many_arguments)]
                     fn recursive_traverse(
                         scope: &rayon::Scope,
                         listener: &AbortListener,
-                        progress: &Option<Arc<AtomicU64>>,
+                        progress: &create::ArchiveProgress,
+                        error: &Arc<RwLock<Option<std::io::Error>>>,
                         server: &crate::server::Server,
+                        destination_filesystem: &Arc<
+                            dyn crate::server::filesystem::virtualfs::VirtualWritableFilesystem,
+                        >,
                         destination: &Path,
                         entry: ddup_bak::archive::entries::Entry,
                     ) -> Result<(), anyhow::Error> {
-                        let destination_path = destination.join(entry.name());
-                        if server
-                            .filesystem
-                            .is_ignored(&destination_path, entry.is_directory())
+                        if error.read().is_some() {
+                            return Ok(());
+                        }
+
+                        let Some(destination_path) =
+                            resolve_entry_path(destination, Path::new(entry.name()))
+                        else {
+                            return Ok(());
+                        };
+
+                        if destination_filesystem.is_primary_server_fs()
+                            && server
+                                .filesystem
+                                .is_ignored(&destination_path, entry.is_directory())
                         {
                             return Ok(());
                         }
@@ -1169,12 +1248,10 @@ impl Archive {
 
                         match entry {
                             ddup_bak::archive::entries::Entry::Directory(dir) => {
-                                server
-                                    .filesystem
-                                    .create_chowned_dir_all(&destination_path)?;
-                                server.filesystem.set_permissions(
+                                destination_filesystem.create_dir_all(&destination_path)?;
+                                destination_filesystem.set_permissions(
                                     &destination_path,
-                                    PortablePermissions::from_mode(dir.mode.bits()),
+                                    PortablePermissions::from_mode_dir(dir.mode.bits()),
                                 )?;
 
                                 for entry in dir.entries {
@@ -1182,39 +1259,48 @@ impl Archive {
                                         scope,
                                         listener,
                                         progress,
+                                        error,
                                         server,
+                                        destination_filesystem,
                                         &destination_path,
                                         entry,
                                     )?;
                                 }
 
-                                server
-                                    .filesystem
-                                    .set_times(&destination_path, dir.mtime, None)?;
+                                destination_filesystem.set_times(
+                                    &destination_path,
+                                    dir.mtime,
+                                    None,
+                                )?;
                             }
                             ddup_bak::archive::entries::Entry::File(file) => {
-                                let mut writer = super::file::ServerFile::new(
-                                    server.clone(),
-                                    &destination_path,
-                                    Some(PortablePermissions::from_mode(file.mode.bits())),
-                                    Some(file.mtime),
-                                )?;
+                                let permissions =
+                                    PortablePermissions::from_mode_file(file.mode.bits());
+                                let mtime = file.mtime;
+
+                                let mut writer =
+                                    destination_filesystem.create_file(&destination_path)?;
 
                                 let reader = AbortReader::new(file, listener.clone());
-                                let mut reader: Box<dyn Read + Send> = match progress {
-                                    Some(progress) => {
-                                        Box::new(CountingReader::new_with_bytes_read(
-                                            reader,
-                                            Arc::clone(progress),
-                                        ))
-                                    }
-                                    None => Box::new(reader),
-                                };
+                                let mut reader: Box<dyn Read + Send> =
+                                    Box::new(progress.counting_reader(reader));
 
+                                let error = Arc::clone(error);
+                                let destination_filesystem = Arc::clone(destination_filesystem);
+                                let progress = progress.clone();
                                 scope.spawn(move |_| {
                                     let mut run = || -> Result<(), std::io::Error> {
                                         crate::io::copy(&mut reader, &mut writer)?;
                                         writer.flush()?;
+
+                                        destination_filesystem
+                                            .set_permissions(&destination_path, permissions)
+                                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                                        destination_filesystem
+                                            .set_times(&destination_path, mtime, None)
+                                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+                                        progress.increment_files();
 
                                         Ok(())
                                     };
@@ -1225,12 +1311,14 @@ impl Archive {
                                             "failed to extract file from archive: {:#?}",
                                             err
                                         );
+
+                                        error.write().replace(err);
                                     }
                                 });
                             }
                             ddup_bak::archive::entries::Entry::Symlink(link) => {
-                                if let Err(err) =
-                                    server.filesystem.symlink(link.target, &destination_path)
+                                if let Err(err) = destination_filesystem
+                                    .create_symlink(&link.target, &destination_path)
                                 {
                                     tracing::debug!(
                                         path = %destination_path.display(),
@@ -1238,7 +1326,7 @@ impl Archive {
                                         err
                                     );
                                 } else {
-                                    server.filesystem.set_times(
+                                    destination_filesystem.set_times(
                                         &destination_path,
                                         link.mtime,
                                         None,
@@ -1250,20 +1338,30 @@ impl Archive {
                         Ok(())
                     }
 
-                    pool.in_place_scope(|scope| {
+                    let error = Arc::new(RwLock::new(None));
+
+                    pool.in_place_scope(|scope| -> Result<(), anyhow::Error> {
                         for entry in archive.into_entries() {
                             recursive_traverse(
                                 scope,
                                 &listener,
                                 &progress,
+                                &error,
                                 &self.server,
+                                &destination_filesystem,
                                 &destination,
                                 entry,
                             )?;
                         }
 
                         Ok(())
-                    })
+                    })?;
+
+                    if let Some(err) = error.write().take() {
+                        return Err(err.into());
+                    }
+
+                    Ok(())
                 })
                 .await??;
 
@@ -1274,12 +1372,7 @@ impl Archive {
                 let (guard, listener) = AbortGuard::new();
 
                 tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
-                    let reader: Box<dyn ReadSeek + Send> = match progress {
-                        Some(progress) => {
-                            Box::new(CountingReader::new_with_bytes_read(file, progress))
-                        }
-                        None => Box::new(file),
-                    };
+                    let reader = progress.counting_reader(file);
                     let reader = CompressionReaderMt::new(
                         reader,
                         self.compression,
@@ -1312,26 +1405,27 @@ impl Archive {
                             Ok(relative) if !relative.as_os_str().is_empty() => relative,
                             _ => continue,
                         };
-                        let destination_path = destination.join(relative);
+                        let Some(destination_path) = resolve_entry_path(&destination, relative)
+                        else {
+                            continue;
+                        };
 
                         let is_dir = matches!(entry.kind(), pbs_client::pxar::EntryKind::Directory);
-                        if self.server.filesystem.is_ignored(&destination_path, is_dir) {
+                        if destination_filesystem.is_primary_server_fs()
+                            && self.server.filesystem.is_ignored(&destination_path, is_dir)
+                        {
                             continue;
                         }
 
                         let stat = entry.metadata().stat;
-                        let permissions =
-                            PortablePermissions::from_mode((stat.mode & 0o7777) as u32);
                         let modified_time = std::time::UNIX_EPOCH
                             + std::time::Duration::from_secs(stat.mtime.secs.max(0) as u64);
 
                         match entry.kind() {
                             pbs_client::pxar::EntryKind::Directory => {
-                                self.server
-                                    .filesystem
-                                    .create_chowned_dir_all(&destination_path)?;
-                                self.server
-                                    .filesystem
+                                let permissions = PortablePermissions::from_mode_dir(stat.mode);
+                                destination_filesystem.create_dir_all(&destination_path)?;
+                                destination_filesystem
                                     .set_permissions(&destination_path, permissions)?;
                                 if directory_entries.len() < Self::MAX_DIRECTORY_MTIME_ENTRIES {
                                     directory_entries.push((destination_path, modified_time));
@@ -1341,16 +1435,13 @@ impl Archive {
                                 if let Some(parent) = destination_path.parent()
                                     && last_parent.as_deref() != Some(parent)
                                 {
-                                    self.server.filesystem.create_chowned_dir_all(parent)?;
+                                    destination_filesystem.create_dir_all(&parent)?;
                                     last_parent = Some(parent.to_path_buf());
                                 }
 
-                                let mut writer = super::file::ServerFile::new(
-                                    self.server.clone(),
-                                    &destination_path,
-                                    Some(permissions),
-                                    Some(modified_time),
-                                )?;
+                                let permissions = PortablePermissions::from_mode_file(stat.mode);
+                                let mut writer =
+                                    destination_filesystem.create_file(&destination_path)?;
 
                                 if let Some(mut contents) = decoder.contents()? {
                                     crate::io::copy_shared(
@@ -1360,12 +1451,23 @@ impl Archive {
                                     )?;
                                 }
                                 writer.flush()?;
+                                drop(writer);
+
+                                destination_filesystem
+                                    .set_permissions(&destination_path, permissions)?;
+                                destination_filesystem.set_times(
+                                    &destination_path,
+                                    modified_time,
+                                    None,
+                                )?;
+
+                                progress.increment_files();
                             }
                             pbs_client::pxar::EntryKind::Symlink(target) => {
-                                if let Err(err) = self
-                                    .server
-                                    .filesystem
-                                    .symlink(target.as_os_str(), &destination_path)
+                                let target = target.as_os_str().to_os_string();
+
+                                if let Err(err) = destination_filesystem
+                                    .create_symlink(&target, &destination_path)
                                 {
                                     tracing::debug!(
                                         path = %destination_path.display(),
@@ -1373,7 +1475,7 @@ impl Archive {
                                         err
                                     );
                                 } else {
-                                    self.server.filesystem.set_times(
+                                    destination_filesystem.set_times(
                                         &destination_path,
                                         modified_time,
                                         None,
@@ -1384,9 +1486,7 @@ impl Archive {
                     }
 
                     for (destination_path, modified_time) in directory_entries {
-                        self.server
-                            .filesystem
-                            .set_times(&destination_path, modified_time, None)?;
+                        destination_filesystem.set_times(&destination_path, modified_time, None)?;
                     }
 
                     Ok(())
@@ -1398,5 +1498,64 @@ impl Archive {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // resolve_entry_path
+
+    #[test]
+    fn resolve_entry_path_resolves_plain_entries_under_the_destination() {
+        assert_eq!(
+            resolve_entry_path(Path::new("logs"), Path::new("a/b.txt")),
+            Some(PathBuf::from("logs/a/b.txt"))
+        );
+        assert_eq!(
+            resolve_entry_path(Path::new(""), Path::new("a/b.txt")),
+            Some(PathBuf::from("a/b.txt"))
+        );
+    }
+
+    #[test]
+    fn resolve_entry_path_strips_current_dir_components_that_tar_writers_emit() {
+        assert_eq!(
+            resolve_entry_path(Path::new("logs"), Path::new("./a/./b.txt")),
+            Some(PathBuf::from("logs/a/b.txt"))
+        );
+        assert_eq!(
+            resolve_entry_path(Path::new(""), Path::new("./server.properties")),
+            Some(PathBuf::from("server.properties"))
+        );
+    }
+
+    #[test]
+    fn resolve_entry_path_rejects_parent_dir_escapes() {
+        assert_eq!(
+            resolve_entry_path(Path::new("logs"), Path::new("../config/secrets.yml")),
+            None
+        );
+        assert_eq!(
+            resolve_entry_path(Path::new("logs"), Path::new("a/../../config/secrets.yml")),
+            None
+        );
+        assert_eq!(
+            resolve_entry_path(Path::new(""), Path::new("x/../config/config.yml")),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_entry_path_rejects_absolute_entries() {
+        assert_eq!(
+            resolve_entry_path(Path::new("logs"), Path::new("/config/secrets.yml")),
+            None
+        );
+        assert_eq!(
+            resolve_entry_path(Path::new(""), Path::new("/etc/passwd")),
+            None
+        );
     }
 }

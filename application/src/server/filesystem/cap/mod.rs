@@ -154,19 +154,143 @@ impl CapFilesystem {
     pub async fn async_remove_dir_all(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
         let path = self.relative_path(path.as_ref());
 
-        let inner = self.get_inner()?;
-        tokio::task::spawn_blocking(move || inner.remove_dir_all(path)).await??;
+        let self_clone = self.clone();
+        tokio::task::spawn_blocking(move || self_clone.remove_dir_all(path)).await??;
 
         Ok(())
     }
 
     pub fn remove_dir_all(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
         let path = self.relative_path(path.as_ref());
-
         let inner = self.get_inner()?;
-        inner.remove_dir_all(path)?;
+
+        let mut first_error = None;
+        let mut failed: u64 = 0;
+        let mut record = |err: std::io::Error| {
+            failed += 1;
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        };
+
+        let mut walker = WalkDir::new(self.clone(), path.clone())?.reversed();
+        let mut cleared_parent: Option<PathBuf> = None;
+
+        while let Some(entry) = walker.next_entry() {
+            match entry {
+                Ok((file_type, entry_path)) => {
+                    if let Err(err) =
+                        Self::remove_entry(&inner, &entry_path, file_type, &mut cleared_parent)
+                    {
+                        record(err);
+                    }
+                }
+                Err(err) => record(err),
+            }
+        }
+
+        if !path.as_os_str().is_empty()
+            && let Err(err) = Self::remove_entry(&inner, &path, FileType::Dir, &mut cleared_parent)
+        {
+            record(err);
+        }
+
+        match first_error {
+            Some(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "failed to remove {} entr{} while removing directory: {:#?}",
+                    failed,
+                    if failed == 1 { "y" } else { "ies" },
+                    err
+                );
+
+                Err(err)
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn remove_entry(
+        inner: &cap_std::fs::Dir,
+        path: &Path,
+        file_type: FileType,
+        cleared_parent: &mut Option<PathBuf>,
+    ) -> Result<(), std::io::Error> {
+        fn remove(
+            inner: &cap_std::fs::Dir,
+            path: &Path,
+            is_dir: bool,
+        ) -> Result<(), std::io::Error> {
+            if is_dir {
+                inner.remove_dir(path)
+            } else {
+                inner.remove_file(path)
+            }
+        }
+
+        let is_dir = file_type.is_dir();
+        let err = match remove(inner, path, is_dir) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => err,
+            Err(err) => return Err(err),
+        };
+
+        #[cfg(target_os = "linux")]
+        {
+            if Self::clear_inode_flags(inner, path, file_type).is_ok()
+                && remove(inner, path, is_dir).is_ok()
+            {
+                return Ok(());
+            }
+
+            if let Some(parent) = path.parent()
+                && cleared_parent.as_deref() != Some(parent)
+            {
+                let cleared = if parent.as_os_str().is_empty() {
+                    Self::clear_flags_on_fd(inner).is_ok()
+                } else {
+                    Self::clear_inode_flags(inner, parent, FileType::Dir).is_ok()
+                };
+
+                if cleared {
+                    *cleared_parent = Some(parent.to_path_buf());
+
+                    if remove(inner, path, is_dir).is_ok() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = cleared_parent;
+
+        Err(err)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn clear_flags_on_fd<Fd: std::os::fd::AsFd>(fd: Fd) -> Result<(), std::io::Error> {
+        let mask = rustix::fs::IFlags::IMMUTABLE | rustix::fs::IFlags::APPEND;
+
+        let current = rustix::fs::ioctl_getflags(&fd)?;
+        if current.intersects(mask) {
+            rustix::fs::ioctl_setflags(&fd, current & !mask)?;
+        }
 
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn clear_inode_flags(
+        inner: &cap_std::fs::Dir,
+        path: &Path,
+        file_type: FileType,
+    ) -> Result<(), std::io::Error> {
+        match file_type {
+            FileType::Dir => Self::clear_flags_on_fd(inner.open_dir(path)?),
+            FileType::File => Self::clear_flags_on_fd(inner.open(path)?),
+            _ => Ok(()),
+        }
     }
 
     pub async fn async_remove_file(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
@@ -645,7 +769,7 @@ impl CapFilesystem {
                 rustix::fs::chmodat(
                     inner.as_fd(),
                     path,
-                    rustix::fs::Mode::from_raw_mode(permissions.mode),
+                    rustix::fs::Mode::from_raw_mode(permissions.mode() as _),
                     rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
                 )
             })
@@ -953,5 +1077,176 @@ impl CapFilesystem {
         let path = self.relative_path(path.as_ref());
 
         WalkDir::new(self.clone(), path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // resolve_path
+
+    #[test]
+    fn resolve_path_strips_current_dir_components() {
+        assert_eq!(
+            CapFilesystem::resolve_path(Path::new("./a/./b")),
+            PathBuf::from("a/b")
+        );
+    }
+
+    #[test]
+    fn resolve_path_collapses_parent_dir_components() {
+        assert_eq!(
+            CapFilesystem::resolve_path(Path::new("a/b/../c")),
+            PathBuf::from("a/c")
+        );
+    }
+
+    #[test]
+    fn resolve_path_clamps_parent_dir_escapes() {
+        assert_eq!(
+            CapFilesystem::resolve_path(Path::new("../../etc/passwd")),
+            PathBuf::from("etc/passwd")
+        );
+        assert_eq!(
+            CapFilesystem::resolve_path(Path::new("a/../../../etc/passwd")),
+            PathBuf::from("etc/passwd")
+        );
+    }
+
+    #[test]
+    fn resolve_path_clamps_parent_dir_escapes_below_root() {
+        assert_eq!(
+            CapFilesystem::resolve_path(Path::new("/../../etc/passwd")),
+            PathBuf::from("/etc/passwd")
+        );
+    }
+
+    #[test]
+    fn resolve_path_leaves_plain_relative_paths_untouched() {
+        assert_eq!(
+            CapFilesystem::resolve_path(Path::new("plugins/config.yml")),
+            PathBuf::from("plugins/config.yml")
+        );
+    }
+
+    // reversed walk + remove_dir_all
+
+    fn temp_filesystem() -> (tempfile::TempDir, CapFilesystem) {
+        let dir = tempfile::tempdir().unwrap();
+        let inner =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+
+        let filesystem = CapFilesystem {
+            base_path: Arc::from(dir.path()),
+            inner: Arc::new(ArcSwapOption::new(Some(Arc::new(inner)))),
+        };
+
+        (dir, filesystem)
+    }
+
+    #[test]
+    fn walk_dir_reversed_yields_children_before_parents() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("a/b/deep.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("a/shallow.txt"), "x").unwrap();
+
+        let mut seen = Vec::new();
+        let mut walker = filesystem.walk_dir("").unwrap().reversed();
+        while let Some(entry) = walker.next_entry() {
+            seen.push(entry.unwrap().1);
+        }
+
+        let index = |p: &str| seen.iter().position(|s| s == Path::new(p)).unwrap();
+
+        // every directory lands after everything nested inside it
+        assert!(index("a/b/deep.txt") < index("a/b"));
+        assert!(index("a/b") < index("a"));
+        assert!(index("a/shallow.txt") < index("a"));
+
+        // the walk root itself is never emitted, matching the pre-order walker
+        assert!(!seen.iter().any(|s| s.as_os_str().is_empty()));
+        assert_eq!(seen.len(), 4);
+    }
+
+    #[test]
+    fn remove_dir_all_removes_nested_tree() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir_all(dir.path().join("tree/nested")).unwrap();
+        std::fs::write(dir.path().join("tree/nested/file.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "x").unwrap();
+
+        filesystem.remove_dir_all("tree").unwrap();
+
+        assert!(!dir.path().join("tree").exists());
+        assert!(dir.path().join("keep.txt").exists());
+    }
+
+    #[test]
+    fn remove_dir_all_with_empty_path_clears_contents_but_keeps_root() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("a/b/file.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("top.txt"), "x").unwrap();
+
+        filesystem.remove_dir_all("").unwrap();
+
+        assert!(dir.path().exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn remove_dir_all_unlinks_symlinks_without_following_them() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir_all(dir.path().join("outside")).unwrap();
+        std::fs::write(dir.path().join("outside/keep.txt"), "x").unwrap();
+        std::fs::create_dir(dir.path().join("tree")).unwrap();
+        std::os::unix::fs::symlink("../outside", dir.path().join("tree/link")).unwrap();
+
+        filesystem.remove_dir_all("tree").unwrap();
+
+        assert!(!dir.path().join("tree").exists());
+        assert!(dir.path().join("outside/keep.txt").exists());
+    }
+
+    /// Reproduces the failure this retry exists for: a `chattr +i` file makes every
+    /// unlink in the tree return `EPERM`. Needs root and `CAP_LINUX_IMMUTABLE`, so it
+    /// skips itself where the flag cannot be set.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn remove_dir_all_clears_immutable_flag_to_delete() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir(dir.path().join("tree")).unwrap();
+        let locked = dir.path().join("tree/locked.txt");
+        std::fs::write(&locked, "x").unwrap();
+
+        let set = std::process::Command::new("chattr")
+            .arg("+i")
+            .arg(&locked)
+            .status();
+        if !matches!(set, Ok(status) if status.success()) {
+            eprintln!("skipping: cannot set the immutable flag here");
+            return;
+        }
+
+        // sanity: the flag really does block deletion
+        assert_eq!(
+            std::fs::remove_file(&locked).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let result = filesystem.remove_dir_all("tree");
+
+        if result.is_err() {
+            std::process::Command::new("chattr")
+                .arg("-i")
+                .arg(&locked)
+                .status()
+                .ok();
+        }
+
+        result.unwrap();
+        assert!(!dir.path().join("tree").exists());
     }
 }

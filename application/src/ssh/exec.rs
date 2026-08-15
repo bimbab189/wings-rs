@@ -84,8 +84,20 @@ impl ExecSession {
                                 timestamp: chrono::Utc::now(),
                             });
 
+                            let destination = PathBuf::from(destination.trim());
+                            let (destination_root, destination_filesystem) = self
+                                .server
+                                .filesystem
+                                .resolve_writable_fs(&self.server, &destination)
+                                .await;
+
                             archive
-                                .extract(PathBuf::from(destination.trim()), None, None)
+                                .extract(
+                                    destination_root,
+                                    destination_filesystem,
+                                    crate::server::filesystem::archive::create::ArchiveProgress::default(),
+                                    None,
+                                )
                                 .await?;
 
                             channel.exit_status(0).await?;

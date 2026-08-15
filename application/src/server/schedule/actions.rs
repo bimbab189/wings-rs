@@ -28,6 +28,85 @@ pub enum ScheduleDynamicParameter {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum ScheduleBackupSelector {
+    Latest {
+        #[serde(default)]
+        backup_group_uuid: Option<uuid::Uuid>,
+    },
+    Oldest {
+        #[serde(default)]
+        backup_group_uuid: Option<uuid::Uuid>,
+    },
+    Uuid {
+        uuid: ScheduleDynamicParameter,
+    },
+    Name {
+        name: ScheduleDynamicParameter,
+        #[serde(default)]
+        backup_group_uuid: Option<uuid::Uuid>,
+        #[serde(default)]
+        oldest: bool,
+    },
+}
+
+#[derive(Default)]
+pub struct ResolvedBackupSelector {
+    pub backup_uuid: Option<uuid::Uuid>,
+    pub backup_name: Option<compact_str::CompactString>,
+    pub backup_group_uuid: Option<uuid::Uuid>,
+    pub oldest: bool,
+}
+
+impl ScheduleBackupSelector {
+    pub fn resolve(
+        &self,
+        execution_context: &super::ScheduleExecutionContext,
+    ) -> Result<ResolvedBackupSelector, Cow<'static, str>> {
+        match self {
+            ScheduleBackupSelector::Latest { backup_group_uuid } => Ok(ResolvedBackupSelector {
+                backup_group_uuid: *backup_group_uuid,
+                ..Default::default()
+            }),
+            ScheduleBackupSelector::Oldest { backup_group_uuid } => Ok(ResolvedBackupSelector {
+                backup_group_uuid: *backup_group_uuid,
+                oldest: true,
+                ..Default::default()
+            }),
+            ScheduleBackupSelector::Uuid { uuid } => {
+                let uuid = match execution_context.resolve_parameter(uuid) {
+                    Some(uuid) => uuid,
+                    None => {
+                        return Err("unable to resolve parameter `uuid` into a string.".into());
+                    }
+                };
+
+                match uuid::Uuid::parse_str(uuid) {
+                    Ok(uuid) => Ok(ResolvedBackupSelector {
+                        backup_uuid: Some(uuid),
+                        ..Default::default()
+                    }),
+                    Err(_) => Err("unable to parse parameter `uuid` into a uuid.".into()),
+                }
+            }
+            ScheduleBackupSelector::Name {
+                name,
+                backup_group_uuid,
+                oldest,
+            } => match execution_context.resolve_parameter(name) {
+                Some(name) => Ok(ResolvedBackupSelector {
+                    backup_name: Some(name.to_compact_string()),
+                    backup_group_uuid: *backup_group_uuid,
+                    oldest: *oldest,
+                    ..Default::default()
+                }),
+                None => Err("unable to resolve parameter `name` into a string.".into()),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ScheduleAction {
     Sleep {
@@ -35,6 +114,17 @@ pub enum ScheduleAction {
     },
     Ensure {
         condition: super::conditions::ScheduleCondition,
+    },
+    If {
+        condition: super::conditions::ScheduleCondition,
+    },
+    ElseIf {
+        condition: super::conditions::ScheduleCondition,
+    },
+    Else,
+    EndIf,
+    Exit {
+        successful: bool,
     },
     Format {
         format: String,
@@ -58,6 +148,12 @@ pub enum ScheduleAction {
 
         output_into: Option<ScheduleVariable>,
     },
+    WaitForState {
+        ignore_failure: bool,
+
+        state: crate::server::state::ServerState,
+        timeout: u64,
+    },
     SendPower {
         ignore_failure: bool,
 
@@ -73,7 +169,31 @@ pub enum ScheduleAction {
         foreground: bool,
 
         name: Option<ScheduleDynamicParameter>,
+        #[serde(default)]
+        backup_group_uuid: Option<uuid::Uuid>,
         ignored_files: Vec<compact_str::CompactString>,
+    },
+    RestoreBackup {
+        ignore_failure: bool,
+        truncate_directory: bool,
+        #[serde(default)]
+        restore_startup: bool,
+
+        backup: ScheduleBackupSelector,
+    },
+    DeleteBackup {
+        #[serde(default)]
+        ignore_failure: bool,
+
+        backup: ScheduleBackupSelector,
+    },
+    MoveBackup {
+        #[serde(default)]
+        ignore_failure: bool,
+
+        backup: ScheduleBackupSelector,
+        #[serde(default)]
+        backup_group_uuid: Option<uuid::Uuid>,
     },
     CreateDirectory {
         ignore_failure: bool,
@@ -96,10 +216,16 @@ pub enum ScheduleAction {
         destination: ScheduleDynamicParameter,
     },
     DeleteFiles {
+        #[serde(default)]
+        ignore_failure: bool,
+
         root: ScheduleDynamicParameter,
         files: Vec<compact_str::CompactString>,
     },
     RenameFiles {
+        #[serde(default)]
+        ignore_failure: bool,
+
         root: ScheduleDynamicParameter,
         files: Vec<crate::models::RenameFile>,
     },
@@ -143,17 +269,26 @@ impl ScheduleAction {
         match self {
             ScheduleAction::Sleep { .. } => false,
             ScheduleAction::Ensure { .. } => false,
+            ScheduleAction::If { .. } => false,
+            ScheduleAction::ElseIf { .. } => false,
+            ScheduleAction::Else => false,
+            ScheduleAction::EndIf => false,
+            ScheduleAction::Exit { .. } => false,
             ScheduleAction::Format { .. } => false,
             ScheduleAction::MatchRegex { .. } => false,
             ScheduleAction::WaitForConsoleLine { ignore_failure, .. } => *ignore_failure,
+            ScheduleAction::WaitForState { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::SendPower { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::SendCommand { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::CreateBackup { ignore_failure, .. } => *ignore_failure,
+            ScheduleAction::RestoreBackup { ignore_failure, .. } => *ignore_failure,
+            ScheduleAction::DeleteBackup { ignore_failure, .. } => *ignore_failure,
+            ScheduleAction::MoveBackup { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::CreateDirectory { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::WriteFile { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::CopyFile { ignore_failure, .. } => *ignore_failure,
-            ScheduleAction::DeleteFiles { .. } => false,
-            ScheduleAction::RenameFiles { .. } => false,
+            ScheduleAction::DeleteFiles { ignore_failure, .. } => *ignore_failure,
+            ScheduleAction::RenameFiles { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::CompressFiles { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::DecompressFile { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::UpdateStartupVariable { ignore_failure, .. } => *ignore_failure,
@@ -176,6 +311,12 @@ impl ScheduleAction {
         }
 
         match self {
+            ScheduleAction::If { .. }
+            | ScheduleAction::ElseIf { .. }
+            | ScheduleAction::Else
+            | ScheduleAction::EndIf
+            | ScheduleAction::Exit { .. } => {}
+
             ScheduleAction::Sleep { duration } => {
                 tokio::time::sleep(std::time::Duration::from_millis(*duration)).await;
             }
@@ -319,6 +460,23 @@ impl ScheduleAction {
                 }
 
                 return Err("timeout while waiting for matching console output.".into());
+            }
+            ScheduleAction::WaitForState {
+                state: target_state,
+                timeout,
+                ..
+            } => {
+                if !server
+                    .state
+                    .wait_for_state(*target_state, std::time::Duration::from_millis(*timeout))
+                    .await
+                {
+                    return Err(format!(
+                        "timeout while waiting for server state `{}`.",
+                        target_state.to_str()
+                    )
+                    .into());
+                }
             }
             ScheduleAction::SendPower { action, .. } => match action {
                 crate::models::ServerPowerAction::Start => {
@@ -504,6 +662,7 @@ impl ScheduleAction {
             ScheduleAction::CreateBackup {
                 foreground,
                 name,
+                backup_group_uuid,
                 ignored_files,
                 ..
             } => {
@@ -524,6 +683,7 @@ impl ScheduleAction {
                         server.uuid,
                         Some(execution_context.schedule_uuid),
                         name,
+                        *backup_group_uuid,
                         ignored_files,
                     )
                     .await
@@ -536,7 +696,10 @@ impl ScheduleAction {
                             err
                         );
 
-                        return Err("failed to create backup".into());
+                        return Err(crate::remote::ApiError::message_or(
+                            &err,
+                            "failed to create backup",
+                        ));
                     }
                 };
 
@@ -572,6 +735,185 @@ impl ScheduleAction {
 
                 if *foreground && let Ok(Err(err)) = thread.await {
                     return Err(err);
+                }
+            }
+            ScheduleAction::RestoreBackup {
+                truncate_directory,
+                restore_startup,
+                backup,
+                ..
+            } => {
+                let selector = backup.resolve(execution_context)?;
+
+                let (adapter, uuid, download_url) = match state
+                    .config
+                    .client
+                    .restore_backup(
+                        server.uuid,
+                        Some(execution_context.schedule_uuid),
+                        selector.backup_uuid,
+                        selector.backup_name.as_deref(),
+                        selector.backup_group_uuid,
+                        selector.oldest,
+                        *truncate_directory,
+                        *restore_startup,
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        tracing::error!(
+                            server = %server.uuid,
+                            "failed to request backup restore: {:#?}",
+                            err
+                        );
+
+                        return Err(crate::remote::ApiError::message_or(
+                            &err,
+                            "failed to request backup restore",
+                        ));
+                    }
+                };
+
+                let backup = match state
+                    .backup_manager
+                    .find_adapter(state, adapter, uuid)
+                    .await
+                {
+                    Ok(backup) => backup,
+                    Err(err) => {
+                        tracing::error!(
+                            server = %server.uuid,
+                            backup = %uuid,
+                            "failed to find backup: {:#?}",
+                            err
+                        );
+
+                        None
+                    }
+                };
+
+                let backup = match backup {
+                    Some(backup) => backup,
+                    None => {
+                        if let Err(err) = state
+                            .config
+                            .client
+                            .set_backup_restore_status(server.uuid, uuid, false)
+                            .await
+                        {
+                            tracing::error!(
+                                server = %server.uuid,
+                                backup = %uuid,
+                                "failed to reset backup restore status: {:#?}",
+                                err
+                            );
+                        }
+
+                        return Err("backup not found".into());
+                    }
+                };
+
+                let truncate_directory = *truncate_directory;
+                let thread = tokio::spawn({
+                    let state = Arc::clone(state);
+                    let server = server.clone();
+
+                    async move {
+                        if let Err(err) = state
+                            .backup_manager
+                            .restore(&backup, &server, truncate_directory, download_url)
+                            .await
+                        {
+                            tracing::error!(
+                                "failed to restore backup {} (adapter = {:?}) for {}: {}",
+                                uuid,
+                                adapter,
+                                server.uuid,
+                                err
+                            );
+
+                            return Err("failed to restore backup".into());
+                        }
+
+                        Ok::<_, Cow<'static, str>>(())
+                    }
+                });
+
+                match thread.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => return Err(err),
+                    Err(err) => {
+                        tracing::error!(
+                            server = %server.uuid,
+                            backup = %uuid,
+                            "failed to restore backup: {:#?}",
+                            err
+                        );
+
+                        return Err("failed to restore backup".into());
+                    }
+                }
+            }
+            ScheduleAction::DeleteBackup { backup, .. } => {
+                let selector = backup.resolve(execution_context)?;
+
+                if let Err(err) = state
+                    .config
+                    .client
+                    .delete_backup(
+                        server.uuid,
+                        Some(execution_context.schedule_uuid),
+                        selector.backup_uuid,
+                        selector.backup_name.as_deref(),
+                        selector.backup_group_uuid,
+                        selector.oldest,
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        server = %server.uuid,
+                        "failed to delete backup: {:#?}",
+                        err
+                    );
+
+                    return Err(crate::remote::ApiError::message_or(
+                        &err,
+                        "failed to delete backup",
+                    ));
+                }
+            }
+            ScheduleAction::MoveBackup {
+                backup,
+                backup_group_uuid,
+                ..
+            } => {
+                let selector = backup.resolve(execution_context)?;
+
+                if let Err(err) = state
+                    .config
+                    .client
+                    .move_backup(
+                        server.uuid,
+                        Some(execution_context.schedule_uuid),
+                        selector.backup_uuid,
+                        selector.backup_name.as_deref(),
+                        selector.backup_group_uuid,
+                        selector.oldest,
+                        *backup_group_uuid,
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        server = %server.uuid,
+                        "failed to move backup: {:#?}",
+                        err
+                    );
+
+                    return Err(crate::remote::ApiError::message_or(
+                        &err,
+                        "failed to move backup",
+                    ));
                 }
             }
             ScheduleAction::CreateDirectory { root, name, .. } => {
@@ -691,20 +1033,6 @@ impl ScheduleAction {
                     return Err("failed to create parent directory".into());
                 }
 
-                let added_content_size = if *append {
-                    content.len() as i64
-                } else {
-                    content.len() as i64 - old_content_size
-                };
-                if filesystem.is_primary_server_fs()
-                    && !server
-                        .filesystem
-                        .async_allocate_in_path(parent, added_content_size, false)
-                        .await
-                {
-                    return Err("failed to allocate space".into());
-                }
-
                 let mut options = OpenOptions::new();
                 options
                     .write(true)
@@ -723,11 +1051,26 @@ impl ScheduleAction {
                     }
                 };
 
+                if filesystem.is_primary_server_fs() && !*append && old_content_size > 0 {
+                    server
+                        .filesystem
+                        .async_allocate_in_path(parent, -old_content_size, true)
+                        .await;
+                }
+
                 if let Err(err) = file.write_all(content.as_bytes()).await {
+                    if err.kind() == std::io::ErrorKind::StorageFull {
+                        return Err("failed to allocate space".into());
+                    }
+
                     tracing::error!(path = %path.display(), "failed to write file: {:?}", err);
                     return Err("failed to write file".into());
                 }
                 if let Err(err) = file.shutdown().await {
+                    if err.kind() == std::io::ErrorKind::StorageFull {
+                        return Err("failed to allocate space".into());
+                    }
+
                     tracing::error!(path = %path.display(), "failed to shutdown file: {:?}", err);
                     return Err("failed to shutdown file".into());
                 }
@@ -911,7 +1254,7 @@ impl ScheduleAction {
                     timestamp: chrono::Utc::now(),
                 });
             }
-            ScheduleAction::DeleteFiles { root, files } => {
+            ScheduleAction::DeleteFiles { root, files, .. } => {
                 let raw_root = match execution_context.resolve_parameter(root) {
                     Some(root) => root,
                     None => {
@@ -941,12 +1284,23 @@ impl ScheduleAction {
                         continue;
                     }
 
-                    if filesystem.is_primary_server_fs() {
-                        server.filesystem.truncate_path(&source).await.ok();
+                    let result = if filesystem.is_primary_server_fs() {
+                        server.filesystem.truncate_path(&source).await
                     } else if metadata.file_type.is_dir() {
-                        filesystem.async_remove_dir_all(&source).await.ok();
+                        filesystem.async_remove_dir_all(&source).await
                     } else {
-                        filesystem.async_remove_file(&source).await.ok();
+                        filesystem.async_remove_file(&source).await
+                    };
+
+                    if let Err(err) = result {
+                        tracing::error!(
+                            server = %server.uuid,
+                            path = %source.display(),
+                            "failed to delete file: {:#?}",
+                            err
+                        );
+
+                        return Err(format!("failed to delete `{file}`").into());
                     }
                 }
 
@@ -962,7 +1316,7 @@ impl ScheduleAction {
                     timestamp: chrono::Utc::now(),
                 });
             }
-            ScheduleAction::RenameFiles { root, files } => {
+            ScheduleAction::RenameFiles { root, files, .. } => {
                 let raw_root = match execution_context.resolve_parameter(root) {
                     Some(root) => Path::new(root),
                     None => {
@@ -1007,16 +1361,22 @@ impl ScheduleAction {
                         continue;
                     }
 
-                    if filesystem.is_primary_server_fs() {
-                        if let Err(err) = server.filesystem.rename_path(from, to).await {
-                            tracing::debug!(
-                                server = %server.uuid,
-                                "failed to rename file: {:#?}",
-                                err
-                            );
-                        }
+                    let result = if filesystem.is_primary_server_fs() {
+                        server.filesystem.rename_path(from, to).await
                     } else {
-                        filesystem.async_rename(&from, &to).await.ok();
+                        filesystem.async_rename(&from, &to).await
+                    };
+
+                    if let Err(err) = result {
+                        tracing::error!(
+                            server = %server.uuid,
+                            "failed to rename file: {:#?}",
+                            err
+                        );
+
+                        return Err(
+                            format!("failed to rename `{}` to `{}`", file.from, file.to).into()
+                        );
                     }
                 }
 
@@ -1308,7 +1668,40 @@ impl ScheduleAction {
                     }
                 };
 
-                let thread = tokio::spawn(archive.extract(root.clone(), None, None));
+                let (destination_root, destination_filesystem) =
+                    server.filesystem.resolve_writable_fs(server, &root).await;
+
+                let bytes_processed = Arc::new(AtomicU64::new(0));
+                let bytes_total = Arc::new(AtomicU64::new(0));
+                let files_processed = Arc::new(AtomicU64::new(0));
+
+                let (_, task) = server
+                    .filesystem
+                    .operations
+                    .add_operation(
+                        crate::server::filesystem::operations::FilesystemOperation::Decompress {
+                            path: source.clone(),
+                            destination_path: root.clone(),
+                            start_time: chrono::Utc::now(),
+                            bytes_processed: bytes_processed.clone(),
+                            bytes_total: bytes_total.clone(),
+                            files_processed: files_processed.clone(),
+                        },
+                        async move {
+                            archive
+                                .extract(
+                                    destination_root,
+                                    destination_filesystem,
+                                    crate::server::filesystem::archive::create::ArchiveProgress::new(
+                                        bytes_processed,
+                                        files_processed,
+                                    ),
+                                    Some(bytes_total),
+                                )
+                                .await
+                        },
+                    )
+                    .await;
 
                 server.activity.log_activity(Activity {
                     event: ActivityEvent::FileDecompress,
@@ -1322,10 +1715,33 @@ impl ScheduleAction {
                     timestamp: chrono::Utc::now(),
                 });
 
-                if *foreground && let Ok(Err(err)) = thread.await {
-                    tracing::error!(path = %source.display(), "failed to decompress file: {:?}", err);
+                if *foreground {
+                    match task.await {
+                        Ok(Some(Ok(()))) => {}
+                        Ok(None) => {
+                            return Err("archive decompression aborted by another source".into());
+                        }
+                        Ok(Some(Err(err))) => {
+                            tracing::error!(
+                                server = %server.uuid,
+                                path = %source.display(),
+                                "failed to decompress file: {:#?}",
+                                err,
+                            );
 
-                    return Err("failed to decompress file".into());
+                            return Err(format!("failed to decompress file: {err}").into());
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                server = %server.uuid,
+                                path = %source.display(),
+                                "failed to decompress file: {:#?}",
+                                err,
+                            );
+
+                            return Err("failed to decompress file".into());
+                        }
+                    }
                 }
             }
             ScheduleAction::UpdateStartupVariable {
@@ -1367,7 +1783,10 @@ impl ScheduleAction {
                             err
                         );
 
-                        return Err("failed to set server startup variable".into());
+                        return Err(crate::remote::ApiError::message_or(
+                            &err,
+                            "failed to set server startup variable",
+                        ));
                     }
                 };
             }
@@ -1397,7 +1816,10 @@ impl ScheduleAction {
                             err
                         );
 
-                        return Err("failed to set server startup command".into());
+                        return Err(crate::remote::ApiError::message_or(
+                            &err,
+                            "failed to set server startup command",
+                        ));
                     }
                 };
             }
@@ -1427,7 +1849,10 @@ impl ScheduleAction {
                             err
                         );
 
-                        return Err("failed to set server startup docker image".into());
+                        return Err(crate::remote::ApiError::message_or(
+                            &err,
+                            "failed to set server startup docker image",
+                        ));
                     }
                 };
             }

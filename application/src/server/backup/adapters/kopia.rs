@@ -1,6 +1,6 @@
 use crate::{
     io::{
-        UninterruptedReadExt,
+        SafeWriteExt, UninterruptedReadExt,
         compression::{CompressionLevel, writer::CompressionWriter},
     },
     models::DirectoryEntry,
@@ -14,9 +14,9 @@ use crate::{
             cap::FileType,
             encode_mode,
             virtualfs::{
-                AsyncFileRead, AsyncReadableFileStream, ByteRange, DirectoryListing,
-                DirectoryStreamWalk, DirectoryWalk, FileMetadata, FileRead, IsIgnoredFn,
-                VirtualReadableFilesystem,
+                AsyncDirectoryStreamWalk, AsyncDirectoryWalk, AsyncFileRead,
+                AsyncReadableFileStream, ByteRange, DirectoryListing, DirectoryWalk, FileMetadata,
+                FileRead, IsIgnoredFn, VirtualReadableFilesystem,
             },
         },
     },
@@ -84,7 +84,9 @@ impl KopiaBackup {
     }
 
     fn get_kopia_state_path(config: &crate::config::Config) -> PathBuf {
-        Path::new(config.load().system.backup_directory.trim_end_matches('/')).join(".kopia")
+        config
+            .resolve_as_path(|cfg| &cfg.system.backup_directory)
+            .join(".kopia")
     }
 
     fn get_config_file_path(
@@ -189,14 +191,19 @@ impl KopiaBackup {
             .split_once('@')
             .unwrap_or((&remote.username, "wings"));
 
-        let output = Self::get_tokio_command(config_file, remote)
+        let mut command = Self::get_tokio_command(config_file, remote);
+        command
             .arg("repository")
             .arg("connect")
             .arg("server")
             .arg("--url")
-            .arg(&remote.url)
-            .arg("--server-cert-fingerprint")
-            .arg(&remote.fingerprint)
+            .arg(&remote.url);
+
+        if let Some(fingerprint) = remote.fingerprint() {
+            command.arg("--server-cert-fingerprint").arg(fingerprint);
+        }
+
+        let output = command
             .arg("--override-username")
             .arg(username)
             .arg("--override-hostname")
@@ -506,10 +513,11 @@ impl BackupExt for KopiaBackup {
                         .stdout
                         .ok_or_else(|| anyhow::anyhow!("kopia restore produced no stdout"))?;
                     let mut subtar = tar::Archive::new(stdout);
-                    let mut entries = subtar.entries()?;
+                    let entries = subtar.entries()?;
 
                     let mut read_buffer = vec![0; crate::BUFFER_SIZE];
-                    while let Some(Ok(mut entry)) = entries.next() {
+                    for entry in entries {
+                        let mut entry = entry?;
                         let header = entry.header().clone();
                         let relative = entry.path()?;
 
@@ -801,15 +809,6 @@ fn parse_dir(bytes: &[u8]) -> Result<ParsedDir, anyhow::Error> {
     Ok(ParsedDir { entries })
 }
 
-struct SubtreeEntry {
-    relative: PathBuf,
-    file_type: FileType,
-    mode: u32,
-    mtime: chrono::DateTime<chrono::Utc>,
-    size: u64,
-    oid: String,
-}
-
 pub struct VirtualKopiaBackup {
     server: crate::server::Server,
     config_file: PathBuf,
@@ -986,7 +985,7 @@ impl VirtualKopiaBackup {
     fn root_metadata(&self) -> FileMetadata {
         FileMetadata {
             file_type: FileType::Dir,
-            permissions: PortablePermissions::from_mode(0o755),
+            permissions: PortablePermissions::from_mode_dir(0o755),
             size: 0,
             modified: None,
             created: None,
@@ -996,7 +995,11 @@ impl VirtualKopiaBackup {
     fn metadata_from_entry(entry: &KopiaEntry) -> FileMetadata {
         FileMetadata {
             file_type: entry.file_type,
-            permissions: PortablePermissions::from_mode(entry.mode),
+            permissions: if entry.file_type.is_dir() {
+                PortablePermissions::from_mode_dir(entry.mode)
+            } else {
+                PortablePermissions::from_mode_file(entry.mode)
+            },
             size: if entry.file_type.is_dir() {
                 0
             } else {
@@ -1029,6 +1032,7 @@ impl VirtualKopiaBackup {
                     directory: true,
                     file: false,
                     symlink: false,
+                    r#virtual: true,
                     mime: MimeCacheValue::directory().mime,
                     modified: entry.mtime,
                     created: epoch,
@@ -1054,66 +1058,13 @@ impl VirtualKopiaBackup {
                     directory: false,
                     file: entry.file_type.is_file(),
                     symlink: entry.file_type.is_symlink(),
+                    r#virtual: true,
                     mime: detected_mime.mime,
                     modified: entry.mtime,
                     created: epoch,
                 }
             }
         }
-    }
-
-    fn collect_subtree<'a>(
-        &'a self,
-        rel: PathBuf,
-        oid: Arc<str>,
-        is_ignored: &'a IsIgnoredFn,
-        out: &'a mut Vec<SubtreeEntry>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let dir = self.load_dir(&oid).await?;
-
-            for (name, entry) in dir.entries.iter() {
-                if entry.file_type.is_dir() {
-                    continue;
-                }
-                let relative = rel.join(name.as_str());
-                if (is_ignored)(entry.file_type, relative.clone()).is_none() {
-                    continue;
-                }
-                out.push(SubtreeEntry {
-                    relative,
-                    file_type: entry.file_type,
-                    mode: entry.mode,
-                    mtime: entry.mtime,
-                    size: entry.size,
-                    oid: entry.oid.clone(),
-                });
-            }
-
-            for (name, entry) in dir.entries.iter() {
-                if !entry.file_type.is_dir() {
-                    continue;
-                }
-                let relative = rel.join(name.as_str());
-                if (is_ignored)(FileType::Dir, relative.clone()).is_none() {
-                    continue;
-                }
-                let mode = if entry.mode != 0 { entry.mode } else { 0o755 };
-                out.push(SubtreeEntry {
-                    relative: relative.clone(),
-                    file_type: FileType::Dir,
-                    mode,
-                    mtime: entry.mtime,
-                    size: 0,
-                    oid: String::new(),
-                });
-                self.collect_subtree(relative, Arc::from(entry.oid.as_str()), is_ignored, out)
-                    .await?;
-            }
-
-            Ok(())
-        })
     }
 
     fn flatten_walk<'a>(
@@ -1162,6 +1113,50 @@ impl VirtualKopiaBackup {
 
             Ok(())
         })
+    }
+
+    fn flatten_walk_blocking(
+        &self,
+        rel: PathBuf,
+        oid: Arc<str>,
+        is_ignored: &IsIgnoredFn,
+        out: &mut Vec<(FileType, PathBuf, String)>,
+    ) -> Result<(), anyhow::Error> {
+        let dir = match self.load_dir_blocking(&oid) {
+            Ok(dir) => dir,
+            Err(err) => {
+                tracing::warn!(
+                    rel = %rel.display(),
+                    oid = %oid,
+                    "kopia flatten_walk failed to load directory, skipping subtree: {:?}",
+                    err,
+                );
+                return Ok(());
+            }
+        };
+
+        for (name, entry) in dir.entries.iter() {
+            if entry.file_type.is_dir() {
+                continue;
+            }
+            let child_path = rel.join(name.as_str());
+            if let Some(filtered) = (is_ignored)(entry.file_type, child_path) {
+                out.push((entry.file_type, filtered, entry.oid.clone()));
+            }
+        }
+
+        for (name, entry) in dir.entries.iter() {
+            if !entry.file_type.is_dir() {
+                continue;
+            }
+            let child_path = rel.join(name.as_str());
+            if let Some(filtered) = (is_ignored)(FileType::Dir, child_path.clone()) {
+                out.push((FileType::Dir, filtered, String::new()));
+            }
+            self.flatten_walk_blocking(child_path, Arc::from(entry.oid.as_str()), is_ignored, out)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -1302,11 +1297,39 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
         })
     }
 
-    async fn async_walk_dir<'a>(
+    fn walk_dir<'a>(
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
     ) -> Result<Box<dyn DirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
+        let base = path.as_ref().to_path_buf();
+        let mut flat: Vec<(FileType, PathBuf, String)> = Vec::new();
+
+        if let Ok(oid) = self.resolve_dir_oid_blocking(&base) {
+            self.flatten_walk_blocking(base, oid, &is_ignored, &mut flat)?;
+        }
+
+        struct TreeWalk {
+            items: std::vec::IntoIter<(FileType, PathBuf)>,
+        }
+
+        impl DirectoryWalk for TreeWalk {
+            fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
+                self.items.next().map(Ok)
+            }
+        }
+
+        let items: Vec<(FileType, PathBuf)> = flat.into_iter().map(|(ft, p, _)| (ft, p)).collect();
+
+        Ok(Box::new(TreeWalk {
+            items: items.into_iter(),
+        }))
+    }
+    async fn async_walk_dir<'a>(
+        &'a self,
+        path: &(dyn AsRef<Path> + Send + Sync),
+        is_ignored: IsIgnoredFn,
+    ) -> Result<Box<dyn AsyncDirectoryWalk + Send + Sync + 'a>, anyhow::Error> {
         let base = path.as_ref().to_path_buf();
         let mut flat: Vec<(FileType, PathBuf, String)> = Vec::new();
 
@@ -1319,7 +1342,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
         }
 
         #[async_trait::async_trait]
-        impl DirectoryWalk for TreeWalk {
+        impl AsyncDirectoryWalk for TreeWalk {
             async fn next_entry(&mut self) -> Option<Result<(FileType, PathBuf), anyhow::Error>> {
                 self.items.next().map(Ok)
             }
@@ -1336,7 +1359,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
         &'a self,
         path: &(dyn AsRef<Path> + Send + Sync),
         is_ignored: IsIgnoredFn,
-    ) -> Result<Box<dyn DirectoryStreamWalk + Send + Sync + 'a>, anyhow::Error> {
+    ) -> Result<Box<dyn AsyncDirectoryStreamWalk + Send + Sync + 'a>, anyhow::Error> {
         struct KopiaDirStreamWalk {
             entry_wanted_notifier: Arc<tokio::sync::Notify>,
             entry_channel_rx: tokio::sync::mpsc::Receiver<
@@ -1345,7 +1368,7 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
         }
 
         #[async_trait::async_trait]
-        impl DirectoryStreamWalk for KopiaDirStreamWalk {
+        impl AsyncDirectoryStreamWalk for KopiaDirStreamWalk {
             fn supports_multithreading(&self) -> bool {
                 false
             }
@@ -1360,73 +1383,87 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
         }
 
         let base = path.as_ref().to_path_buf();
-        let mut flat: Vec<(FileType, PathBuf, String)> = Vec::new();
-        match self.resolve_dir_oid(&base).await {
-            Ok(oid) => {
-                self.flatten_walk(base.clone(), oid, &is_ignored, &mut flat)
-                    .await?;
-            }
+        let base_oid = match self.resolve_dir_oid(&base).await {
+            Ok(oid) => Some(oid),
             Err(err) => {
                 tracing::warn!(
                     base = %base.display(),
                     "kopia stream walk could not resolve directory oid: {:?}",
                     err,
                 );
+                None
             }
-        }
+        };
 
         let entry_wanted_notifier = Arc::new(tokio::sync::Notify::new());
         let (entry_channel_tx, entry_channel_rx) = tokio::sync::mpsc::channel(1);
 
-        crate::spawn_handled({
+        if let Some(base_oid) = base_oid {
             let entry_wanted_notifier = Arc::clone(&entry_wanted_notifier);
             let config_file = self.config_file.clone();
             let remote = Arc::clone(&self.remote);
 
-            async move {
-                for (file_type, entry_path, oid) in flat {
-                    entry_wanted_notifier.notified().await;
+            crate::spawn_handled(async move {
+                tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
+                    let runtime = tokio::runtime::Handle::current();
 
-                    if file_type.is_file() {
-                        let child = KopiaBackup::get_tokio_command(&config_file, &remote)
-                            .arg("show")
-                            .arg(&oid)
-                            .stdout(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::null())
-                            .spawn()?;
+                    let child = KopiaBackup::get_std_command(&config_file, &remote)
+                        .arg("restore")
+                        .arg(base_oid.as_ref())
+                        .arg("/dev/stdout")
+                        .arg("--mode")
+                        .arg("tar")
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()?;
+                    let stdout = child
+                        .stdout
+                        .ok_or_else(|| anyhow::anyhow!("kopia restore produced no stdout"))?;
 
-                        let stdout = match child.stdout {
-                            Some(stdout) => stdout,
-                            None => {
-                                entry_channel_tx
-                                    .send(Err(anyhow::anyhow!("kopia show produced no stdout")))
-                                    .await?;
-                                continue;
-                            }
+                    let mut subtar = tar::Archive::new(stdout);
+                    let entries = subtar.entries()?;
+
+                    for entry in entries {
+                        let mut entry = entry?;
+                        let header = entry.header().clone();
+                        let relative = entry.path()?.to_path_buf();
+                        if relative.as_os_str().is_empty() || relative.as_os_str() == "." {
+                            continue;
+                        }
+
+                        let file_type = match header.entry_type() {
+                            tar::EntryType::Directory => FileType::Dir,
+                            tar::EntryType::Symlink => FileType::Symlink,
+                            tar::EntryType::Regular => FileType::File,
+                            _ => continue,
                         };
 
-                        entry_channel_tx
-                            .send(Ok((
-                                file_type,
-                                entry_path,
-                                Box::new(stdout) as AsyncReadableFileStream,
-                            )))
-                            .await?;
-                    } else {
-                        entry_channel_tx
-                            .send(Ok((
-                                file_type,
-                                entry_path,
-                                Box::new(tokio::io::empty()) as AsyncReadableFileStream,
-                            )))
-                            .await?;
-                    }
-                }
+                        let Some(entry_path) = (is_ignored)(file_type, base.join(&relative)) else {
+                            continue;
+                        };
 
-                entry_wanted_notifier.notify_one();
+                        let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+                        entry_channel_tx.blocking_send(Ok((
+                            file_type,
+                            entry_path,
+                            Box::new(reader) as AsyncReadableFileStream,
+                        )))?;
+
+                        let mut writer = tokio_util::io::SyncIoBridge::new(writer);
+                        crate::io::copy(&mut entry, &mut writer)?;
+                        writer.shutdown()?;
+
+                        runtime.block_on(entry_wanted_notifier.notified());
+                    }
+
+                    entry_wanted_notifier.notify_one();
+                    Ok(())
+                })
+                .await??;
+
                 Ok::<_, anyhow::Error>(())
-            }
-        });
+            });
+        }
 
         entry_wanted_notifier.notify_one();
 
@@ -1529,16 +1566,12 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
         compression_level: CompressionLevel,
         progress: crate::server::filesystem::archive::create::ArchiveProgress,
         is_ignored: IsIgnoredFn,
-    ) -> Result<tokio::io::ReadHalf<tokio::io::SimplexStream>, anyhow::Error> {
+    ) -> Result<crate::io::fallible_reader::FallibleSimplexReader, anyhow::Error> {
         let base_path = path.as_ref().to_path_buf();
         let base_oid = match self.resolve_dir_oid(&base_path).await {
             Ok(oid) => oid,
             Err(_) => return Err(Self::not_found()),
         };
-
-        let mut entries = Vec::new();
-        self.collect_subtree(PathBuf::new(), base_oid, &is_ignored, &mut entries)
-            .await?;
 
         let threads = self
             .server
@@ -1550,67 +1583,98 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
         let config_file = self.config_file.clone();
         let remote = Arc::clone(&self.remote);
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+        let (reader, signal) = crate::io::fallible_reader::FallibleReader::new(reader);
 
-        let open_object = move |oid: &str| -> Result<std::process::ChildStdout, anyhow::Error> {
+        let spawn_restore = move || -> Result<std::process::ChildStdout, anyhow::Error> {
             let child = KopiaBackup::get_std_command(&config_file, &remote)
-                .arg("show")
-                .arg(oid)
+                .arg("restore")
+                .arg(base_oid.as_ref())
+                .arg("/dev/stdout")
+                .arg("--mode")
+                .arg("tar")
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .spawn()?;
             child
                 .stdout
-                .ok_or_else(|| anyhow::anyhow!("kopia show produced no stdout"))
+                .ok_or_else(|| anyhow::anyhow!("kopia restore produced no stdout"))
         };
 
         match archive_format {
             StreamableArchiveFormat::Zip => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
+                    let stdout = spawn_restore()?;
+
                     let writer = tokio_util::io::SyncIoBridge::new(writer);
                     let mut zip = zip::ZipWriter::new_stream(writer);
 
+                    let mut subtar = tar::Archive::new(stdout);
+                    let entries = subtar.entries()?;
+
+                    let mut read_buffer = vec![0; crate::BUFFER_SIZE];
                     for entry in entries {
-                        let name = entry.relative.to_string_lossy();
+                        let mut entry = entry?;
+                        let header = entry.header().clone();
+                        let relative = entry.path()?.to_path_buf();
+                        if relative.as_os_str().is_empty() || relative.as_os_str() == "." {
+                            continue;
+                        }
+
+                        let file_type = match header.entry_type() {
+                            tar::EntryType::Directory => FileType::Dir,
+                            tar::EntryType::Symlink => FileType::Symlink,
+                            tar::EntryType::Regular => FileType::File,
+                            _ => continue,
+                        };
+
+                        let absolute_path = base_path.join(&relative);
+                        if (is_ignored)(file_type, absolute_path).is_none() {
+                            continue;
+                        }
+
+                        let mode =
+                            header
+                                .mode()
+                                .unwrap_or(if file_type.is_dir() { 0o755 } else { 0o644 });
+                        let size = header.size().unwrap_or(0);
+
                         let mut options: zip::write::FileOptions<'_, ()> =
                             zip::write::FileOptions::default()
                                 .compression_level(
                                     Some(compression_level.to_deflate_level() as i64),
                                 )
-                                .unix_permissions(entry.mode)
-                                .large_file(entry.size >= u32::MAX as u64);
+                                .unix_permissions(mode)
+                                .large_file(size >= u32::MAX as u64);
 
-                        if let Some(dt) =
-                            chrono::DateTime::from_timestamp(entry.mtime.timestamp(), 0)
-                            && let Ok(dt) = zip::DateTime::from_date_and_time(
-                                dt.year() as u16,
-                                dt.month() as u8,
-                                dt.day() as u8,
-                                dt.hour() as u8,
-                                dt.minute() as u8,
-                                dt.second() as u8,
-                            )
+                        if let Ok(mtime) = header.mtime()
+                            && let Some(mtime) = chrono::DateTime::from_timestamp(mtime as i64, 0)
                         {
-                            options = options.last_modified_time(dt);
+                            options =
+                                options.last_modified_time(zip::DateTime::from_date_and_time(
+                                    mtime.year() as u16,
+                                    mtime.month() as u8,
+                                    mtime.day() as u8,
+                                    mtime.hour() as u8,
+                                    mtime.minute() as u8,
+                                    mtime.second() as u8,
+                                )?);
                         }
 
-                        match entry.file_type {
+                        match file_type {
                             FileType::Dir => {
-                                zip.add_directory(name, options)?;
+                                zip.add_directory(relative.to_string_lossy(), options)?;
                             }
                             FileType::File => {
-                                zip.start_file(name, options)?;
+                                zip.start_file(relative.to_string_lossy(), options)?;
                                 progress.increment_files();
 
-                                let mut reader = open_object(&entry.oid)?;
-                                let mut buffer = vec![0; crate::BUFFER_SIZE];
                                 loop {
-                                    let read = reader.read_uninterrupted(&mut buffer)?;
-                                    if crate::unlikely(read == 0) {
+                                    let bytes_read = entry.read_uninterrupted(&mut read_buffer)?;
+                                    if crate::unlikely(bytes_read == 0) {
                                         break;
                                     }
-                                    let chunk = buffer.get(..read).unwrap_or_default();
-                                    zip.write_all(chunk)?;
-                                    progress.increment_bytes(read as u64);
+                                    zip.safe_write_all(&read_buffer, bytes_read)?;
+                                    progress.increment_bytes(bytes_read as u64);
                                 }
                             }
                             _ => {}
@@ -1624,7 +1688,9 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
                 });
             }
             f if f.is_tar() => {
-                crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
+                crate::spawn_blocking_signalled(signal, move || -> Result<(), anyhow::Error> {
+                    let stdout = spawn_restore()?;
+
                     let writer = CompressionWriter::new(
                         tokio_util::io::SyncIoBridge::new(writer),
                         f.compression_format(),
@@ -1633,33 +1699,38 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
                     )?;
                     let mut tar = tar::Builder::new(writer);
 
-                    for entry in entries {
-                        let mut header = tar::Header::new_gnu();
-                        header.set_mode(entry.mode);
-                        header.set_mtime(entry.mtime.timestamp().max(0) as u64);
-                        header.set_uid(0);
-                        header.set_gid(0);
+                    let mut subtar = tar::Archive::new(stdout);
+                    let entries = subtar.entries()?;
 
-                        match entry.file_type {
-                            FileType::Dir => {
-                                header.set_entry_type(tar::EntryType::Directory);
-                                header.set_size(0);
-                                tar.append_data(&mut header, &entry.relative, std::io::empty())?;
-                            }
-                            FileType::File => {
-                                header.set_entry_type(tar::EntryType::Regular);
-                                header.set_size(entry.size);
-                                let reader = open_object(&entry.oid)?;
-                                let reader = progress.counting_reader(reader);
-                                let mut reader =
-                                    crate::io::fixed_reader::FixedReader::new_with_fixed_bytes(
-                                        reader,
-                                        entry.size as usize,
-                                    );
-                                tar.append_data(&mut header, &entry.relative, &mut reader)?;
+                    for entry in entries {
+                        let entry = entry?;
+                        let mut header = entry.header().clone();
+                        let relative = entry.path()?.to_path_buf();
+                        if relative.as_os_str().is_empty() || relative.as_os_str() == "." {
+                            continue;
+                        }
+
+                        let file_type = match header.entry_type() {
+                            tar::EntryType::Directory => FileType::Dir,
+                            tar::EntryType::Symlink => FileType::Symlink,
+                            tar::EntryType::Regular => FileType::File,
+                            _ => continue,
+                        };
+
+                        let absolute_path = base_path.join(&relative);
+                        if (is_ignored)(file_type, absolute_path).is_none() {
+                            continue;
+                        }
+
+                        if file_type.is_file() {
+                            let reader = progress.counting_reader(entry);
+                            tar.append_data(&mut header, relative, reader)?;
+                            progress.increment_files();
+                        } else {
+                            tar.append_data(&mut header, relative, std::io::empty())?;
+                            if file_type.is_symlink() {
                                 progress.increment_files();
                             }
-                            _ => {}
                         }
                     }
 

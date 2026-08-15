@@ -111,8 +111,6 @@ impl russh::server::Handler for SshSession {
             return Ok(Auth::reject());
         }
 
-        self.limiter.increment_sessions(user)?;
-        self.user_uuid = Some(user);
         self.limiter
             .finish_attempt(&self.user_ip, AuthenticationType::Password)
             .await;
@@ -130,6 +128,9 @@ impl russh::server::Handler for SshSession {
         if server.locked_state().is_some() {
             return Ok(Auth::reject());
         }
+
+        self.limiter.increment_sessions(user)?;
+        self.user_uuid = Some(user);
 
         tracing::debug!(server = %server.uuid, %user, "user authenticated with password");
 
@@ -199,8 +200,6 @@ impl russh::server::Handler for SshSession {
             return Ok(Auth::reject());
         }
 
-        self.limiter.increment_sessions(user)?;
-        self.user_uuid = Some(user);
         self.limiter
             .finish_attempt(&self.user_ip, AuthenticationType::PublicKey)
             .await;
@@ -213,6 +212,9 @@ impl russh::server::Handler for SshSession {
         if server.locked_state().is_some() {
             return Ok(Auth::reject());
         }
+
+        self.limiter.increment_sessions(user)?;
+        self.user_uuid = Some(user);
 
         tracing::debug!(server = %server.uuid, %user, "user authenticated with public key");
 
@@ -239,8 +241,9 @@ impl russh::server::Handler for SshSession {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: russh::server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         if self.open_channels
             >= self
                 .state
@@ -251,16 +254,19 @@ impl russh::server::Handler for SshSession {
                 .limits
                 .max_channels_per_connection
         {
-            return Err(russh::Error::ChannelOpenFailure(
-                russh::ChannelOpenFailure::ResourceShortage,
-            ));
+            reply
+                .reject(russh::ChannelOpenFailure::ResourceShortage)
+                .await;
+            return Ok(());
         }
+
+        reply.accept().await;
 
         tracing::debug!("opening new channel: {}", channel.id());
         self.clients.insert(channel.id(), channel);
         self.open_channels += 1;
 
-        Ok(true)
+        Ok(())
     }
 
     async fn channel_eof(

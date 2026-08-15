@@ -11,9 +11,16 @@ use axum::{
 };
 use colored::Colorize;
 use russh::server::Server;
-use std::{fmt::Debug, net::SocketAddr, path::Path, sync::Arc, time::Instant};
+use std::{
+    fmt::Debug,
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa_axum::router::OpenApiRouter;
+
+pub static CLAP_COMMAND: OnceLock<clap::Command> = OnceLock::new();
 
 mod bins;
 mod commands;
@@ -28,6 +35,7 @@ mod routes;
 mod server;
 mod ssh;
 mod stats;
+mod tls;
 mod utils;
 
 use payload::Payload;
@@ -36,11 +44,6 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_COMMIT: &str = env!("CARGO_GIT_COMMIT");
 const GIT_BRANCH: &str = env!("CARGO_GIT_BRANCH");
 const TARGET: &str = env!("CARGO_TARGET");
-
-#[cfg(unix)]
-const DEFAULT_CONFIG_PATH: &str = "/etc/pterodactyl/config.yml";
-#[cfg(windows)]
-const DEFAULT_CONFIG_PATH: &str = "C:\\ProgramData\\Calagopus-Wings\\config.yml";
 
 /// 32 KiB - used for general IO
 const BUFFER_SIZE: usize = 32 * 1024;
@@ -69,6 +72,28 @@ fn spawn_blocking_handled<
             }
             Err(err) => {
                 tracing::error!("spawned blocking task panicked: {:?}", err);
+            }
+        }
+    });
+}
+
+fn spawn_blocking_signalled<
+    F: FnOnce() -> Result<(), E> + Send + 'static,
+    E: Debug + Send + 'static,
+>(
+    signal: crate::io::fallible_reader::FallibleSignal,
+    f: F,
+) {
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(f).await {
+            Ok(Ok(_)) => signal.succeed(),
+            Ok(Err(err)) => {
+                tracing::error!("spawned blocking task failed: {:?}", err);
+                signal.fail(format!("{err:?}"));
+            }
+            Err(err) => {
+                tracing::error!("spawned blocking task panicked: {:?}", err);
+                signal.fail(format!("task panicked: {err:?}"));
             }
         }
     });
@@ -180,9 +205,13 @@ async fn handle_cors(
     );
     headers.insert(
         "Access-Control-Allow-Methods",
-        HeaderValue::from_static("GET, POST, PATCH, PUT, DELETE, OPTIONS"),
+        HeaderValue::from_static("GET, HEAD, POST, PATCH, PUT, DELETE, OPTIONS"),
     );
-    headers.insert("Access-Control-Allow-Headers", HeaderValue::from_static("Accept, Accept-Encoding, Authorization, Cache-Control, Content-Type, Content-Length, Origin, X-Real-IP, X-CSRF-Token"));
+    headers.insert("Access-Control-Allow-Headers", HeaderValue::from_static("Accept, Accept-Encoding, Authorization, Cache-Control, Content-Type, Content-Length, Origin, X-Real-IP, X-CSRF-Token, Upload-Offset, Upload-Length, Upload-Complete"));
+    headers.insert(
+        "Access-Control-Expose-Headers",
+        HeaderValue::from_static("Upload-Offset"),
+    );
 
     if state.config.load().allow_cors_private_network {
         headers.insert(
@@ -233,17 +262,22 @@ async fn handle_cors(
 
 async fn main_rt() {
     let cli = crate::commands::CliCommandGroupBuilder::new(
-        "wings-rs",
+        "calagopus-wings",
         "The wings server implementing server management for the panel.",
     );
 
     let mut cli = crate::commands::commands(cli);
     let mut matches = cli.get_matches();
 
-    let config_path = matches
-        .get_one::<String>("config")
-        .expect("config path is required")
-        .clone();
+    CLAP_COMMAND
+        .set(cli.get_command())
+        .expect("failed to set CLAP_COMMAND");
+
+    let config_path = matches.get_one::<String>("config").cloned();
+    let config_path = config_path
+        .as_deref()
+        .or_else(|| crate::config::Config::find())
+        .unwrap_or(crate::config::Config::DEFAULT_PATH);
     let debug = *matches
         .get_one::<bool>("debug")
         .expect("debug flag is required");
@@ -252,7 +286,7 @@ async fn main_rt() {
         .copied()
         .unwrap_or(false);
     let config = crate::config::Config::open(
-        &config_path,
+        config_path,
         debug,
         matches.subcommand().is_some(),
         ignore_certificate_errors,
@@ -534,7 +568,11 @@ async fn main_rt() {
             async move {
                 let mut server = crate::ssh::Server::new(Arc::clone(&state));
 
-                let key_file = Path::new(&state.config.load().system.data_directory)
+                let cfg = state.config.load();
+                let key_file = cfg
+                    .system
+                    .data_directory
+                    .as_path(&cfg)
                     .join(".sftp")
                     .join(format!(
                         "id_{}",
@@ -546,6 +584,8 @@ async fn main_rt() {
                             .key_algorithm
                             .replace("-", "_")
                     ));
+                drop(cfg);
+
                 let key = match tokio::fs::read(&key_file)
                     .await
                     .map(russh::keys::PrivateKey::from_openssh)
@@ -640,7 +680,7 @@ async fn main_rt() {
                     Ok(_) => {}
                     Err(err) => {
                         if err.kind() == std::io::ErrorKind::AddrInUse {
-                            exit_error!("failed to start ssh server (address already in use)");
+                            exit_error!("failed to start ssh server ({} already in use)", address);
                         } else {
                             exit_error!("failed to start ssh server: {:?}", err);
                         }
@@ -669,13 +709,33 @@ async fn main_rt() {
         if config.load().api.ssl.enabled {
             tracing::info!("loading ssl certs");
 
-            let rustls_config = match axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            #[cfg(not(target_os = "linux"))]
+            if config.load().api.ssl.ktls_enabled {
+                tracing::warn!("kernel tls is only supported on linux, using userspace tls");
+            }
+
+            #[cfg(target_os = "linux")]
+            let ktls_ciphers = if config.load().api.ssl.ktls_enabled {
+                crate::tls::detect_ktls_support().await
+            } else {
+                None
+            };
+
+            #[cfg(target_os = "linux")]
+            let ktls = ktls_ciphers.is_some();
+            #[cfg(not(target_os = "linux"))]
+            let ktls = false;
+
+            let rustls_config = match crate::tls::server_config(
                 config.load().api.ssl.cert.as_str(),
                 config.load().api.ssl.key.as_str(),
+                ktls,
             )
             .await
             {
-                Ok(config) => config,
+                Ok(server_config) => {
+                    axum_server::tls_rustls::RustlsConfig::from_config(server_config)
+                }
                 Err(err) => exit_error!("failed to load SSL certificate and key: {:?}", err),
             };
 
@@ -688,16 +748,23 @@ async fn main_rt() {
                         tokio::time::sleep(std::time::Duration::from_hours(24)).await;
                         tracing::info!("reloading ssl certs");
 
-                        if let Err(err) = rustls_config
-                            .reload_from_pem_file(
-                                config.load().api.ssl.cert.as_str(),
-                                config.load().api.ssl.key.as_str(),
-                            )
-                            .await
+                        match crate::tls::server_config(
+                            config.load().api.ssl.cert.as_str(),
+                            config.load().api.ssl.key.as_str(),
+                            ktls,
+                        )
+                        .await
                         {
-                            tracing::error!("failed to reload SSL certificate and key: {:?}", err);
-                        } else {
-                            tracing::info!("ssl certs reloaded successfully");
+                            Ok(server_config) => {
+                                rustls_config.reload_from_config(server_config);
+                                tracing::info!("ssl certs reloaded successfully");
+                            }
+                            Err(err) => {
+                                tracing::error!(
+                                    "failed to reload SSL certificate and key: {:?}",
+                                    err
+                                );
+                            }
                         }
                     }
                 }
@@ -705,14 +772,31 @@ async fn main_rt() {
 
             tracing::info!("https listening on {}", address.to_string());
 
-            match axum_server::bind_rustls(address, rustls_config)
+            #[cfg(target_os = "linux")]
+            let result = match ktls_ciphers {
+                Some(ciphers) => {
+                    axum_server::bind(address)
+                        .acceptor(crate::tls::KtlsAcceptor::new(rustls_config, ciphers))
+                        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                        .await
+                }
+                None => {
+                    axum_server::bind_rustls(address, rustls_config)
+                        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                        .await
+                }
+            };
+
+            #[cfg(not(target_os = "linux"))]
+            let result = axum_server::bind_rustls(address, rustls_config)
                 .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-            {
+                .await;
+
+            match result {
                 Ok(_) => {}
                 Err(err) => {
                     if err.kind() == std::io::ErrorKind::AddrInUse {
-                        exit_error!("failed to start https server (address already in use)");
+                        exit_error!("failed to start https server ({} already in use)", address);
                     } else {
                         exit_error!("failed to start https server: {:?}", err);
                     }
@@ -726,7 +810,7 @@ async fn main_rt() {
                     Ok(listener) => listener,
                     Err(err) => {
                         if err.kind() == std::io::ErrorKind::AddrInUse {
-                            exit_error!("failed to start http server (address already in use)");
+                            exit_error!("failed to start http server ({} already in use)", address);
                         } else {
                             exit_error!("failed to start http server: {:?}", err);
                         }
@@ -739,7 +823,7 @@ async fn main_rt() {
                 Ok(_) => {}
                 Err(err) => {
                     if err.kind() == std::io::ErrorKind::AddrInUse {
-                        exit_error!("failed to start http server (address already in use)");
+                        exit_error!("failed to start http server ({} already in use)", address);
                     } else {
                         exit_error!("failed to start http server: {:?}", err);
                     }
@@ -764,13 +848,15 @@ async fn main_rt() {
             ));
 
             let _ = tokio::fs::remove_file(&socket_path).await;
-            let listener = match tokio::net::UnixListener::bind(socket_path) {
+            let listener = match tokio::net::UnixListener::bind(&socket_path) {
                 Ok(listener) => listener,
-                Err(err) => exit_error!("failed to bind to unix socket: {:?}", err),
+                Err(err) => {
+                    exit_error!("failed to bind to unix socket ({}): {:?}", socket_path, err)
+                }
             };
 
             if let Err(err) = axum::serve(listener, router.into_make_service()).await {
-                exit_error!("failed to start http server: {:?}", err);
+                exit_error!("failed to start http server ({}): {:?}", socket_path, err);
             }
         }
         #[cfg(not(unix))]

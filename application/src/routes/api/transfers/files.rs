@@ -50,6 +50,20 @@ pub(crate) mod post {
         pub destination_path: compact_str::CompactString,
     }
 
+    fn remap_root_path(path: &Path, files: &[crate::models::CopyFile]) -> PathBuf {
+        for file in files {
+            if let Ok(stripped) = path.strip_prefix(Path::new(&file.from)) {
+                return if stripped.as_os_str().is_empty() {
+                    PathBuf::from(&file.to)
+                } else {
+                    Path::new(&file.to).join(stripped)
+                };
+            }
+        }
+
+        path.to_path_buf()
+    }
+
     #[utoipa::path(post, path = "/", responses(
         (status = OK, body = inline(Response)),
         (status = UNAUTHORIZED, body = ApiError),
@@ -124,7 +138,7 @@ pub(crate) mod post {
         let total_bytes: u64 = headers
             .get("Total-Bytes")
             .map_or(Ok(0), |v| v.to_str().unwrap_or_default().parse())?;
-        let root_files: Vec<compact_str::CompactString> = serde_json::from_str(
+        let root_files: Vec<crate::models::CopyFile> = serde_json::from_str(
             headers
                 .get("Root-Files")
                 .map_or("[]", |v| v.to_str().unwrap_or("[]")),
@@ -148,7 +162,7 @@ pub(crate) mod post {
                 crate::server::filesystem::operations::FilesystemOperation::CopyRemote {
                     server: payload.server,
                     path: PathBuf::from(&payload.root),
-                    files: root_files.into_iter().map(PathBuf::from).collect(),
+                    files: root_files.iter().map(|file| PathBuf::from(&file.from)).collect(),
                     destination_server: server.uuid,
                     destination_path: PathBuf::from(&payload.destination_path),
                     start_time: chrono::Utc::now(),
@@ -166,10 +180,12 @@ pub(crate) mod post {
                     async move {
                         tokio::task::spawn_blocking(move || {
                             let mut archive_checksum = None;
+                            let mut archive_received = false;
 
-                            while let Some(field) = runtime.block_on(multipart.next_field())? {
+                            while let Some(mut field) = runtime.block_on(multipart.next_field())? {
                                 match field.name() {
                                     Some("archive") => {
+                                        archive_received = true;
                                         let file_name = field.file_name().unwrap_or("archive.tar.gz").to_string();
                                         let reader =
                                             tokio_util::io::StreamReader::new(field.into_stream().map_err(|err| {
@@ -192,11 +208,12 @@ pub(crate) mod post {
                                         {
                                             let archive =
                                                 itaf::decoder::ItafDecoder::new(&mut reader)?;
-                                            let mut entries = archive.entries();
+                                            let entries = archive.entries();
 
                                             let mut read_buffer =
                                                 vec![0; crate::TRANSFER_BUFFER_SIZE];
-                                            while let Some(Ok(mut entry)) = entries.next() {
+                                            for entry in entries {
+                                                let mut entry = entry?;
                                                 let rel = entry.enclosed_path();
                                                 if rel.as_os_str().is_empty() || rel.is_absolute()
                                                 {
@@ -204,7 +221,8 @@ pub(crate) mod post {
                                                 }
 
                                                 let destination_path =
-                                                    Path::new(&payload.destination_path).join(&rel);
+                                                    Path::new(&payload.destination_path)
+                                                        .join(remap_root_path(&rel, &root_files));
 
                                                 let is_dir = matches!(
                                                     &entry,
@@ -224,7 +242,7 @@ pub(crate) mod post {
                                                             .create_dir_all(&destination_path)?;
                                                         filesystem.set_permissions(
                                                             &destination_path,
-                                                            PortablePermissions::from_mode(
+                                                            PortablePermissions::from_mode_dir(
                                                                 dir.metadata().mode,
                                                             ),
                                                         )?;
@@ -287,17 +305,19 @@ pub(crate) mod post {
                                         } else {
                                             let mut archive = tar::Archive::new(reader);
                                             archive.set_ignore_zeros(true);
-                                            let mut entries = archive.entries()?;
+                                            let entries = archive.entries()?;
 
                                             let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
-                                            while let Some(Ok(mut entry)) = entries.next() {
+                                            for entry in entries {
+                                                let mut entry = entry?;
                                                 let path = entry.path()?;
 
                                                 if path.is_absolute() {
                                                     continue;
                                                 }
 
-                                                let destination_path = Path::new(&payload.destination_path).join(&path);
+                                                let destination_path = Path::new(&payload.destination_path)
+                                                    .join(remap_root_path(&path, &root_files));
                                                 let header = entry.header();
 
                                                 let is_dir = header.entry_type() == tar::EntryType::Directory;
@@ -313,7 +333,7 @@ pub(crate) mod post {
                                                     tar::EntryType::Directory => {
                                                         filesystem.create_dir_all(&destination_path)?;
                                                         if let Ok(permissions) =
-                                                            header.mode().map(PortablePermissions::from_mode)
+                                                            header.mode().map(PortablePermissions::from_mode_dir)
                                                         {
                                                             filesystem.set_permissions(
                                                                 &destination_path,
@@ -381,7 +401,12 @@ pub(crate) mod post {
                                             }
                                         };
 
-                                        let checksum = runtime.block_on(field.text())?;
+                                        let checksum = runtime.block_on(
+                                            crate::utils::read_limited_multipart_field(
+                                                &mut field,
+                                                super::super::MAX_CHECKSUM_LEN,
+                                            ),
+                                        )?;
 
                                         if archive_checksum != checksum {
                                             return Err(anyhow::anyhow!(
@@ -391,6 +416,18 @@ pub(crate) mod post {
                                     }
                                     _ => {}
                                 }
+                            }
+
+                            if !archive_received {
+                                return Err(anyhow::anyhow!("transfer did not contain an archive"));
+                            }
+
+                            // the checksum field takes the computed hash, anything left over
+                            // means the sender never provided one to compare against.
+                            if archive_checksum.is_some() {
+                                return Err(anyhow::anyhow!(
+                                    "transfer did not contain an archive checksum, cannot verify integrity"
+                                ));
                             }
 
                             Ok(())

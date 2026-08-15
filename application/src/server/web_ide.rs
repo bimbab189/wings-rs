@@ -2475,17 +2475,18 @@ as well.\n"
         }
 
         let protected = [
-            &config.system.data_directory,
-            &config.system.archive_directory,
-            &config.system.backup_directory,
-            &config.system.vmount_directory,
-            &config.system.log_directory,
-            &config.system.tmp_directory,
-            &config.web_ide.runtime_directory,
+            config.system.data_directory.as_path(&config),
+            config.system.archive_directory.as_path(&config),
+            config.system.backup_directory.as_path(&config),
+            config.system.vmount_directory.as_path(&config),
+            config.system.log_directory.as_path(&config),
+            config.system.tmp_directory.as_path(&config),
+            PathBuf::from(&config.web_ide.runtime_directory),
         ];
         for protected in protected {
-            let protected = std::path::Path::new(protected);
-            if memory == protected || memory.starts_with(protected) || protected.starts_with(memory)
+            if memory == protected
+                || memory.starts_with(&protected)
+                || protected.starts_with(memory)
             {
                 anyhow::bail!("web_ide.memory_directory overlaps a protected Wings directory");
             }
@@ -2519,19 +2520,18 @@ as well.\n"
         }
 
         let protected = [
-            &config.system.data_directory,
-            &config.system.archive_directory,
-            &config.system.backup_directory,
-            &config.system.vmount_directory,
-            &config.system.log_directory,
-            &config.system.tmp_directory,
-            &config.web_ide.runtime_directory,
-            &config.web_ide.memory_directory,
+            config.system.data_directory.as_path(&config),
+            config.system.archive_directory.as_path(&config),
+            config.system.backup_directory.as_path(&config),
+            config.system.vmount_directory.as_path(&config),
+            config.system.log_directory.as_path(&config),
+            config.system.tmp_directory.as_path(&config),
+            PathBuf::from(&config.web_ide.runtime_directory),
+            PathBuf::from(&config.web_ide.memory_directory),
         ];
         for protected in protected {
-            let protected = Path::new(protected);
             if persistent == protected
-                || persistent.starts_with(protected)
+                || persistent.starts_with(&protected)
                 || protected.starts_with(persistent)
             {
                 anyhow::bail!(
@@ -2570,16 +2570,15 @@ as well.\n"
         }
 
         let protected = [
-            &config.system.data_directory,
-            &config.system.archive_directory,
-            &config.system.backup_directory,
-            &config.system.log_directory,
-            &config.system.tmp_directory,
+            config.system.data_directory.as_path(&config),
+            config.system.archive_directory.as_path(&config),
+            config.system.backup_directory.as_path(&config),
+            config.system.log_directory.as_path(&config),
+            config.system.tmp_directory.as_path(&config),
         ];
         for protected in protected {
-            let protected = std::path::Path::new(protected);
             if runtime == protected
-                || runtime.starts_with(protected)
+                || runtime.starts_with(&protected)
                 || protected.starts_with(runtime)
             {
                 anyhow::bail!("web_ide.runtime_directory overlaps a protected Wings directory");
