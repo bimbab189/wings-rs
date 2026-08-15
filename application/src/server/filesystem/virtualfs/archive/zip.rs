@@ -4,12 +4,14 @@ use crate::{
         counting_reader::CountingReader,
     },
     models::DirectoryEntry,
+    routes::MimeCacheValue,
     server::filesystem::{
         archive::{
             StreamableArchiveFormat, multi_reader::MultiReader, zip_entry_get_modified_time,
         },
         cap::FileType,
         encode_mode,
+        usage::UsedSpace,
         virtualfs::{
             AsyncFileRead, AsyncReadableFileStream, ByteRange, DirectoryListing,
             DirectoryStreamWalk, DirectoryWalk, FileMetadata, FileRead, IsIgnoredFn,
@@ -55,16 +57,70 @@ impl<R: Read + Seek + Clone> BetterZipArchiveExt<R> for zip::ZipArchive<R> {
     }
 }
 
+pub struct SortableZipEntry {
+    pub name: PathBuf,
+    pub size: u64,
+    pub size_compressed: u64,
+    pub modified: chrono::DateTime<chrono::Utc>,
+    pub created: chrono::DateTime<chrono::Utc>,
+}
+
+impl SortableZipEntry {
+    pub fn new(
+        name: PathBuf,
+        entry: &zip::read::ZipFile<'_, impl Read + Seek>,
+        archive_created: &chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self {
+            name,
+            size: entry.size(),
+            size_compressed: entry.compressed_size(),
+            modified: crate::server::filesystem::archive::zip_entry_get_modified_time(entry)
+                .map(|dt| dt.into_std().into())
+                .unwrap_or_default(),
+            created: crate::server::filesystem::archive::zip_entry_get_created_time(entry)
+                .map(|dt| dt.into_std().into())
+                .unwrap_or_else(|| *archive_created),
+        }
+    }
+
+    pub fn cmp_sort(
+        &self,
+        other: &Self,
+        sort: crate::models::DirectorySortingMode,
+    ) -> std::cmp::Ordering {
+        use crate::models::DirectorySortingMode::*;
+
+        match sort {
+            NameAsc => self.name.cmp(&other.name),
+            NameDesc => other.name.cmp(&self.name),
+            SizeAsc => self.size.cmp(&other.size),
+            SizeDesc => other.size.cmp(&self.size),
+            PhysicalSizeAsc => self.size_compressed.cmp(&other.size_compressed),
+            PhysicalSizeDesc => other.size_compressed.cmp(&self.size_compressed),
+            ModifiedAsc => self.modified.cmp(&other.modified),
+            ModifiedDesc => other.modified.cmp(&self.modified),
+            CreatedAsc => self.created.cmp(&other.created),
+            CreatedDesc => other.created.cmp(&self.created),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct VirtualZipArchive {
     pub server: crate::server::Server,
     pub archive: zip::ZipArchive<MultiReader>,
-    pub mime_cache: moka::sync::Cache<usize, &'static str>,
-    pub sizes: Arc<Vec<(u64, PathBuf)>>,
+    pub archive_created: chrono::DateTime<chrono::Utc>,
+    pub mime_cache: moka::sync::Cache<usize, MimeCacheValue>,
+    pub sizes: Arc<Vec<(UsedSpace, PathBuf)>>,
 }
 
 impl VirtualZipArchive {
-    pub fn new(server: crate::server::Server, mut archive: zip::ZipArchive<MultiReader>) -> Self {
+    pub fn new(
+        server: crate::server::Server,
+        mut archive: zip::ZipArchive<MultiReader>,
+        archive_created: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
         let names = archive
             .file_names()
             .map(|name| name.to_string())
@@ -73,10 +129,13 @@ impl VirtualZipArchive {
             .into_iter()
             .map(|name| {
                 (
-                    archive
-                        .by_name(&name)
-                        .map(|file| file.size())
-                        .unwrap_or_default(),
+                    {
+                        let entry = archive.by_name(&name);
+
+                        entry
+                            .map(|e| UsedSpace::new(e.size(), e.compressed_size()))
+                            .unwrap_or_default()
+                    },
                     PathBuf::from(name),
                 )
             })
@@ -86,6 +145,7 @@ impl VirtualZipArchive {
         Self {
             server,
             archive,
+            archive_created,
             mime_cache: moka::sync::Cache::new(10240),
             sizes: Arc::new(sizes),
         }
@@ -111,73 +171,61 @@ impl VirtualZipArchive {
         )
         .await??;
 
-        Ok(Self::new(server, archive))
+        let metadata = server.filesystem.async_metadata(archive_path).await?;
+
+        Ok(Self::new(
+            server,
+            archive,
+            metadata
+                .created()
+                .map_or_else(|_| Default::default(), |dt| dt.into_std().into()),
+        ))
     }
 
     fn zip_entry_to_directory_entry(
+        archive_created: &chrono::DateTime<chrono::Utc>,
         path: &Path,
         entry_index: usize,
-        mime_cache: &moka::sync::Cache<usize, &'static str>,
-        sizes: &[(u64, PathBuf)],
+        mime_cache: &moka::sync::Cache<usize, MimeCacheValue>,
+        sizes: &[(UsedSpace, PathBuf)],
         buffer: Option<&[u8]>,
         mut entry: zip::read::ZipFile<impl Read + Seek>,
     ) -> DirectoryEntry {
-        let size = if entry.is_dir() {
-            sizes
+        let (size, size_physical) = if entry.is_dir() {
+            let space: UsedSpace = sizes
                 .iter()
                 .filter(|(_, name)| name.starts_with(path))
                 .map(|(size, _)| *size)
-                .sum()
+                .sum();
+
+            (space.get_logical(), space.get_physical())
         } else {
-            entry.size()
+            (entry.size(), entry.compressed_size())
         };
 
-        let mime_type = if entry.is_dir() {
-            "inode/directory"
+        let detected_mime = if entry.is_dir() {
+            MimeCacheValue::directory()
         } else if entry.is_symlink() {
-            "inode/symlink"
-        } else if let Some(mime_type) = mime_cache.get(&entry_index) {
-            mime_type
+            MimeCacheValue::symlink()
+        } else if let Some(detected_mime) = mime_cache.get(&entry_index) {
+            detected_mime
         } else if let Some(buffer) = buffer {
-            let mime_type = if let Some(mime) = infer::get(buffer) {
-                mime.mime_type()
-            } else if let Some(mime) = new_mime_guess::from_path(entry.name()).iter_raw().next() {
-                mime
-            } else if crate::utils::is_valid_utf8_slice(buffer) || buffer.is_empty() {
-                "text/plain"
-            } else {
-                "application/octet-stream"
-            };
+            let detected_mime = crate::utils::detect_mime_type(path, Some(buffer));
 
-            mime_cache.insert(entry_index, mime_type);
-
-            mime_type
+            mime_cache.insert(entry_index, detected_mime);
+            detected_mime
         } else {
             let mut buffer = [0; 64];
             let buffer = if entry.read(&mut buffer).is_err() {
                 None
             } else {
-                Some(&buffer)
+                Some(&buffer[..])
             };
 
-            let mime_type = if let Some(buffer) = buffer {
-                if let Some(mime) = infer::get(buffer) {
-                    mime.mime_type()
-                } else if let Some(mime) = new_mime_guess::from_path(entry.name()).iter_raw().next()
-                {
-                    mime
-                } else if crate::utils::is_valid_utf8_slice(buffer) || buffer.is_empty() {
-                    "text/plain"
-                } else {
-                    "application/octet-stream"
-                }
-            } else {
-                "application/octet-stream"
-            };
+            let detected_mime = crate::utils::detect_mime_type(path, buffer);
 
-            mime_cache.insert(entry_index, mime_type);
-
-            mime_type
+            mime_cache.insert(entry_index, detected_mime);
+            detected_mime
         };
 
         let mode = entry
@@ -190,17 +238,22 @@ impl VirtualZipArchive {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into(),
-            created: chrono::DateTime::default(),
-            modified: crate::server::filesystem::archive::zip_entry_get_modified_time(&entry)
-                .map(|dt| dt.into_std().into())
-                .unwrap_or_default(),
             mode: encode_mode(mode),
             mode_bits: compact_str::format_compact!("{:o}", mode & 0o777),
             size,
+            size_physical,
+            editable: entry.is_file() && detected_mime.valid_utf8,
+            inner_editable: entry.is_file() && detected_mime.valid_inner_utf8,
             directory: entry.is_dir(),
             file: entry.is_file(),
             symlink: entry.is_symlink(),
-            mime: mime_type,
+            mime: detected_mime.mime,
+            modified: crate::server::filesystem::archive::zip_entry_get_modified_time(&entry)
+                .map(|dt| dt.into_std().into())
+                .unwrap_or_default(),
+            created: crate::server::filesystem::archive::zip_entry_get_created_time(&entry)
+                .map(|dt| dt.into_std().into())
+                .unwrap_or_else(|| *archive_created),
         }
     }
 
@@ -279,6 +332,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<DirectoryEntry, anyhow::Error> {
         let mut archive = self.archive.clone();
+        let archive_created = self.archive_created;
         let mime_cache = self.mime_cache.clone();
         let sizes = self.sizes.clone();
         let path = path.as_ref().to_path_buf();
@@ -288,6 +342,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
             let entry = archive.by_index(entry_index)?;
 
             Ok::<_, zip::result::ZipError>(Self::zip_entry_to_directory_entry(
+                &archive_created,
                 &path,
                 entry_index,
                 &mime_cache,
@@ -307,6 +362,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         buffer: &[u8],
     ) -> Result<DirectoryEntry, anyhow::Error> {
         let mut archive = self.archive.clone();
+        let archive_created = self.archive_created;
         let mime_cache = self.mime_cache.clone();
         let sizes = self.sizes.clone();
         let path = path.as_ref().to_path_buf();
@@ -317,6 +373,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
             let entry = archive.by_index(entry_index)?;
 
             Ok::<_, zip::result::ZipError>(Self::zip_entry_to_directory_entry(
+                &archive_created,
                 &path,
                 entry_index,
                 &mime_cache,
@@ -336,8 +393,10 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
         per_page: Option<usize>,
         page: usize,
         is_ignored: IsIgnoredFn,
+        sort: crate::models::DirectorySortingMode,
     ) -> Result<DirectoryListing, anyhow::Error> {
         let mut archive = self.archive.clone();
+        let archive_created = self.archive_created;
         let mime_cache = self.mime_cache.clone();
         let sizes = self.sizes.clone();
         let path = path.as_ref().to_path_buf();
@@ -364,19 +423,22 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                         continue;
                     }
 
-                    if (is_ignored)(Self::zip_entry_to_file_type(&entry), name).is_none() {
+                    let Some(name) = (is_ignored)(Self::zip_entry_to_file_type(&entry), name)
+                    else {
                         continue;
-                    }
+                    };
 
                     if entry.is_dir() {
-                        directory_entries.push((i, entry.name().to_string()));
+                        directory_entries
+                            .push((i, SortableZipEntry::new(name, &entry, &archive_created)));
                     } else {
-                        other_entries.push((i, entry.name().to_string()));
+                        other_entries
+                            .push((i, SortableZipEntry::new(name, &entry, &archive_created)));
                     }
                 }
 
-                directory_entries.sort_unstable_by(|a, b| a.1.cmp(&b.1));
-                other_entries.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+                directory_entries.sort_unstable_by(|a, b| a.1.cmp_sort(&b.1, sort));
+                other_entries.sort_unstable_by(|a, b| a.1.cmp_sort(&b.1, sort));
 
                 let total_entries = directory_entries.len() + other_entries.len();
                 let mut entries = Vec::new();
@@ -397,6 +459,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                         };
 
                         entries.push(Self::zip_entry_to_directory_entry(
+                            &archive_created,
                             &entry_path,
                             entry_index,
                             &mime_cache,
@@ -417,6 +480,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                         };
 
                         entries.push(Self::zip_entry_to_directory_entry(
+                            &archive_created,
                             &entry_path,
                             entry_index,
                             &mime_cache,

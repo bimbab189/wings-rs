@@ -133,7 +133,7 @@ impl russh::server::Handler for SshSession {
 
         server
             .user_permissions
-            .set_permissions(user, permissions, &ignored_files)
+            .set_permissions(user, permissions, Some(&ignored_files))
             .await;
         server
             .activity
@@ -217,7 +217,7 @@ impl russh::server::Handler for SshSession {
 
         server
             .user_permissions
-            .set_permissions(user, permissions, &ignored_files)
+            .set_permissions(user, permissions, Some(&ignored_files))
             .await;
         server
             .activity
@@ -376,7 +376,7 @@ impl russh::server::Handler for SshSession {
             None => return Err(russh::Error::WrongChannel),
         };
 
-        tracing::debug!("recieved command from exec: {}", command);
+        tracing::debug!("received command from exec: {}", command);
 
         // Register exec session in the global registry.
         let session_id = self

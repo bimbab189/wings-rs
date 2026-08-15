@@ -21,6 +21,7 @@ pub(crate) mod schedules;
 pub(crate) mod script;
 pub(crate) mod sync;
 pub(crate) mod transfer;
+pub(crate) mod utilization;
 pub(crate) mod version;
 pub(crate) mod web_hosting;
 pub(crate) mod web_ide;
@@ -113,6 +114,7 @@ pub(crate) mod delete {
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
+        .nest("/utilization", utilization::router(state))
         .nest("/logs", logs::router(state))
         .nest("/install", install::router(state))
         .nest("/transfer", transfer::router(state))

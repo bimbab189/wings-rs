@@ -27,10 +27,7 @@ impl<'a> DiskLimiterExt for NoneLimiter<'a> {
     }
 
     async fn disk_usage(&self) -> Result<u64, std::io::Error> {
-        Ok(self
-            .filesystem
-            .disk_usage_cached
-            .load(std::sync::atomic::Ordering::Relaxed))
+        Ok(self.filesystem.get_physical_cached_size())
     }
 
     async fn update_disk_limit(&self, _limit: u64) -> Result<(), std::io::Error> {

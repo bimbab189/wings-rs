@@ -241,8 +241,8 @@ fn system_passwd_directory() -> String {
 fn system_disk_check_interval() -> u64 {
     150
 }
-fn system_disk_check_threads() -> usize {
-    2
+fn system_disk_check_use_inotify() -> bool {
+    true
 }
 fn system_activity_send_interval() -> u64 {
     60
@@ -735,8 +735,8 @@ nestify::nest! {
 
             #[serde(default = "system_disk_check_interval")]
             pub disk_check_interval: u64,
-            #[serde(default = "system_disk_check_threads")]
-            pub disk_check_threads: usize,
+            #[serde(default = "system_disk_check_use_inotify")]
+            pub disk_check_use_inotify: bool,
             #[serde(default)]
             pub disk_limiter_mode: crate::server::filesystem::limiter::DiskLimiterMode,
             #[serde(default = "system_activity_send_interval")]
@@ -1072,7 +1072,7 @@ impl DockerOverhead {
     /// means, <=1024MiB ram = 1.05 multiplier,
     /// <=2048MiB ram = 1.10 multiplier,
     /// >2048MiB ram = 1.05 multiplier (default_multiplier)
-    pub fn get_mutiplier(&self, memory: MiB) -> f64 {
+    pub fn get_multiplier(&self, memory: MiB) -> f64 {
         if !self.r#override {
             if memory.as_mib() <= 2048 {
                 return 1.15;
@@ -1096,7 +1096,7 @@ impl DockerOverhead {
 
     #[inline]
     pub fn get_memory(&self, memory: MiB) -> MiB {
-        let multiplier = self.get_mutiplier(memory);
+        let multiplier = self.get_multiplier(memory);
 
         MiB((memory.as_mib() as f64 * multiplier) as u64)
     }
@@ -1507,7 +1507,7 @@ impl Config {
         let release =
             std::fs::read_to_string("/etc/os-release").unwrap_or_else(|_| "unknown".to_string());
 
-        if release.contains("distroless") {
+        if release.contains("distroless") || std::env::var("OCI_CONTAINER").is_ok() {
             self.system.username =
                 std::env::var("WINGS_USERNAME").map_or_else(|_| system_username(), |u| u.into());
             self.system.user.uid = std::env::var("WINGS_UID")
@@ -1520,50 +1520,96 @@ impl Config {
             return Ok(());
         }
 
-        if self.system.user.rootless.enabled {
-            let user = users::get_current_uid();
-            let group = users::get_current_gid();
+        let users = sysinfo::Users::new_with_refreshed_list();
 
-            if let Some(username) = users::get_current_username() {
-                self.system.username = username.to_string_lossy().to_compact_string();
+        if self.system.user.rootless.enabled
+            && let Ok(current_pid) = sysinfo::get_current_pid()
+        {
+            let mut sys = sysinfo::System::new_all();
+            sys.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[current_pid]),
+                false,
+                sysinfo::ProcessRefreshKind::nothing().with_memory(),
+            );
+
+            if let Some(process) = sys.process(current_pid) {
+                if let Some(user) = process.user_id() {
+                    if let Some(user) = users.get_user_by_id(user) {
+                        self.system.username = user.name().to_compact_string();
+                    }
+
+                    self.system.user.uid = **user;
+                    if self.system.user.rootless.container_uid == 0 {
+                        self.system.user.rootless.container_uid = self.system.user.uid;
+                    }
+                }
+                if let Some(group) = process.group_id() {
+                    self.system.user.gid = *group;
+                    if self.system.user.rootless.container_gid == 0 {
+                        self.system.user.rootless.container_gid = self.system.user.gid;
+                    }
+                }
+
+                if self.system.user.uid == 0 || self.system.user.gid == 0 {
+                    return Err(anyhow::anyhow!(
+                        "refusing to use user with UID or GID of 0 (root), please check your wings config and change system.username to a non-root user or disable rootless mode"
+                    ));
+                }
+
+                return Ok(());
             }
+        }
 
-            self.system.user.uid = user;
-            self.system.user.gid = group;
+        let mut found_user = false;
+        for user in users.list() {
+            if user.name() == self.system.username {
+                self.system.user.uid = **user.id();
+                self.system.user.gid = *user.group_id();
 
+                if self.system.user.uid == 0 || self.system.user.gid == 0 {
+                    return Err(anyhow::anyhow!(
+                        "refusing to use user with UID or GID of 0 (root), please check your wings config and change system.username to a non-root user"
+                    ));
+                }
+
+                found_user = true;
+                break;
+            }
+        }
+
+        if found_user {
             return Ok(());
         }
 
-        if let Some(user) = users::get_user_by_name(&self.system.username) {
-            self.system.user.uid = user.uid();
-            self.system.user.gid = user.primary_group_id();
-
-            return Ok(());
-        }
-
-        let command = if release.contains("alpine") {
+        let output = if release.contains("alpine") {
             std::process::Command::new("addgroup")
                 .arg("-S")
                 .arg(&self.system.username)
                 .output()
                 .context("failed to create group")?;
 
-            format!(
-                "adduser -S -D -H -G {} -s /sbin/nologin {}",
-                self.system.username, self.system.username
-            )
+            std::process::Command::new("adduser")
+                .arg("-S")
+                .arg("-D")
+                .arg("-H")
+                .arg("-G")
+                .arg(&self.system.username)
+                .arg("-s")
+                .arg("/sbin/nologin")
+                .arg(&self.system.username)
+                .output()
+                .context(format!("failed to create user {}", self.system.username))?
         } else {
-            format!(
-                "useradd --system --no-create-home --shell /usr/sbin/nologin {}",
-                self.system.username
-            )
+            std::process::Command::new("useradd")
+                .arg("--system")
+                .arg("--no-create-home")
+                .arg("--shell")
+                .arg("/usr/sbin/nologin")
+                .arg(&self.system.username)
+                .output()
+                .context(format!("failed to create user {}", self.system.username))?
         };
 
-        let split = command.split_whitespace().collect::<Vec<_>>();
-        let output = std::process::Command::new(split[0])
-            .args(&split[1..])
-            .output()
-            .context(format!("failed to create user {}", self.system.username))?;
         if !output.status.success() {
             return Err(
                 anyhow::anyhow!("failed to create user {}", self.system.username).context(format!(
@@ -1574,11 +1620,27 @@ impl Config {
             );
         }
 
-        let user = users::get_user_by_name(&self.system.username)
-            .context(format!("failed to get user {}", self.system.username))?;
+        let users = sysinfo::Users::new_with_refreshed_list();
 
-        self.system.user.uid = user.uid();
-        self.system.user.gid = user.primary_group_id();
+        let Some(user) = users
+            .list()
+            .iter()
+            .find(|u| u.name() == self.system.username)
+        else {
+            return Err(anyhow::anyhow!(
+                "failed to find user {} after creating it",
+                self.system.username
+            ));
+        };
+
+        self.system.user.uid = **user.id();
+        self.system.user.gid = *user.group_id();
+
+        if self.system.user.uid == 0 || self.system.user.gid == 0 {
+            return Err(anyhow::anyhow!(
+                "refusing to use user with UID or GID of 0 (root), please check your wings config and change system.username to a non-root user"
+            ));
+        }
 
         Ok(())
     }
@@ -1646,6 +1708,13 @@ impl Config {
 
     pub fn data_path(&self, server_uuid: uuid::Uuid) -> PathBuf {
         Path::new(&self.system.data_directory).join(server_uuid.to_compact_string())
+    }
+
+    pub fn daemon_prelude(&self) -> compact_str::CompactString {
+        ansi_term::Color::Yellow
+            .bold()
+            .paint(format!("[{} Daemon]:", self.app_name))
+            .to_compact_string()
     }
 
     pub async fn ensure_network(&self, client: &bollard::Docker) -> Result<(), anyhow::Error> {

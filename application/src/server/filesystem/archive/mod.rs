@@ -176,7 +176,6 @@ impl StreamableArchiveFormat {
     }
 }
 
-#[inline]
 pub fn zip_entry_get_modified_time(
     entry: &zip::read::ZipFile<impl std::io::Read>,
 ) -> Option<cap_std::time::SystemTime> {
@@ -186,6 +185,14 @@ pub fn zip_entry_get_modified_time(
         {
             return Some(cap_std::time::SystemTime::from_std(
                 std::time::UNIX_EPOCH + std::time::Duration::from_secs(mod_time as u64),
+            ));
+        }
+
+        if let zip::extra_fields::ExtraField::Ntfs(ntfs) = field {
+            let mtime = sevenz_rust2::NtTime::new(ntfs.mtime());
+
+            return Some(cap_std::time::SystemTime::from_std(
+                std::time::SystemTime::from(mtime),
             ));
         }
     }
@@ -210,6 +217,30 @@ pub fn zip_entry_get_modified_time(
                     chrono_date.and_time(chrono_time).and_utc().timestamp() as u64,
                 ),
         ));
+    }
+
+    None
+}
+
+pub fn zip_entry_get_created_time(
+    entry: &zip::read::ZipFile<impl std::io::Read>,
+) -> Option<cap_std::time::SystemTime> {
+    for field in entry.extra_data_fields() {
+        if let zip::extra_fields::ExtraField::ExtendedTimestamp(ext) = field
+            && let Some(cr_time) = ext.cr_time()
+        {
+            return Some(cap_std::time::SystemTime::from_std(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(cr_time as u64),
+            ));
+        }
+
+        if let zip::extra_fields::ExtraField::Ntfs(ntfs) = field {
+            let ctime = sevenz_rust2::NtTime::new(ntfs.ctime());
+
+            return Some(cap_std::time::SystemTime::from_std(
+                std::time::SystemTime::from(ctime),
+            ));
+        }
     }
 
     None
@@ -279,17 +310,16 @@ impl Archive {
         };
 
         match inferred.map(|f| f.mime_type()) {
-            Some("application/gzip") => (CompressionType::Gz, get_archive_format()),
-            Some("application/x-bzip2") => (CompressionType::Bz2, get_archive_format()),
-            Some("application/x-xz") => (CompressionType::Xz, get_archive_format()),
-            Some("application/x-lzip") => (CompressionType::Lzip, get_archive_format()),
-            Some("application/x-lz4") => (CompressionType::Lz4, get_archive_format()),
-            Some("application/zstd") => (CompressionType::Zstd, get_archive_format()),
             Some("application/zip") => (CompressionType::None, ArchiveType::Zip),
             Some("application/x-tar") => (CompressionType::None, ArchiveType::Tar),
             Some("application/vnd.rar") => (CompressionType::None, ArchiveType::Rar),
             Some("application/x-7z-compressed") => (CompressionType::None, ArchiveType::SevenZip),
-            _ => (CompressionType::None, get_archive_format()),
+            mime => (
+                mime.map_or(CompressionType::None, |mime| {
+                    CompressionType::from_mime(mime)
+                }),
+                get_archive_format(),
+            ),
         }
     }
 

@@ -4,10 +4,12 @@ use crate::{
         counting_reader::CountingReader,
     },
     models::DirectoryEntry,
+    routes::MimeCacheValue,
     server::filesystem::{
         archive::{StreamableArchiveFormat, multi_reader::MultiReader},
         cap::FileType,
         encode_mode,
+        usage::UsedSpace,
         virtualfs::{
             AsyncFileRead, AsyncReadableFileStream, ByteRange, DirectoryListing,
             DirectoryStreamWalk, DirectoryWalk, FileMetadata, FileRead, IsIgnoredFn,
@@ -28,30 +30,70 @@ use std::{
 };
 use tokio::io::AsyncWriteExt;
 
+pub trait CmpSortExt {
+    fn cmp_sort(
+        &self,
+        other: &Self,
+        sort: crate::models::DirectorySortingMode,
+    ) -> std::cmp::Ordering;
+}
+
+impl CmpSortExt for sevenz_rust2::ArchiveEntry {
+    fn cmp_sort(
+        &self,
+        other: &Self,
+        sort: crate::models::DirectorySortingMode,
+    ) -> std::cmp::Ordering {
+        use crate::models::DirectorySortingMode::*;
+
+        match sort {
+            NameAsc => self.name().cmp(other.name()),
+            NameDesc => other.name().cmp(self.name()),
+            SizeAsc => self.size.cmp(&other.size),
+            SizeDesc => other.size.cmp(&self.size),
+            PhysicalSizeAsc => self.compressed_size.cmp(&other.compressed_size),
+            PhysicalSizeDesc => other.compressed_size.cmp(&self.compressed_size),
+            ModifiedAsc => self.last_modified_date().cmp(&other.last_modified_date()),
+            ModifiedDesc => other.last_modified_date().cmp(&self.last_modified_date()),
+            CreatedAsc => self.creation_date().cmp(&other.creation_date()),
+            CreatedDesc => other.creation_date().cmp(&self.creation_date()),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct VirtualSevenZipArchive {
     pub server: crate::server::Server,
     pub archive: Arc<sevenz_rust2::Archive>,
-    pub mime_cache: moka::sync::Cache<usize, &'static str>,
+    pub archive_created: chrono::DateTime<chrono::Utc>,
+    pub mime_cache: moka::sync::Cache<usize, MimeCacheValue>,
     pub reader: MultiReader,
-    pub sizes: Arc<Vec<(u64, PathBuf)>>,
+    pub sizes: Arc<Vec<(UsedSpace, PathBuf)>>,
 }
 
 impl VirtualSevenZipArchive {
     pub fn new(
         server: crate::server::Server,
         archive: Arc<sevenz_rust2::Archive>,
+        archive_created: chrono::DateTime<chrono::Utc>,
         reader: MultiReader,
     ) -> Self {
-        let sizes = archive
+        let mut sizes = archive
             .files
             .iter()
-            .map(|entry| (entry.size, PathBuf::from(&entry.name)))
+            .map(|entry| {
+                (
+                    UsedSpace::new(entry.size, entry.compressed_size),
+                    PathBuf::from(&entry.name),
+                )
+            })
             .collect::<Vec<_>>();
+        sizes.shrink_to_fit();
 
         Self {
             server,
             archive,
+            archive_created,
             mime_cache: moka::sync::Cache::new(10240),
             reader,
             sizes: Arc::new(sizes),
@@ -80,72 +122,62 @@ impl VirtualSevenZipArchive {
         })
         .await??;
 
-        Ok(Self::new(server, Arc::new(archive), reader))
+        let metadata = server.filesystem.async_metadata(archive_path).await?;
+
+        Ok(Self::new(
+            server,
+            Arc::new(archive),
+            metadata
+                .created()
+                .map_or_else(|_| Default::default(), |dt| dt.into_std().into()),
+            reader,
+        ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn seven_zip_entry_to_directory_entry(
+        archive_created: &chrono::DateTime<chrono::Utc>,
         path: &Path,
         entry_index: usize,
-        mime_cache: &moka::sync::Cache<usize, &'static str>,
-        sizes: &[(u64, PathBuf)],
+        mime_cache: &moka::sync::Cache<usize, MimeCacheValue>,
+        sizes: &[(UsedSpace, PathBuf)],
         buffer: Option<&[u8]>,
         entry: &sevenz_rust2::ArchiveEntry,
         reader: &mut dyn Read,
     ) -> DirectoryEntry {
-        let size = if entry.is_directory() {
-            sizes
+        let (size, size_physical) = if entry.is_directory() {
+            let space: UsedSpace = sizes
                 .iter()
                 .filter(|(_, name)| name.starts_with(path))
                 .map(|(size, _)| *size)
-                .sum()
+                .sum();
+
+            (space.get_logical(), space.get_physical())
         } else {
-            entry.size()
+            (entry.size, entry.compressed_size)
         };
 
-        let mime_type = if entry.is_directory() {
-            "inode/directory"
-        } else if let Some(mime_type) = mime_cache.get(&entry_index) {
-            mime_type
+        let detected_mime = if entry.is_directory() {
+            MimeCacheValue::directory()
+        } else if let Some(detected_mime) = mime_cache.get(&entry_index) {
+            detected_mime
         } else if let Some(buffer) = buffer {
-            let mime_type = if let Some(mime) = infer::get(buffer) {
-                mime.mime_type()
-            } else if let Some(mime) = new_mime_guess::from_path(entry.name()).iter_raw().next() {
-                mime
-            } else if crate::utils::is_valid_utf8_slice(buffer) || buffer.is_empty() {
-                "text/plain"
-            } else {
-                "application/octet-stream"
-            };
+            let detected_mime = crate::utils::detect_mime_type(path, Some(buffer));
 
-            mime_cache.insert(entry_index, mime_type);
-
-            mime_type
+            mime_cache.insert(entry_index, detected_mime);
+            detected_mime
         } else {
             let mut buffer = [0; 64];
             let buffer = if reader.read(&mut buffer).is_err() {
                 None
             } else {
-                Some(&buffer)
+                Some(&buffer[..])
             };
 
-            let mime_type = if let Some(buffer) = buffer {
-                if let Some(mime) = infer::get(buffer) {
-                    mime.mime_type()
-                } else if let Some(mime) = new_mime_guess::from_path(entry.name()).iter_raw().next()
-                {
-                    mime
-                } else if crate::utils::is_valid_utf8_slice(buffer) || buffer.is_empty() {
-                    "text/plain"
-                } else {
-                    "application/octet-stream"
-                }
-            } else {
-                "application/octet-stream"
-            };
+            let detected_mime = crate::utils::detect_mime_type(path, buffer);
 
-            mime_cache.insert(entry_index, mime_type);
-
-            mime_type
+            mime_cache.insert(entry_index, detected_mime);
+            detected_mime
         };
 
         let mode = if entry.is_directory() { 0o755 } else { 0o644 };
@@ -156,23 +188,26 @@ impl VirtualSevenZipArchive {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into(),
-            created: if entry.has_creation_date {
-                std::time::SystemTime::from(entry.creation_date).into()
-            } else {
-                Default::default()
-            },
+            mode: encode_mode(mode),
+            mode_bits: compact_str::format_compact!("{:o}", mode),
+            size,
+            size_physical,
+            editable: !entry.is_directory() && detected_mime.valid_utf8,
+            inner_editable: !entry.is_directory() && detected_mime.valid_inner_utf8,
+            directory: entry.is_directory(),
+            file: !entry.is_directory(),
+            symlink: false,
+            mime: detected_mime.mime,
             modified: if entry.has_last_modified_date {
                 std::time::SystemTime::from(entry.last_modified_date).into()
             } else {
                 Default::default()
             },
-            mode: encode_mode(mode),
-            mode_bits: compact_str::format_compact!("{:o}", mode),
-            size,
-            directory: entry.is_directory(),
-            file: !entry.is_directory(),
-            symlink: false,
-            mime: mime_type,
+            created: if entry.has_creation_date {
+                std::time::SystemTime::from(entry.creation_date).into()
+            } else {
+                *archive_created
+            },
         }
     }
 
@@ -259,6 +294,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<DirectoryEntry, anyhow::Error> {
         let archive = self.archive.clone();
+        let archive_created = self.archive_created;
         let mime_cache = self.mime_cache.clone();
         let sizes = self.sizes.clone();
         let mut reader = self.reader.clone();
@@ -291,6 +327,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                         .for_each_entries(&mut |block_entry, reader| {
                             if block_entry.name() == entry.name() {
                                 result = Some(Self::seven_zip_entry_to_directory_entry(
+                                    &archive_created,
                                     &path,
                                     entry_index,
                                     &mime_cache,
@@ -309,6 +346,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                     result.ok_or_else(|| anyhow::anyhow!("Failed to read 7z entry for metadata"))
                 }
                 _ => Ok(Self::seven_zip_entry_to_directory_entry(
+                    &archive_created,
                     &path,
                     entry_index,
                     &mime_cache,
@@ -330,6 +368,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         buffer: &[u8],
     ) -> Result<DirectoryEntry, anyhow::Error> {
         let archive = self.archive.clone();
+        let archive_created = self.archive_created;
         let mime_cache = self.mime_cache.clone();
         let sizes = self.sizes.clone();
         let path = path.as_ref().to_path_buf();
@@ -344,6 +383,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                 .ok_or_else(|| anyhow::anyhow!("Entry not found"))?;
 
             Ok::<_, anyhow::Error>(Self::seven_zip_entry_to_directory_entry(
+                &archive_created,
                 &path,
                 entry_index,
                 &mime_cache,
@@ -364,8 +404,10 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
         per_page: Option<usize>,
         page: usize,
         is_ignored: IsIgnoredFn,
+        sort: crate::models::DirectorySortingMode,
     ) -> Result<DirectoryListing, anyhow::Error> {
         let archive = self.archive.clone();
+        let archive_created = self.archive_created;
         let mime_cache = self.mime_cache.clone();
         let mut reader = self.reader.clone();
         let sizes = self.sizes.clone();
@@ -399,14 +441,14 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                     }
 
                     if entry.is_directory() {
-                        directory_entries.push((i, entry.name()));
+                        directory_entries.push((i, entry));
                     } else {
-                        other_entries.push((i, entry.name()));
+                        other_entries.push((i, entry));
                     }
                 }
 
-                directory_entries.sort_unstable_by(|a, b| a.1.cmp(b.1));
-                other_entries.sort_unstable_by(|a, b| a.1.cmp(b.1));
+                directory_entries.sort_unstable_by(|a, b| a.1.cmp_sort(b.1, sort));
+                other_entries.sort_unstable_by(|a, b| a.1.cmp_sort(b.1, sort));
 
                 let total_entries = directory_entries.len() + other_entries.len();
                 let mut entries = Vec::new();
@@ -415,15 +457,14 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                     .into_iter()
                     .chain(other_entries.into_iter());
 
-                let target_entries: Vec<(usize, &str)> = if let Some(per_page) = per_page {
+                let target_entries: Vec<_> = if let Some(per_page) = per_page {
                     let start = (page - 1) * per_page;
                     iterator.skip(start).take(per_page).collect()
                 } else {
                     iterator.collect()
                 };
 
-                for (entry_index, _) in target_entries {
-                    let archive_entry = &archive.files[entry_index];
+                for (entry_index, archive_entry) in target_entries {
                     let entry_path = Path::new(archive_entry.name());
 
                     let needs_read =
@@ -449,6 +490,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                                 }
 
                                 entries.push(Self::seven_zip_entry_to_directory_entry(
+                                    &archive_created,
                                     entry_path,
                                     entry_index,
                                     &mime_cache,
@@ -463,6 +505,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
 
                             if !entry_processed {
                                 entries.push(Self::seven_zip_entry_to_directory_entry(
+                                    &archive_created,
                                     entry_path,
                                     entry_index,
                                     &mime_cache,
@@ -474,6 +517,7 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                             }
                         }
                         _ => entries.push(Self::seven_zip_entry_to_directory_entry(
+                            &archive_created,
                             entry_path,
                             entry_index,
                             &mime_cache,

@@ -8,6 +8,37 @@ use utoipa_axum::{
 pub(crate) mod _server_;
 pub(crate) mod files;
 
+pub(crate) mod get {
+    use crate::{
+        response::{ApiResponse, ApiResponseResult},
+        routes::{ApiError, GetState},
+    };
+    use std::{collections::HashMap, sync::atomic::Ordering};
+
+    #[utoipa::path(get, path = "/", responses(
+        (status = OK, body = HashMap<uuid::Uuid, crate::models::TransferProgress>),
+        (status = NOT_FOUND, body = ApiError),
+    ))]
+    pub async fn route(state: GetState) -> ApiResponseResult {
+        let mut transfers = HashMap::new();
+
+        for server in state.server_manager.get_servers().await.iter() {
+            if let Some(outgoing_transfer) = server.outgoing_transfer.read().await.as_ref() {
+                transfers.insert(
+                    server.uuid,
+                    crate::models::TransferProgress {
+                        archive_progress: outgoing_transfer.bytes_archived.load(Ordering::Relaxed),
+                        network_progress: outgoing_transfer.bytes_sent.load(Ordering::Relaxed),
+                        total: outgoing_transfer.bytes_total.load(Ordering::Relaxed),
+                    },
+                );
+            }
+        }
+
+        ApiResponse::new_serialized(transfers).ok()
+    }
+}
+
 pub(crate) mod post {
     use crate::{
         io::{
@@ -29,7 +60,7 @@ pub(crate) mod post {
     use futures::TryStreamExt;
     use serde::Serialize;
     use sha1::Digest;
-    use std::{io::Write, path::Path, str::FromStr};
+    use std::{io::Write, path::Path, str::FromStr, sync::atomic::Ordering};
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Serialize)]
@@ -75,8 +106,8 @@ pub(crate) mod post {
             }
         };
 
-        if !payload.validate(&state.config.jwt).await {
-            return ApiResponse::error("invalid token")
+        if let Err(err) = payload.validate(&state.config.jwt).await {
+            return ApiResponse::error(&format!("invalid token: {err}"))
                 .with_status(StatusCode::UNAUTHORIZED)
                 .ok();
         }
@@ -115,9 +146,7 @@ pub(crate) mod post {
                 .create_server(&state, server_data, false)
                 .await;
 
-            server
-                .transferring
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            server.transferring.store(true, Ordering::SeqCst);
             server
         } else {
             let mut tries = 0;
@@ -594,9 +623,7 @@ pub(crate) mod post {
                                 .client
                                 .set_server_transfer(subject, true, backups)
                                 .await?;
-                            server
-                                .transferring
-                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            server.transferring.store(false, Ordering::SeqCst);
                             server
                                 .websocket
                                 .send(crate::server::websocket::WebsocketMessage::new(
@@ -640,9 +667,7 @@ pub(crate) mod post {
                             .client
                             .set_server_transfer(subject, true, backups)
                             .await?;
-                        server
-                            .transferring
-                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                        server.transferring.store(false, Ordering::SeqCst);
                         server
                             .websocket
                             .send(crate::server::websocket::WebsocketMessage::new(
@@ -697,8 +722,20 @@ pub(crate) mod post {
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
+        .routes(
+            routes!(get::route).layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::routes::api::auth,
+            )),
+        )
         .routes(routes!(post::route).layer(DefaultBodyLimit::disable()))
         .nest("/files", files::router(state))
-        .nest("/{server}", _server_::router(state))
+        .nest(
+            "/{server}",
+            _server_::router(state).route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::routes::api::auth,
+            )),
+        )
         .with_state(state.clone())
 }

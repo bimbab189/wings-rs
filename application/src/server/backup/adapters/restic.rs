@@ -6,6 +6,7 @@ use crate::{
     models::DirectoryEntry,
     remote::backups::{RawServerBackup, ResticBackupConfiguration},
     response::ApiResponse,
+    routes::MimeCacheValue,
     server::{
         backup::{Backup, BackupCleanExt, BackupCreateExt, BackupExt, BackupFindExt},
         filesystem::{
@@ -71,6 +72,25 @@ pub struct ResticDirectoryEntry {
     mode: u32,
     size: Option<u64>,
     mtime: chrono::DateTime<chrono::Utc>,
+}
+
+impl ResticDirectoryEntry {
+    pub fn cmp_sort(
+        &self,
+        other: &Self,
+        sort: crate::models::DirectorySortingMode,
+    ) -> std::cmp::Ordering {
+        use crate::models::DirectorySortingMode::*;
+
+        match sort {
+            NameAsc => self.path.cmp(&other.path),
+            NameDesc => other.path.cmp(&self.path),
+            SizeAsc | PhysicalSizeAsc => self.size.unwrap_or(0).cmp(&other.size.unwrap_or(0)),
+            SizeDesc | PhysicalSizeDesc => other.size.unwrap_or(0).cmp(&self.size.unwrap_or(0)),
+            ModifiedAsc | CreatedAsc => self.mtime.cmp(&other.mtime),
+            ModifiedDesc | CreatedDesc => other.mtime.cmp(&self.mtime),
+        }
+    }
 }
 
 pub struct ResticBackup {
@@ -786,7 +806,7 @@ impl BackupExt for ResticBackup {
             }
         }
 
-        server.filesystem.rerun_disk_checker();
+        server.filesystem.rerun_disk_checker().await;
 
         Ok(())
     }
@@ -909,24 +929,12 @@ impl VirtualResticBackup {
             _ => 0,
         };
 
-        let mime_type = if matches!(entry.r#type, ResticEntryType::Dir) {
-            "inode/directory"
+        let detected_mime = if matches!(entry.r#type, ResticEntryType::Dir) {
+            MimeCacheValue::directory()
         } else if matches!(entry.r#type, ResticEntryType::Symlink) {
-            "inode/symlink"
-        } else if let Some(buffer) = buffer {
-            if let Some(mime) = infer::get(buffer) {
-                mime.mime_type()
-            } else if let Some(mime) = new_mime_guess::from_path(&entry.path).iter_raw().next() {
-                mime
-            } else if crate::utils::is_valid_utf8_slice(buffer) || buffer.is_empty() {
-                "text/plain"
-            } else {
-                "application/octet-stream"
-            }
+            MimeCacheValue::symlink()
         } else {
-            new_mime_guess::from_path(&entry.path)
-                .first_raw()
-                .unwrap_or("application/octet-stream")
+            crate::utils::detect_mime_type(path, buffer)
         };
 
         DirectoryEntry {
@@ -935,15 +943,19 @@ impl VirtualResticBackup {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into(),
-            created: chrono::DateTime::from_timestamp(0, 0).unwrap_or_default(),
-            modified: entry.mtime,
             mode: encode_mode(entry.mode),
             mode_bits: compact_str::format_compact!("{:o}", entry.mode & 0o777),
             size,
+            size_physical: size,
+            editable: matches!(entry.r#type, ResticEntryType::File) && detected_mime.valid_utf8,
+            inner_editable: matches!(entry.r#type, ResticEntryType::File)
+                && detected_mime.valid_inner_utf8,
             directory: matches!(entry.r#type, ResticEntryType::Dir),
             file: matches!(entry.r#type, ResticEntryType::File),
             symlink: matches!(entry.r#type, ResticEntryType::Symlink),
-            mime: mime_type,
+            mime: detected_mime.mime,
+            modified: entry.mtime,
+            created: chrono::DateTime::from_timestamp(0, 0).unwrap_or_default(),
         }
     }
 
@@ -1046,6 +1058,7 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
         per_page: Option<usize>,
         page: usize,
         is_ignored: IsIgnoredFn,
+        sort: crate::models::DirectorySortingMode,
     ) -> Result<DirectoryListing, anyhow::Error> {
         let path = path.as_ref().to_path_buf();
         let mut directory_entries = Vec::new();
@@ -1075,8 +1088,8 @@ impl VirtualReadableFilesystem for VirtualResticBackup {
             }
         }
 
-        directory_entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-        other_entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        directory_entries.sort_unstable_by(|a, b| a.cmp_sort(b, sort));
+        other_entries.sort_unstable_by(|a, b| a.cmp_sort(b, sort));
 
         let total_entries = directory_entries.len() + other_entries.len();
         let mut entries = Vec::new();

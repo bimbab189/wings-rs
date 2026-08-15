@@ -1,6 +1,6 @@
 use bollard::secret::ContainerStateStatusEnum;
 use compact_str::ToCompactString;
-use futures_util::StreamExt;
+use futures::StreamExt;
 use serde_json::json;
 use std::{
     collections::HashMap,
@@ -153,8 +153,6 @@ impl Server {
 
         Box::pin(async move {
             let old_sender = server.clone().websocket_sender.write().await.replace(tokio::spawn(async move {
-                let mut prev_usage = resources::ResourceUsage::default();
-
                 let mut container_channel = match container.update_reciever.lock().await.take() {
                     Some(channel) => channel,
                     None => {
@@ -172,22 +170,20 @@ impl Server {
                         None => break,
                     };
 
-                    if usage != prev_usage {
-                        let message = websocket::WebsocketMessage::new(
-                            websocket::WebsocketEvent::ServerStats,
-                            [serde_json::to_string(&usage).unwrap().into()].into(),
+                    let message = websocket::WebsocketMessage::new(
+                        websocket::WebsocketEvent::ServerStats,
+                        [serde_json::to_string(&usage).unwrap().into()].into(),
+                    );
+
+                    if let Err(err) = server.websocket.send(message) {
+                        tracing::error!(
+                            server = %server.uuid,
+                            "failed to send websocket message: {}",
+                            err
                         );
-
-                        if let Err(err) = server.websocket.send(message) {
-                            tracing::error!(
-                                server = %server.uuid,
-                                "failed to send websocket message: {}",
-                                err
-                            );
-                        }
-
-                        prev_usage = usage;
                     }
+
+                    server.filesystem.disk_checker_state_dirty.store(true, Ordering::Relaxed);
 
                     if server.filesystem.is_full().await
                         && server.state.get_state() != state::ServerState::Offline
@@ -819,9 +815,7 @@ impl Server {
     }
 
     pub fn log_daemon_with_prelude(&self, message: &str) {
-        let prelude = ansi_term::Color::Yellow
-            .bold()
-            .paint(format!("[{} Daemon]:", self.app_state.config.app_name));
+        let prelude = self.app_state.config.daemon_prelude();
 
         self.websocket
             .send(websocket::WebsocketMessage::new(

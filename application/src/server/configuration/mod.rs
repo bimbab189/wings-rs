@@ -61,6 +61,7 @@ nestify::nest! {
         pub invocation: compact_str::CompactString,
         pub skip_egg_scripts: bool,
 
+        pub entrypoint: Option<Vec<String>>,
         pub environment: HashMap<compact_str::CompactString, serde_json::Value>,
         #[serde(default)]
         pub labels: HashMap<String, String>,
@@ -144,17 +145,19 @@ impl ServerConfiguration {
     }
 
     fn vmounts(&self, config: &crate::config::Config) -> Vec<Mount> {
-        vec![
-            Mount {
-                default: false,
-                target: "/etc/machine-id".into(),
-                source: self
-                    .machine_id_path(config)
-                    .to_string_lossy()
-                    .to_compact_string(),
-                read_only: true,
-            },
-            Mount {
+        let mut mounts = Vec::new();
+
+        mounts.push(Mount {
+            default: false,
+            target: "/etc/machine-id".into(),
+            source: self
+                .machine_id_path(config)
+                .to_string_lossy()
+                .to_compact_string(),
+            read_only: true,
+        });
+        if !config.system.user.rootless.enabled {
+            mounts.push(Mount {
                 default: false,
                 target: "/sys/class/dmi/id/product_uuid".into(),
                 source: self
@@ -162,8 +165,10 @@ impl ServerConfiguration {
                     .to_string_lossy()
                     .to_compact_string(),
                 read_only: true,
-            },
-        ]
+            });
+        }
+
+        mounts
     }
 
     async fn mounts(
@@ -583,6 +588,7 @@ impl ServerConfiguration {
             }),
             hostname: Some(self.uuid.to_string()),
             domainname: string_to_option(&config.docker.domainname),
+            entrypoint: self.entrypoint.clone(),
             image: Some(self.container.image.trim_end_matches('~').to_string()),
             env: Some(self.environment(config)),
             user: Some(if config.system.user.rootless.enabled {

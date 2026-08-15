@@ -5,7 +5,6 @@ use utoipa::ToSchema;
 
 #[derive(ToSchema, Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[schema(rename_all = "snake_case")]
 pub enum ServerPowerAction {
     Start,
     Stop,
@@ -32,7 +31,6 @@ impl FromStr for ServerPowerAction {
 
 #[derive(ToSchema, Default, Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[schema(rename_all = "snake_case")]
 pub enum ServerAutoStartBehavior {
     Always,
     #[default]
@@ -42,7 +40,6 @@ pub enum ServerAutoStartBehavior {
 
 #[derive(ToSchema, Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[schema(rename_all = "snake_case")]
 pub enum ServerBackupStatus {
     Starting,
     Finished,
@@ -57,18 +54,37 @@ pub struct Server {
     pub configuration: crate::server::configuration::ServerConfiguration,
 }
 
+#[derive(ToSchema, Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectorySortingMode {
+    #[default]
+    NameAsc,
+    NameDesc,
+    SizeAsc,
+    SizeDesc,
+    PhysicalSizeAsc,
+    PhysicalSizeDesc,
+    ModifiedAsc,
+    ModifiedDesc,
+    CreatedAsc,
+    CreatedDesc,
+}
+
 #[derive(ToSchema, Serialize)]
 pub struct DirectoryEntry {
     pub name: compact_str::CompactString,
-    pub created: chrono::DateTime<chrono::Utc>,
-    pub modified: chrono::DateTime<chrono::Utc>,
     pub mode: compact_str::CompactString,
     pub mode_bits: compact_str::CompactString,
     pub size: u64,
+    pub size_physical: u64,
+    pub editable: bool,
+    pub inner_editable: bool,
     pub directory: bool,
     pub file: bool,
     pub symlink: bool,
     pub mime: &'static str,
+    pub created: chrono::DateTime<chrono::Utc>,
+    pub modified: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(ToSchema, Serialize)]
@@ -92,6 +108,13 @@ pub struct PullProgress {
     pub status: PullProgressStatus,
     pub progress: i64,
     pub total: i64,
+}
+
+#[derive(ToSchema, Serialize)]
+pub struct TransferProgress {
+    pub archive_progress: u64,
+    pub network_progress: u64,
+    pub total: u64,
 }
 
 #[derive(ToSchema, Serialize)]

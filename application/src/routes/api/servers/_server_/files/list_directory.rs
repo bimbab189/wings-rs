@@ -74,6 +74,7 @@ pub(crate) mod get {
                 Some(state.config.api.directory_entry_limit),
                 1,
                 is_ignored,
+                crate::models::DirectorySortingMode::NameAsc,
             )
             .await?;
 

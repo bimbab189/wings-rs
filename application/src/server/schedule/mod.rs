@@ -25,7 +25,9 @@ pub enum ScheduleTrigger {
         status: crate::models::ServerBackupStatus,
     },
     ConsoleLine {
-        contains: String,
+        contains: compact_str::CompactString,
+        #[serde(default)]
+        case_insensitive: bool,
         output_into: Option<actions::ScheduleVariable>,
     },
     Crash,
@@ -52,13 +54,15 @@ impl PartialEq for ScheduleTrigger {
             (
                 ScheduleTrigger::ConsoleLine {
                     contains: c1,
+                    case_insensitive: ci1,
                     output_into: o1,
                 },
                 ScheduleTrigger::ConsoleLine {
                     contains: c2,
+                    case_insensitive: ci2,
                     output_into: o2,
                 },
-            ) => c1 == c2 && o1 == o2,
+            ) => c1 == c2 && ci1 == ci2 && o1 == o2,
             (ScheduleTrigger::Crash, ScheduleTrigger::Crash) => true,
             _ => false,
         }
@@ -449,6 +453,7 @@ impl Schedule {
                 }
                 ScheduleTrigger::ConsoleLine {
                     contains,
+                    case_insensitive,
                     output_into,
                 } => {
                     tasks.push(tokio::task::spawn({
@@ -466,22 +471,45 @@ impl Schedule {
                                     }
                                 };
 
-                                while let Ok(line) = stdout.recv().await {
-                                    if line.contains(&contains) {
-                                        if let Some(output_into) = &output_into {
-                                            let mut execution_context =
-                                                ScheduleExecutionContext::new(schedule_uuid);
-                                            execution_context.store_variable(
-                                                output_into.clone(),
-                                                line.to_compact_string(),
-                                            );
-                                            nest_execution_context
-                                                .lock()
-                                                .await
-                                                .replace(execution_context);
-                                        }
+                                if case_insensitive {
+                                    let contains = contains.to_lowercase();
 
-                                        executor_notifier.notify_one();
+                                    while let Ok(line) = stdout.recv().await {
+                                        if line.to_lowercase().contains(&*contains) {
+                                            if let Some(output_into) = &output_into {
+                                                let mut execution_context =
+                                                    ScheduleExecutionContext::new(schedule_uuid);
+                                                execution_context.store_variable(
+                                                    output_into.clone(),
+                                                    line.to_compact_string(),
+                                                );
+                                                nest_execution_context
+                                                    .lock()
+                                                    .await
+                                                    .replace(execution_context);
+                                            }
+
+                                            executor_notifier.notify_one();
+                                        }
+                                    }
+                                } else {
+                                    while let Ok(line) = stdout.recv().await {
+                                        if line.contains(&*contains) {
+                                            if let Some(output_into) = &output_into {
+                                                let mut execution_context =
+                                                    ScheduleExecutionContext::new(schedule_uuid);
+                                                execution_context.store_variable(
+                                                    output_into.clone(),
+                                                    line.to_compact_string(),
+                                                );
+                                                nest_execution_context
+                                                    .lock()
+                                                    .await
+                                                    .replace(execution_context);
+                                            }
+
+                                            executor_notifier.notify_one();
+                                        }
                                     }
                                 }
                             }

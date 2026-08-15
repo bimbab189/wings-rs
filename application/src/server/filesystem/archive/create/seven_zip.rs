@@ -68,9 +68,12 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
             let mtime = source_metadata
                 .modified()
                 .map_or(None, |mtime| NtTime::try_from(mtime.into_std()).ok());
+            let ctime = source_metadata
+                .created()
+                .map_or(None, |ctime| NtTime::try_from(ctime.into_std()).ok());
 
             if source_metadata.is_dir() {
-                directory_entries.push((relative.to_path_buf(), mtime));
+                directory_entries.push((relative.to_path_buf(), mtime, ctime));
                 if let Some(bytes_archived) = &bytes_archived {
                     bytes_archived.fetch_add(source_metadata.len(), Ordering::SeqCst);
                 }
@@ -92,9 +95,12 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
                     let mtime = source_metadata
                         .modified()
                         .map_or(None, |mtime| NtTime::try_from(mtime.into_std()).ok());
+                    let ctime = source_metadata
+                        .created()
+                        .map_or(None, |ctime| NtTime::try_from(ctime.into_std()).ok());
 
                     if metadata.is_dir() {
-                        directory_entries.push((relative.to_path_buf(), mtime));
+                        directory_entries.push((relative.to_path_buf(), mtime, ctime));
                         if let Some(bytes_archived) = &bytes_archived {
                             bytes_archived.fetch_add(metadata.len(), Ordering::SeqCst);
                         }
@@ -113,6 +119,10 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
                         if let Some(mtime) = mtime {
                             entry.has_last_modified_date = true;
                             entry.last_modified_date = mtime;
+                        }
+                        if let Some(ctime) = ctime {
+                            entry.has_creation_date = true;
+                            entry.creation_date = ctime;
                         }
                         entry.size = metadata.len();
 
@@ -134,18 +144,26 @@ pub async fn create_7z<W: Write + Seek + Send + 'static>(
                     entry.has_last_modified_date = true;
                     entry.last_modified_date = mtime;
                 }
+                if let Some(ctime) = ctime {
+                    entry.has_creation_date = true;
+                    entry.creation_date = ctime;
+                }
                 entry.size = source_metadata.len();
 
                 archive.push_archive_entry(entry, Some(reader))?;
             }
         }
 
-        for (source_path, mtime) in directory_entries {
+        for (source_path, mtime, ctime) in directory_entries {
             let mut entry =
                 sevenz_rust2::ArchiveEntry::new_directory(&source_path.to_string_lossy());
             if let Some(mtime) = mtime {
                 entry.has_last_modified_date = true;
                 entry.last_modified_date = mtime;
+            }
+            if let Some(ctime) = ctime {
+                entry.has_creation_date = true;
+                entry.creation_date = ctime;
             }
 
             archive.push_archive_entry(entry, None::<&[u8]>)?;

@@ -13,7 +13,7 @@ pub(crate) mod post {
         extract::Query,
         http::{HeaderMap, StatusCode},
     };
-    use futures_util::StreamExt;
+    use futures::StreamExt;
     use serde::{Deserialize, Serialize};
     use tokio::io::AsyncWriteExt;
     use utoipa::ToSchema;

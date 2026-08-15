@@ -28,29 +28,16 @@ pub(crate) mod post {
         state: GetState,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        if data.servers.is_empty() {
-            for server in state.server_manager.get_servers().await.iter() {
+        for server in state.server_manager.get_servers().await.iter() {
+            if data.servers.is_empty() || data.servers.contains(&server.uuid) {
                 server
                     .user_permissions
-                    .set_permissions(data.user, Permissions::default(), &[] as &[&str])
+                    .set_permissions(data.user, Permissions::default(), Some(&[] as &[&str]))
                     .await;
                 state
                     .web_ide
                     .revoke_user(server.uuid, data.user, "permissions_revoked")
                     .await;
-            }
-        } else {
-            for server in state.server_manager.get_servers().await.iter() {
-                if data.servers.contains(&server.uuid) {
-                    server
-                        .user_permissions
-                        .set_permissions(data.user, Permissions::default(), &[] as &[&str])
-                        .await;
-                    state
-                        .web_ide
-                        .revoke_user(server.uuid, data.user, "permissions_revoked")
-                        .await;
-                }
             }
         }
 

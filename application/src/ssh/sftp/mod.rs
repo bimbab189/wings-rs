@@ -7,7 +7,6 @@ use crate::{
     utils::PortableModeExt,
 };
 use cap_std::fs::{Metadata, OpenOptions};
-use compact_str::ToCompactString;
 use positioned_io::{ReadAt, WriteAt};
 use russh_sftp::protocol::{
     Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode,
@@ -119,11 +118,11 @@ impl SftpSession {
     }
 
     #[inline]
-    fn next_handle_id(&mut self) -> String {
+    fn next_handle_id(&mut self) -> compact_str::CompactString {
         let id = self.handle_id;
         self.handle_id += 1;
 
-        format!("{id:x}")
+        compact_str::format_compact!("{id:x}")
     }
 
     #[inline]
@@ -411,7 +410,7 @@ impl russh_sftp::server::Handler for SftpSession {
         let handle = self.next_handle_id();
 
         self.handles.insert(
-            handle.to_compact_string(),
+            handle.clone(),
             ServerHandle::Dir(DirHandle {
                 path,
                 dir,
@@ -419,7 +418,10 @@ impl russh_sftp::server::Handler for SftpSession {
             }),
         );
 
-        Ok(Handle { id, handle })
+        Ok(Handle {
+            id,
+            handle: handle.into(),
+        })
     }
 
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
@@ -1181,7 +1183,7 @@ impl russh_sftp::server::Handler for SftpSession {
         let handle = self.next_handle_id();
 
         self.handles.insert(
-            handle.to_compact_string(),
+            handle.clone(),
             ServerHandle::File(FileHandle {
                 path,
                 path_components,
@@ -1192,7 +1194,10 @@ impl russh_sftp::server::Handler for SftpSession {
             }),
         );
 
-        Ok(Handle { id, handle })
+        Ok(Handle {
+            id,
+            handle: handle.into(),
+        })
     }
 
     async fn read(
@@ -1219,6 +1224,7 @@ impl russh_sftp::server::Handler for SftpSession {
                 let bytes_read = file.read().unwrap().read_at(offset, &mut data)?;
 
                 data.truncate(bytes_read);
+                data.shrink_to_fit();
                 Ok(data)
             }
         })

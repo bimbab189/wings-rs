@@ -290,7 +290,7 @@ async fn exchange(
     let now = chrono::Utc::now().timestamp();
     let issuer = state.config.remote.trim_end_matches('/');
     let audience = state.config.web_ide.public_url.trim_end_matches('/');
-    let valid = claims.base.validate(&state.config.jwt).await
+    let valid = claims.base.validate(&state.config.jwt).await.is_ok()
         && claims.kind == "webide_launch"
         && claims.base.subject.as_deref() == Some("webide-launch")
         && claims.base.issuer.trim_end_matches('/') == issuer

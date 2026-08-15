@@ -23,6 +23,43 @@ pub struct MimeCacheKey {
     pub modified: u64,
 }
 
+#[derive(Clone, Copy)]
+pub struct MimeCacheValue {
+    pub mime: &'static str,
+    pub valid_utf8: bool,
+    pub valid_inner_utf8: bool,
+}
+
+impl Default for MimeCacheValue {
+    fn default() -> Self {
+        MimeCacheValue {
+            mime: "application/octet-stream",
+            valid_utf8: false,
+            valid_inner_utf8: false,
+        }
+    }
+}
+
+impl MimeCacheValue {
+    #[inline]
+    pub fn directory() -> Self {
+        MimeCacheValue {
+            mime: "inode/directory",
+            valid_utf8: false,
+            valid_inner_utf8: false,
+        }
+    }
+
+    #[inline]
+    pub fn symlink() -> Self {
+        MimeCacheValue {
+            mime: "inode/symlink",
+            valid_utf8: false,
+            valid_inner_utf8: false,
+        }
+    }
+}
+
 #[cfg(unix)]
 impl From<&std::fs::Metadata> for MimeCacheKey {
     fn from(metadata: &std::fs::Metadata) -> Self {
@@ -84,7 +121,8 @@ pub struct AppState {
     pub stats_manager: Arc<crate::stats::StatsManager>,
     pub server_manager: Arc<crate::server::manager::ServerManager>,
     pub backup_manager: Arc<crate::server::backup::manager::BackupManager>,
-    pub mime_cache: moka::future::Cache<MimeCacheKey, &'static str>,
+    pub inotify_manager: Arc<crate::server::filesystem::inotify::InotifyManager>,
+    pub mime_cache: moka::future::Cache<MimeCacheKey, MimeCacheValue>,
     pub ssh_sessions: crate::ssh::SshSessionRegistry,
     pub web_ide: crate::server::web_ide::WebIdeManager,
 }
