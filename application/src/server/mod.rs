@@ -210,16 +210,15 @@ impl Server {
                     }
 
                     match container_state.status {
-                        Some(ContainerStateStatusEnum::RUNNING) => {
+                        Some(ContainerStateStatusEnum::RUNNING)
                             if !matches!(
                                 server.state.get_state(),
                                 state::ServerState::Running
                                     | state::ServerState::Starting
                                     | state::ServerState::Stopping,
-                            ) {
+                            ) => {
                                 server.state.set_state(state::ServerState::Running).await;
                             }
-                        }
                         Some(ContainerStateStatusEnum::EMPTY)
                         | Some(ContainerStateStatusEnum::DEAD)
                         | Some(ContainerStateStatusEnum::EXITED)
@@ -512,44 +511,37 @@ impl Server {
     }
 
     #[inline]
-    pub fn is_locked_state(&self) -> bool {
-        if !self.app_state.config.debug {
-            return self.suspended.load(Ordering::Relaxed)
-                || self.installing.load(Ordering::Relaxed)
-                || self.restoring.load(Ordering::Relaxed)
-                || self.transferring.load(Ordering::Relaxed);
-        }
-
+    pub fn locked_state(&self) -> Option<&'static str> {
         if self.suspended.load(Ordering::Relaxed) {
             tracing::debug!(
                 server = %self.uuid,
                 "server locked at state check: suspended"
             );
-            return true;
+            return Some("suspended");
         }
         if self.installing.load(Ordering::Relaxed) {
             tracing::debug!(
                 server = %self.uuid,
                 "server locked at state check: installing"
             );
-            return true;
+            return Some("installing");
         }
         if self.restoring.load(Ordering::Relaxed) {
             tracing::debug!(
                 server = %self.uuid,
                 "server locked at state check: restoring"
             );
-            return true;
+            return Some("restoring");
         }
         if self.transferring.load(Ordering::Relaxed) {
             tracing::debug!(
                 server = %self.uuid,
                 "server locked at state check: transferring"
             );
-            return true;
+            return Some("transferring");
         }
 
-        false
+        None
     }
 
     #[inline]
@@ -872,6 +864,7 @@ impl Server {
                     registry_auth = Some(bollard::auth::DockerCredentials {
                         username: Some(config.username.clone()),
                         password: Some(config.password.clone()),
+                        serveraddress: Some(registry.clone()),
                         ..Default::default()
                     });
                     break;
@@ -1024,9 +1017,9 @@ impl Server {
         aquire_timeout: Option<std::time::Duration>,
         skip_schedules: bool,
     ) -> Result<(), anyhow::Error> {
-        if self.is_locked_state() {
+        if let Some(state) = self.locked_state() {
             return Err(anyhow::anyhow!(
-                "Server is in a locked state, cannot start the server."
+                "Server is in a locked state ({state}), cannot start the server."
             ));
         }
 
@@ -1542,6 +1535,8 @@ impl Server {
             .await;
 
         crate::server::installation::ServerInstaller::delete_install_logs(self).await;
+
+        self.filesystem.close().await;
 
         tokio::spawn({
             let server = self.clone();

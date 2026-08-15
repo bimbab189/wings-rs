@@ -3,7 +3,7 @@ use crate::server::installation::InstallationScript;
 use anyhow::Context;
 use futures::StreamExt;
 use rand::distr::SampleString;
-use std::{collections::HashMap, fs::Permissions, path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 async fn container_config(
     server: &super::Server,
@@ -81,7 +81,7 @@ async fn container_config(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&tmp_dir, Permissions::from_mode(0o755)).await?;
+        tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755)).await?;
     }
 
     Ok(bollard::container::Config {

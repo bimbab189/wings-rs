@@ -17,7 +17,14 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 use utoipa::ToSchema;
 
 fn app_name() -> String {
-    "Pterodactyl".to_string()
+    #[cfg(unix)]
+    {
+        "Pterodactyl".to_string()
+    }
+    #[cfg(windows)]
+    {
+        "Calagopus".to_string()
+    }
 }
 fn api_host() -> String {
     "0.0.0.0".to_string()
@@ -154,7 +161,7 @@ fn system_root_directory() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus".to_string()
+        "C:\\ProgramData\\Calagopus-Wings".to_string()
     }
 }
 fn system_log_directory() -> String {
@@ -164,7 +171,7 @@ fn system_log_directory() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\logs".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\logs".to_string()
     }
 }
 fn system_vmount_directory() -> String {
@@ -174,7 +181,7 @@ fn system_vmount_directory() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\vmounts".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\vmounts".to_string()
     }
 }
 fn system_data() -> String {
@@ -184,7 +191,7 @@ fn system_data() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\volumes".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\volumes".to_string()
     }
 }
 fn system_archive_directory() -> String {
@@ -194,7 +201,7 @@ fn system_archive_directory() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\archives".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\archives".to_string()
     }
 }
 fn system_backup_directory() -> String {
@@ -204,7 +211,7 @@ fn system_backup_directory() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\backups".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\backups".to_string()
     }
 }
 fn system_tmp_directory() -> String {
@@ -214,12 +221,18 @@ fn system_tmp_directory() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\tmp".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\tmp".to_string()
     }
 }
-#[cfg(unix)]
 fn system_username() -> compact_str::CompactString {
-    "pterodactyl".into()
+    #[cfg(unix)]
+    {
+        "pterodactyl".into()
+    }
+    #[cfg(windows)]
+    {
+        "calagopus-wings".into()
+    }
 }
 fn system_timezone() -> compact_str::CompactString {
     if let Ok(tz) = std::env::var("TZ") {
@@ -238,8 +251,15 @@ fn system_timezone() -> compact_str::CompactString {
 fn system_passwd_directory() -> String {
     "/run/wings/etc".to_string()
 }
+#[cfg(unix)]
+fn system_machine_id_enabled() -> bool {
+    true
+}
 fn system_disk_check_interval() -> u64 {
     150
+}
+fn system_full_disk_check_every() -> u64 {
+    6
 }
 fn system_disk_check_use_inotify() -> bool {
     true
@@ -342,7 +362,7 @@ fn system_backup_restic_repository() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\backups\\restic".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\backups\\restic".to_string()
     }
 }
 fn system_backup_restic_password_file() -> String {
@@ -352,7 +372,7 @@ fn system_backup_restic_password_file() -> String {
     }
     #[cfg(windows)]
     {
-        "C:\\ProgramData\\Calagopus\\backups\\restic_password".to_string()
+        "C:\\ProgramData\\Calagopus-Wings\\backups\\restic_password".to_string()
     }
 }
 fn system_backup_restic_retry_lock_seconds() -> u64 {
@@ -391,13 +411,27 @@ fn docker_network_dns() -> Vec<String> {
     vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()]
 }
 fn docker_network_name() -> String {
-    "pterodactyl_nw".to_string()
+    #[cfg(unix)]
+    {
+        "pterodactyl_nw".to_string()
+    }
+    #[cfg(windows)]
+    {
+        "calagopus_nw".to_string()
+    }
 }
 fn docker_network_driver() -> String {
     "bridge".to_string()
 }
 fn docker_network_mode() -> String {
-    "pterodactyl_nw".to_string()
+    #[cfg(unix)]
+    {
+        "pterodactyl_nw".to_string()
+    }
+    #[cfg(windows)]
+    {
+        "calagopus_nw".to_string()
+    }
 }
 fn docker_network_enable_icc() -> bool {
     true
@@ -688,35 +722,27 @@ nestify::nest! {
             #[serde(default = "system_tmp_directory")]
             pub tmp_directory: String,
 
-            #[cfg(unix)]
             #[serde(default = "system_username")]
             pub username: compact_str::CompactString,
             #[serde(default = "system_timezone")]
             pub timezone: compact_str::CompactString,
 
-            #[cfg(unix)]
             #[serde(default)]
             #[schema(inline)]
             pub user: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemUser {
-                #[cfg(unix)]
                 #[serde(default)]
                 #[schema(inline)]
                 pub rootless: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemUserRootless {
-                    #[cfg(unix)]
                     #[serde(default)]
                     pub enabled: bool,
-                    #[cfg(unix)]
                     #[serde(default)]
                     pub container_uid: u32,
-                    #[cfg(unix)]
                     #[serde(default)]
                     pub container_gid: u32,
                 },
 
-                #[cfg(unix)]
                 #[serde(default)]
                 pub uid: u32,
-                #[cfg(unix)]
                 #[serde(default)]
                 pub gid: u32,
             },
@@ -733,8 +759,19 @@ nestify::nest! {
                 pub directory: String,
             },
 
+            #[cfg(unix)]
+            #[serde(default)]
+            #[schema(inline)]
+            pub machine_id: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct SystemMachineId {
+                #[cfg(unix)]
+                #[serde(default = "system_machine_id_enabled")]
+                pub enabled: bool,
+            },
+
             #[serde(default = "system_disk_check_interval")]
             pub disk_check_interval: u64,
+            #[serde(default = "system_full_disk_check_every")]
+            pub full_disk_check_every: u64,
             #[serde(default = "system_disk_check_use_inotify")]
             pub disk_check_use_inotify: bool,
             #[serde(default)]
@@ -1258,6 +1295,7 @@ impl Config {
                 "you have enabled sending offline server logs, but also deleting containers on stop. This will result in no logs being sent for stopped servers."
             );
         }
+        #[cfg(unix)]
         if matches!(
             self.system.disk_limiter_mode,
             crate::server::filesystem::limiter::DiskLimiterMode::FuseQuota
@@ -1267,6 +1305,7 @@ impl Config {
                 "you have enabled FUSEquota disk limiting, but also disabled deleting containers on stop. This can cause issues if you try manually starting things. this setup is not recommended."
             );
         }
+        #[cfg(unix)]
         if matches!(
             self.system.disk_limiter_mode,
             crate::server::filesystem::limiter::DiskLimiterMode::FuseQuota
@@ -1425,7 +1464,7 @@ impl Config {
 
         // Do not allow directory paths with less than 1 segment (e.g. "/")
         const MIN_DIRECTORY_SEGMENTS: usize = 1;
-        let directories = vec![
+        let directories = &[
             (&self.system.root_directory, "root_directory"),
             (&self.system.log_directory, "log_directory"),
             (&self.system.vmount_directory, "vmount_directory"),

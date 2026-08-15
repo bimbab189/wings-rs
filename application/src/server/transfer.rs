@@ -11,6 +11,7 @@ use human_bytes::human_bytes;
 use serde::Deserialize;
 use sha2::Digest;
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -215,11 +216,11 @@ impl OutgoingServerTransfer {
                 ))
                 .ok();
 
-            let (files_sender, files_receiver) = async_channel::bounded(256);
+            let (files_sender, files_receiver) = async_channel::bounded(512 * (1 + multiplex_streams));
 
             let (checksum_sender, checksum_receiver) = tokio::sync::oneshot::channel();
-            let (mut checksummed_reader, checksummed_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
-            let (reader, mut writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+            let (mut checksummed_reader, checksummed_writer) = tokio::io::simplex(crate::TRANSFER_BUFFER_SIZE);
+            let (reader, mut writer) = tokio::io::simplex(crate::TRANSFER_BUFFER_SIZE);
 
             fn get_archive_task(
                 files_receiver: async_channel::Receiver<PathBuf>,
@@ -263,7 +264,7 @@ impl OutgoingServerTransfer {
                 async move {
                     let mut hasher = sha2::Sha256::new();
 
-                    let mut buffer = vec![0; crate::BUFFER_SIZE];
+                    let mut buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
                     loop {
                         let bytes_read = checksummed_reader.read(&mut buffer).await?;
                         if crate::unlikely(bytes_read == 0) {
@@ -276,7 +277,7 @@ impl OutgoingServerTransfer {
                     }
 
                     checksum_sender
-                        .send(format!("{:x}", hasher.finalize()))
+                        .send(hex::encode(hasher.finalize()))
                         .ok();
                     writer.shutdown().await?;
 
@@ -301,7 +302,7 @@ impl OutgoingServerTransfer {
                 .part(
                     "archive",
                     reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(
-                        tokio_util::io::ReaderStream::with_capacity(reader, crate::BUFFER_SIZE),
+                        tokio_util::io::ReaderStream::with_capacity(reader, crate::TRANSFER_BUFFER_SIZE),
                     ))
                     .file_name(format!("archive.{}", archive_format.extension()))
                     .mime_str("application/x-tar")
@@ -330,7 +331,7 @@ impl OutgoingServerTransfer {
                                 install_logs,
                                 Arc::clone(&bytes_archived),
                             ),
-                            crate::BUFFER_SIZE,
+                            crate::TRANSFER_BUFFER_SIZE,
                         ),
                     ))
                     .file_name("install.log")
@@ -340,7 +341,7 @@ impl OutgoingServerTransfer {
             }
 
             for backup in &backups {
-                if let Ok(Some(backup)) = backup_manager.find(*backup).await {
+                if let Ok(Some(backup)) = backup_manager.find(&server.app_state, *backup).await {
                     match backup.adapter() {
                         super::backup::adapters::BackupAdapter::Wings => {
                             let hasher = Arc::new(Mutex::new(sha2::Sha256::new()));
@@ -380,7 +381,7 @@ impl OutgoingServerTransfer {
 
                             let (checksum_sender, checksum_receiver) = tokio::sync::oneshot::channel();
                             tokio::spawn(async move {
-                                checksum_sender.send(format!("{:x}", hasher.lock().await.finalize_reset())).ok();
+                                checksum_sender.send(hex::encode(hasher.lock().await.finalize_reset())).ok();
                             });
 
                             bytes_total.fetch_add(
@@ -395,7 +396,7 @@ impl OutgoingServerTransfer {
                                 .part(
                                     format!("backup-{}", backup.uuid()),
                                     reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(
-                                        tokio_util::io::ReaderStream::with_capacity(reader, crate::BUFFER_SIZE),
+                                        tokio_util::io::ReaderStream::with_capacity(reader, crate::TRANSFER_BUFFER_SIZE),
                                     ))
                                     .file_name(file_name.file_name().unwrap_or_default().to_string_lossy().to_string())
                                     .mime_str("backup/wings")
@@ -439,6 +440,7 @@ impl OutgoingServerTransfer {
                     let mut last_bytes_sent = 0;
                     let mut last_update_time = Instant::now();
                     let start_time = Instant::now();
+                    let mut history = VecDeque::new();
 
                     loop {
                         let now = Instant::now();
@@ -449,14 +451,23 @@ impl OutgoingServerTransfer {
                         let current_bytes_archived = bytes_archived.load(Ordering::SeqCst);
                         let current_bytes_sent = bytes_sent.load(Ordering::SeqCst);
 
+                        history.push_back((now, current_bytes_archived));
+                        while let Some(&(t, _)) = history.front() {
+                            if now.duration_since(t).as_secs_f64() > 30.0 {
+                                history.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+
                         let archive_rate = if elapsed_secs > 0.0 {
-                            (current_bytes_archived - last_bytes_archived) as f64 / elapsed_secs
+                            (current_bytes_archived.saturating_sub(last_bytes_archived)) as f64 / elapsed_secs
                         } else {
                             0.0
                         };
 
                         let network_rate = if elapsed_secs > 0.0 {
-                            (current_bytes_sent - last_bytes_sent) as f64 / elapsed_secs
+                            (current_bytes_sent.saturating_sub(last_bytes_sent)) as f64 / elapsed_secs
                         } else {
                             0.0
                         };
@@ -475,22 +486,35 @@ impl OutgoingServerTransfer {
                         let archive_percentage = (current_bytes_archived as f64 / bytes_total as f64) * 100.0;
                         let formatted_archive_percentage = format!("{:.2}%", archive_percentage);
 
-                        let time_estimate = if archive_rate > 0.0 {
-                            let remaining_bytes = bytes_total as f64 - current_bytes_archived as f64;
-                            let remaining_seconds = remaining_bytes / archive_rate;
+                        let time_estimate = if history.len() > 1 && current_bytes_archived < bytes_total {
+                            let &(oldest_time, oldest_progress) = history.front().unwrap();
+                            let &(newest_time, newest_progress) = history.back().unwrap();
 
-                            &if remaining_seconds < 60.0 {
-                                format!("{:.0}s", remaining_seconds)
-                            } else if remaining_seconds < 3600.0 {
-                                format!("{:.0}m {:.0}s", remaining_seconds / 60.0, remaining_seconds % 60.0)
+                            let delta_progress = newest_progress.saturating_sub(oldest_progress) as f64;
+                            let delta_time = newest_time.duration_since(oldest_time).as_secs_f64();
+
+                            if delta_progress > 0.0 && delta_time > 0.0 {
+                                let rate_30s = delta_progress / delta_time;
+                                let remaining_bytes = bytes_total.saturating_sub(newest_progress) as f64;
+                                let remaining_seconds = remaining_bytes / rate_30s;
+
+                                if remaining_seconds < 60.0 {
+                                    format!("{:.0}s", remaining_seconds)
+                                } else if remaining_seconds < 3600.0 {
+                                    format!("{:.0}m {:.0}s", remaining_seconds / 60.0, remaining_seconds % 60.0)
+                                } else {
+                                    format!("{:.1}h {:.0}m",
+                                        remaining_seconds / 3600.0,
+                                        (remaining_seconds % 3600.0) / 60.0
+                                    )
+                                }
                             } else {
-                                format!("{:.1}h {:.0}m", 
-                                    remaining_seconds / 3600.0,
-                                    (remaining_seconds % 3600.0) / 60.0
-                                )
+                                "calculating...".to_string()
                             }
+                        } else if current_bytes_archived >= bytes_total {
+                            "0s".to_string()
                         } else {
-                            "unknown"
+                            "unknown".to_string()
                         };
 
                         let elapsed_time = if total_elapsed_secs < 60.0 {
@@ -553,7 +577,11 @@ impl OutgoingServerTransfer {
                 }
             });
 
-            let response = reqwest::Client::new()
+            let response = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+                .build()
+                .unwrap()
                 .post(&url)
                 .header("Authorization", &token)
                 .header("Multiplex-Stream-Count", multiplex_streams)
@@ -568,8 +596,8 @@ impl OutgoingServerTransfer {
 
             for i in 0..multiplex_streams {
                 let (checksum_sender, checksum_receiver) = tokio::sync::oneshot::channel();
-                let (mut checksummed_reader, checksummed_writer) = tokio::io::simplex(crate::BUFFER_SIZE);
-                let (reader, mut writer) = tokio::io::simplex(crate::BUFFER_SIZE);
+                let (mut checksummed_reader, checksummed_writer) = tokio::io::simplex(crate::TRANSFER_BUFFER_SIZE);
+                let (reader, mut writer) = tokio::io::simplex(crate::TRANSFER_BUFFER_SIZE);
 
                 let archive_task = get_archive_task(
                     files_receiver.clone(),
@@ -589,7 +617,7 @@ impl OutgoingServerTransfer {
                     async move {
                         let mut hasher = sha2::Sha256::new();
 
-                        let mut buffer = vec![0; crate::BUFFER_SIZE];
+                        let mut buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
                         loop {
                             let bytes_read = checksummed_reader.read(&mut buffer).await?;
                             if crate::unlikely(bytes_read == 0) {
@@ -601,7 +629,7 @@ impl OutgoingServerTransfer {
                             bytes_sent.fetch_add(bytes_read as u64, Ordering::Relaxed);
                         }
 
-                        checksum_sender.send(format!("{:x}", hasher.finalize())).ok();
+                        checksum_sender.send(hex::encode(hasher.finalize())).ok();
                         writer.flush().await?;
                         writer.shutdown().await?;
 
@@ -613,7 +641,7 @@ impl OutgoingServerTransfer {
                     .part(
                         "archive",
                         reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(
-                            tokio_util::io::ReaderStream::with_capacity(reader, crate::BUFFER_SIZE),
+                            tokio_util::io::ReaderStream::with_capacity(reader, crate::TRANSFER_BUFFER_SIZE),
                         ))
                         .file_name(format!("archive.{}", archive_format.extension()))
                         .mime_str("application/x-tar")
@@ -630,7 +658,11 @@ impl OutgoingServerTransfer {
                     );
 
                 multiplex_responses.push(
-                    reqwest::Client::new()
+                    reqwest::Client::builder()
+                        .connect_timeout(std::time::Duration::from_secs(15))
+                        .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+                        .build()
+                        .unwrap()
                         .post(&url)
                         .header("Authorization", &token)
                         .header("Multiplex-Stream", i)
@@ -672,9 +704,9 @@ impl OutgoingServerTransfer {
 
             if delete_backups {
                 for backup in backups {
-                    match backup_manager.find(backup).await {
+                    match backup_manager.find(&server.app_state, backup).await {
                         Ok(Some(backup)) => {
-                            if let Err(err) = backup.delete(&server.app_state.config).await {
+                            if let Err(err) = backup.delete(&server.app_state).await {
                                 tracing::error!(
                                     server = %server.uuid,
                                     "failed to delete backup {}: {}",

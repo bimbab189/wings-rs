@@ -1,7 +1,7 @@
 [package]
 name = "wings-rs"
 rust-version = { workspace = true }
-version = "1.0.1"
+version = "1.0.4"
 edition = "2024"
 
 [dependencies]
@@ -23,6 +23,7 @@ reqwest = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
 colored = "3.0.0"
+jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 nestify = "0.3.3"
 rayon = "1.10.0"
 serde_norway = "0.9.42"
@@ -34,30 +35,28 @@ tar = "0.4.44"
 zip = { version = "8.0.0", default-features = false, features = ["bzip2", "deflate", "time", "zstd", "lzma", "xz"] }
 sevenz-rust2 = { version = "0.20.0", features = ["deflate", "compress", "brotli", "zstd", "bzip2", "ppmd", "lz4"] }
 flate2 = { version = "1.1.1", default-features = false, features = ["zlib-rs"] }
-jwt = "0.16.0"
-hmac = { version = "0.12.1", features = ["std"] }
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 ddup-bak = "0.8.0"
 infer = "0.19.0"
 rustls = { version = "0.23.27", features = ["aws-lc-rs"] }
 ignore = { version = "0.4.23", features = ["simd-accel"] }
-sha1 = "0.10.6"
+sha1 = "0.11.0"
 futures = "0.3.31"
 futures-util = "0.3.31"
-russh = "0.59.0"
+russh = "0.60.0"
 russh-sftp = "2.1.1"
 md5 = "0.8.0"
 human_bytes = "0.4.3"
 ansi_term = "0.12.1"
-clap = { version = "4.5.37", features = ["derive"] }
+clap = { version = "4.5.37", features = ["derive", "string"] }
 dialoguer = "0.12.0"
 sysinfo = "0.38.0"
 crc32fast = "1.4.2"
 cap-std = "4.0.0"
 rustix = "1.0.7"
 cidr = { version = "0.3.1", features = ["serde"] }
-hickory-resolver = "0.25.2"
-constant_time_eq = "0.4.2"
+hickory-resolver = "0.26.0"
+constant_time_eq = "0.5.0"
 new_mime_guess = "4.0.4"
 async-trait = "0.1.88"
 cron = { version = "0.16.0", features = ["serde"] }
@@ -86,18 +85,21 @@ accept-header = "0.2.3"
 mime = "0.3.17"
 toml = { version = "1.0.1", features = ["preserve_order"] }
 sntpc-net-tokio = "1.0.1"
-sntpc = { version = "0.8.1", features = ["std"] }
 tokio-tungstenite = "0.28.0"
 yrs = "0.18.8"
 yrs-axum = "0.8.2"
 
 [target.'cfg(unix)'.dependencies]
 users = "0.11.0"
-libz-ng-sys = "=1.1.23" # temporary pin due to riscv64 issues
+sntpc = { version = "0.9.0", features = ["std"] }
 notify = "8.2.0"
+hex = "0.4.3"
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 tikv-jemallocator = "0.6.0"
+
+[target.'cfg(target_arch = "riscv64gc")'.dependencies]
+libz-ng-sys = "=1.1.23" # temporary pin due to riscv64 issues
 
 [build-dependencies]
 reqwest = { workspace = true, features = ["blocking"] }

@@ -144,28 +144,35 @@ impl ServerConfiguration {
         config.vmount_path(self.uuid).join("machine-uuid")
     }
 
-    fn vmounts(&self, config: &crate::config::Config) -> Vec<Mount> {
+    async fn vmounts(&self, config: &crate::config::Config) -> Vec<Mount> {
         let mut mounts = Vec::new();
 
-        mounts.push(Mount {
-            default: false,
-            target: "/etc/machine-id".into(),
-            source: self
-                .machine_id_path(config)
-                .to_string_lossy()
-                .to_compact_string(),
-            read_only: true,
-        });
-        if !config.system.user.rootless.enabled {
+        #[cfg(unix)]
+        if config.system.machine_id.enabled {
             mounts.push(Mount {
                 default: false,
-                target: "/sys/class/dmi/id/product_uuid".into(),
+                target: "/etc/machine-id".into(),
                 source: self
-                    .machine_uuid_path(config)
+                    .machine_id_path(config)
                     .to_string_lossy()
                     .to_compact_string(),
                 read_only: true,
             });
+            if !config.system.user.rootless.enabled
+                && tokio::fs::metadata("/sys/class/dmi/id/product_uuid")
+                    .await
+                    .is_ok()
+            {
+                mounts.push(Mount {
+                    default: false,
+                    target: "/sys/class/dmi/id/product_uuid".into(),
+                    source: self
+                        .machine_uuid_path(config)
+                        .to_string_lossy()
+                        .to_compact_string(),
+                    read_only: true,
+                });
+            }
         }
 
         mounts
@@ -176,7 +183,7 @@ impl ServerConfiguration {
         config: &crate::config::Config,
         filesystem: &super::filesystem::Filesystem,
     ) -> Vec<Mount> {
-        let mut mounts = self.vmounts(config);
+        let mut mounts = self.vmounts(config).await;
 
         mounts.push(Mount {
             default: true,
@@ -254,10 +261,10 @@ impl ServerConfiguration {
             .collect()
     }
 
+    #[cfg(unix)]
     fn convert_devices(&self) -> Vec<bollard::models::DeviceMapping> {
         let mut devices = Vec::new();
 
-        #[cfg(unix)]
         if self.container.kvm_passthrough_enabled {
             devices.push(bollard::models::DeviceMapping {
                 path_on_host: Some("/dev/kvm".into()),
@@ -540,6 +547,7 @@ impl ServerConfiguration {
 
                 port_bindings: Some(self.convert_allocations_docker_bindings(config)),
                 mounts: Some(self.convert_mounts(config, filesystem).await),
+                #[cfg(unix)]
                 devices: Some(self.convert_devices()),
                 network_mode: Some(network_mode),
                 dns: Some(config.docker.network.dns.clone()),

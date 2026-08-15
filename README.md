@@ -55,6 +55,10 @@ system:
   # path for temporary mountpoints for servers
   vmount_directory: /var/lib/pterodactyl/vmounts
 
+  # how often to do a full disk check when inotify is used, this is to prevent gradual desync between the
+  # actual disk usage and the inotify events. 6 means that a full disk check will be done every 6 inotify disk checks.
+  # so, if disk_check_interval is 150 seconds, then a full disk check will be done every 900 seconds (15 minutes)
+  full_disk_check_every: 6
   # apply a real quota limit to each server
   # none, btrfs_subvolume, zfs_dataset, xfs_quota, (experimental) fuse_quota
   disk_limiter_mode: none
@@ -202,7 +206,7 @@ ignore_panel_wings_upgrades: false
 - `GET /api/servers/{server}/logs/install` API endpoint for getting server installation logs
 - `GET /api/servers/{server}/version` API endpoint for getting a version hash for a server
 - `GET /api/servers/{server}/files/fingerprints` API endpoint for getting fingerprints for many files at once
-- `GET /api/servers/{server}/files/list` API endpoint for listing files with pagination
+- `GET /api/servers/{server}/files/list` API endpoint for listing files with pagination and file sorting
 - `POST /api/servers/{server}/files/search` API endpoint for searching for file names/content
 - `GET /api/servers/{server}/download/directory` API endpoint for downloading directories on-the-fly as archives
 
@@ -210,6 +214,7 @@ ignore_panel_wings_upgrades: false
 
 - properly support egg `file_denylist`
 - add support for browsing `.zip`, `.7z`, and `.ddup` archives in the file manager
+- add support for browsing `/home/container/` mounts as virtual directories in the file manager
 - add support for `name` property on `POST /api/servers/{server}/files/copy`
 - add support for opening individual compressed file (e.g. `.log.gz`) in `GET /api/servers/{server}/files/contents`
 - add (real) folder size support on `GET /api/servers/{server}/files/list-directory`

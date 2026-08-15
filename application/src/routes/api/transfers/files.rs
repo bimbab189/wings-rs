@@ -16,12 +16,12 @@ pub(crate) mod post {
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
         server::transfer::TransferArchiveFormat,
+        utils::PortablePermissions,
     };
     use axum::{
         extract::Multipart,
         http::{HeaderMap, StatusCode},
     };
-    use cap_std::fs::{Permissions, PermissionsExt};
     use futures::TryStreamExt;
     use serde::{Deserialize, Serialize};
     use sha1::Digest;
@@ -185,7 +185,7 @@ pub(crate) mod post {
                                         archive.set_ignore_zeros(true);
                                         let mut entries = archive.entries()?;
 
-                                        let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                                        let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
                                         while let Some(Ok(mut entry)) = entries.next() {
                                             let path = entry.path()?;
 
@@ -204,7 +204,7 @@ pub(crate) mod post {
                                                 tar::EntryType::Directory => {
                                                     filesystem.create_dir_all(&destination_path)?;
                                                     if let Ok(permissions) =
-                                                        header.mode().map(Permissions::from_mode)
+                                                        header.mode().map(PortablePermissions::from_mode)
                                                     {
                                                         filesystem.set_permissions(
                                                             &destination_path,
@@ -260,7 +260,7 @@ pub(crate) mod post {
                                     }
                                     Some("checksum") => {
                                         let archive_checksum = match archive_checksum.take() {
-                                            Some(checksum) => format!("{:x}", checksum),
+                                            Some(checksum) => hex::encode(checksum),
                                             None => {
                                                 return Err(anyhow::anyhow!(
                                                     "archive checksum does not match multipart checksum, None to be found"

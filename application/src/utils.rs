@@ -157,58 +157,106 @@ pub fn is_valid_utf8_slice(s: &[u8]) -> bool {
     false
 }
 
-pub trait PortableModeExt {
-    fn from_portable_mode(mode: u32) -> Self;
-    fn mode(&self) -> u32;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PortablePermissions {
+    pub mode: u32,
+}
+
+impl PortablePermissions {
+    pub fn from_mode(mode: u32) -> Self {
+        Self { mode }
+    }
+
+    pub fn is_readonly(&self) -> bool {
+        self.mode & 0o200 == 0
+    }
+
+    pub fn into_os(self) -> Option<std::fs::Permissions> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            Some(std::fs::Permissions::from_mode(self.mode))
+        }
+        #[cfg(windows)]
+        None
+    }
 }
 
 #[cfg(unix)]
-impl PortableModeExt for std::fs::Permissions {
-    fn from_portable_mode(mode: u32) -> Self {
+impl From<std::fs::Permissions> for PortablePermissions {
+    fn from(perms: std::fs::Permissions) -> Self {
+        Self {
+            mode: std::os::unix::fs::PermissionsExt::mode(&perms),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<cap_std::fs::Permissions> for PortablePermissions {
+    fn from(perms: cap_std::fs::Permissions) -> Self {
+        Self {
+            mode: cap_std::fs::PermissionsExt::mode(&perms),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl From<std::fs::Permissions> for PortablePermissions {
+    fn from(perms: std::fs::Permissions) -> Self {
+        Self {
+            mode: if perms.readonly() { 0o444 } else { 0o666 },
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl From<cap_std::fs::Permissions> for PortablePermissions {
+    fn from(perms: cap_std::fs::Permissions) -> Self {
+        Self {
+            mode: if perms.readonly() { 0o444 } else { 0o666 },
+        }
+    }
+}
+
+pub trait PortablePermissionsApplier {
+    fn apply_permissions(&self, new_permissions: PortablePermissions) -> std::io::Result<()>;
+}
+
+#[cfg(unix)]
+impl PortablePermissionsApplier for std::fs::File {
+    fn apply_permissions(&self, new_permissions: PortablePermissions) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        Self::from_mode(mode)
-    }
 
-    fn mode(&self) -> u32 {
-        std::os::unix::fs::PermissionsExt::mode(self)
+        let permissions = std::fs::Permissions::from_mode(new_permissions.mode);
+        self.set_permissions(permissions)
     }
 }
 
 #[cfg(unix)]
-impl PortableModeExt for cap_std::fs::Permissions {
-    fn from_portable_mode(mode: u32) -> Self {
+impl PortablePermissionsApplier for cap_std::fs::File {
+    fn apply_permissions(&self, new_permissions: PortablePermissions) -> std::io::Result<()> {
         use cap_std::fs::PermissionsExt;
-        Self::from_mode(mode)
-    }
 
-    fn mode(&self) -> u32 {
-        cap_std::fs::PermissionsExt::mode(self)
+        let permissions = cap_std::fs::Permissions::from_mode(new_permissions.mode);
+        self.set_permissions(permissions)
     }
 }
 
-#[cfg(windows)]
-impl PortableModeExt for std::fs::Permissions {
-    fn from_portable_mode(mode: u32) -> Self {
-        let mut perms: Self = unsafe { std::mem::zeroed() };
-        perms.set_readonly(mode & 0o200 == 0);
-        perms
-    }
-
-    fn mode(&self) -> u32 {
-        if self.readonly() { 0o444 } else { 0o666 }
+#[cfg(not(unix))]
+impl PortablePermissionsApplier for std::fs::File {
+    fn apply_permissions(&self, new_permissions: PortablePermissions) -> std::io::Result<()> {
+        let mut permissions = self.metadata()?.permissions();
+        permissions.set_readonly(new_permissions.is_readonly());
+        self.set_permissions(permissions)
     }
 }
 
-#[cfg(windows)]
-impl PortableModeExt for cap_std::fs::Permissions {
-    fn from_portable_mode(mode: u32) -> Self {
-        let mut perms: Self = unsafe { std::mem::zeroed() };
-        perms.set_readonly(mode & 0o200 == 0);
-        perms
-    }
-
-    fn mode(&self) -> u32 {
-        if self.readonly() { 0o444 } else { 0o666 }
+#[cfg(not(unix))]
+impl PortablePermissionsApplier for cap_std::fs::File {
+    fn apply_permissions(&self, new_permissions: PortablePermissions) -> std::io::Result<()> {
+        let mut permissions = self.metadata()?.permissions();
+        permissions.set_readonly(new_permissions.is_readonly());
+        self.set_permissions(permissions)
     }
 }
 
@@ -239,7 +287,7 @@ impl PortableSizeExt for cap_std::fs::Metadata {
     }
 }
 
-#[cfg(windows)]
+#[cfg(not(unix))]
 impl PortableSizeExt for std::fs::Metadata {
     fn size_logical(&self) -> u64 {
         self.len()
@@ -250,7 +298,7 @@ impl PortableSizeExt for std::fs::Metadata {
     }
 }
 
-#[cfg(windows)]
+#[cfg(not(unix))]
 impl PortableSizeExt for cap_std::fs::Metadata {
     fn size_logical(&self) -> u64 {
         self.len()

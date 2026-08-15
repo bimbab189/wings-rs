@@ -26,6 +26,7 @@ impl CliCommandGroupBuilder {
     pub fn new(name: &'static str, about: &'static str) -> Self {
         Self {
             command: Command::new(name)
+                .version(crate::full_version())
                 .arg(
                     Arg::new("config")
                         .help("set the location for the configuration file")
@@ -34,7 +35,7 @@ impl CliCommandGroupBuilder {
                         .long("config")
                         .alias("config-file")
                         .alias("config-path")
-                        .default_value("/etc/pterodactyl/config.yml")
+                        .default_value(crate::DEFAULT_CONFIG_PATH)
                         .global(true)
                         .required(false),
                 )

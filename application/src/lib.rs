@@ -33,7 +33,15 @@ pub const TARGET: &str = match option_env!("CARGO_TARGET") {
     None => "unknown-unknown",
 };
 
+#[cfg(unix)]
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/pterodactyl/config.yml";
+#[cfg(windows)]
+pub const DEFAULT_CONFIG_PATH: &str = "C:\\ProgramData\\Calagopus-Wings\\config.yml";
+
+/// 32 KiB - used for general IO
 pub const BUFFER_SIZE: usize = 32 * 1024;
+/// 4 MiB - used for transfers
+pub const TRANSFER_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 pub fn full_version() -> String {
     if GIT_BRANCH == "unknown" {

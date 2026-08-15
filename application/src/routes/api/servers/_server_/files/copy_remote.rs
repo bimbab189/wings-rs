@@ -405,9 +405,7 @@ pub(crate) mod post {
                                     writer.write_all(&buffer[..bytes_read]).await?;
                                 }
 
-                                checksum_sender
-                                    .send(format!("{:x}", hasher.finalize()))
-                                    .ok();
+                                checksum_sender.send(hex::encode(hasher.finalize())).ok();
                                 writer.shutdown().await?;
 
                                 Ok::<_, anyhow::Error>(())
@@ -440,7 +438,11 @@ pub(crate) mod post {
                                 )
                                 .part("test", reqwest::multipart::Part::text("JOHN PORK"));
 
-                            let response = reqwest::Client::new()
+                            let response = reqwest::Client::builder()
+                                .connect_timeout(std::time::Duration::from_secs(15))
+                                .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+                                .build()
+                                .unwrap()
                                 .post(&data.url)
                                 .header("Authorization", &data.token)
                                 .header("Total-Bytes", total.load(Ordering::Relaxed))

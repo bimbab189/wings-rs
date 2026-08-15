@@ -1,4 +1,8 @@
-use hickory_resolver::{TokioResolver, config::LookupIpStrategy, lookup_ip::LookupIpIntoIter};
+use hickory_resolver::{
+    TokioResolver,
+    config::LookupIpStrategy,
+    lookup_ip::{LookupIp, LookupIpIter},
+};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::{net::SocketAddr, sync::Arc};
 
@@ -15,7 +19,7 @@ impl DnsResolver {
 
         Self {
             config: Arc::clone(config),
-            state: Arc::new(builder.build()),
+            state: Arc::new(builder.build().unwrap()),
         }
     }
 }
@@ -26,19 +30,25 @@ impl Resolve for DnsResolver {
 
         Box::pin(async move {
             let lookup = resolver.state.lookup_ip(name.as_str()).await?;
-            let addrs: Addrs = Box::new(SocketAddrs {
-                config: Arc::clone(&resolver.config),
-                iter: lookup.into_iter(),
-            });
+            let addrs: Addrs = Box::new(SocketAddrs::new(
+                Arc::clone(&resolver.config),
+                lookup,
+                |l| l.iter(),
+            ));
 
             Ok(addrs)
         })
     }
 }
 
+#[ouroboros::self_referencing]
 struct SocketAddrs {
     config: Arc<crate::config::Config>,
-    iter: LookupIpIntoIter,
+    lookup: LookupIp,
+
+    #[borrows(mut lookup)]
+    #[covariant]
+    iter: LookupIpIter<'this>,
 }
 
 impl Iterator for SocketAddrs {
@@ -46,11 +56,15 @@ impl Iterator for SocketAddrs {
 
     fn next(&mut self) -> Option<Self::Item> {
         let next = self
-            .iter
-            .next()
+            .with_iter_mut(|iter| iter.next())
             .map(|ip_addr| SocketAddr::new(ip_addr, 0))?;
 
-        for cidr in self.config.api.remote_download_blocked_cidrs.iter() {
+        for cidr in self
+            .borrow_config()
+            .api
+            .remote_download_blocked_cidrs
+            .iter()
+        {
             if cidr.contains(&next.ip()) {
                 tracing::warn!("blocking internal IP address in pull: {}", next.ip());
                 return self.next();

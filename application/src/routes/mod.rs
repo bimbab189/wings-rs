@@ -16,13 +16,6 @@ pub enum AppContainerType {
     None,
 }
 
-#[derive(Hash, Eq, PartialEq, Clone, Copy)]
-pub struct MimeCacheKey {
-    pub ino: u64,
-    pub dev: u64,
-    pub modified: u64,
-}
-
 #[derive(Clone, Copy)]
 pub struct MimeCacheValue {
     pub mime: &'static str,
@@ -58,6 +51,13 @@ impl MimeCacheValue {
             valid_inner_utf8: false,
         }
     }
+}
+
+#[derive(Hash, Eq, PartialEq, Clone, Copy)]
+pub struct MimeCacheKey {
+    pub ino: u64,
+    pub dev: u64,
+    pub modified: u64,
 }
 
 #[cfg(unix)]
@@ -97,15 +97,28 @@ impl From<&cap_std::fs::Metadata> for MimeCacheKey {
 #[cfg(windows)]
 impl From<&std::fs::Metadata> for MimeCacheKey {
     fn from(metadata: &std::fs::Metadata) -> Self {
-        use std::os::windows::fs::MetadataExt;
-
         Self {
-            ino: metadata.file_index().unwrap_or(0),
-            dev: metadata.volume_serial_number().map_or(0, |v| v as u64),
+            ino: 0,
+            dev: 0,
             modified: metadata
                 .modified()
                 .ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_secs()),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl From<&cap_std::fs::Metadata> for MimeCacheKey {
+    fn from(metadata: &cap_std::fs::Metadata) -> Self {
+        Self {
+            ino: 0,
+            dev: 0,
+            modified: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.into_std().duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |duration| duration.as_secs()),
         }
     }

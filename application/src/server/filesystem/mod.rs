@@ -4,7 +4,7 @@ use crate::{
     server::filesystem::virtualfs::{
         DirectoryStreamWalkFn, VirtualReadableFilesystem, VirtualWritableFilesystem,
     },
-    utils::{PortableModeExt, PortableSizeExt},
+    utils::{PortablePermissions, PortableSizeExt},
 };
 use cap_std::fs::Metadata;
 use compact_str::ToCompactString;
@@ -13,7 +13,6 @@ use std::{
     fmt::Debug,
     hint::unreachable_unchecked,
     ops::Deref,
-    os::fd::AsFd,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -39,6 +38,7 @@ pub mod writer;
 pub fn encode_mode(mode: u32) -> compact_str::CompactString {
     let mut mode_str = compact_str::CompactString::default();
 
+    #[cfg(unix)]
     mode_str.push(match rustix::fs::FileType::from_raw_mode(mode) {
         rustix::fs::FileType::RegularFile => '-',
         rustix::fs::FileType::Directory => 'd',
@@ -49,6 +49,8 @@ pub fn encode_mode(mode: u32) -> compact_str::CompactString {
         rustix::fs::FileType::Fifo => 'p',
         rustix::fs::FileType::Unknown => '?',
     });
+    #[cfg(not(unix))]
+    mode_str.push('?');
 
     for i in 0u8..9 {
         if mode & (1 << (8 - i)) != 0 {
@@ -137,6 +139,8 @@ impl Filesystem {
                 async move {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
+                    let mut full_disk_check_counter = 0;
+
                     loop {
                         let run_inner = async |paths_to_scan: Option<Vec<PathBuf>>| -> Result<(), anyhow::Error> {
                             tracing::debug!(
@@ -206,6 +210,7 @@ impl Filesystem {
 
                                     for dir in &dirs_to_scan {
                                         let mut tmp_disk_usage = usage::DiskUsage::default();
+                                        #[cfg(unix)]
                                         let mut seen_inodes = HashSet::new();
 
                                         let mut walker = cap_filesystem.async_walk_dir(dir).await?;
@@ -266,6 +271,7 @@ impl Filesystem {
                             }
 
                             let mut tmp_disk_usage = usage::DiskUsage::default();
+                            #[cfg(unix)]
                             let mut seen_inodes = HashSet::new();
                             let mut total_entries = 0;
                             let mut total_size = 0;
@@ -328,10 +334,16 @@ impl Filesystem {
 
                         if !disk_checker_state_dirty.swap(false, Ordering::Relaxed) {
                             tracing::debug!(
+                                path = %cap_filesystem.base_path.display(),
                                 "skipping disk usage check due to server state inactivity"
                             );
                         } else {
-                            let paths_to_scan = if use_server_notifier.load(Ordering::Relaxed) {
+                            let paths_to_scan = if full_disk_check_counter
+                                % config.system.full_disk_check_every
+                                == 0
+                            {
+                                None
+                            } else if use_server_notifier.load(Ordering::Relaxed) {
                                 let paths = server_notifier.take_modified_paths().await;
 
                                 tracing::debug!(
@@ -343,6 +355,8 @@ impl Filesystem {
                             } else {
                                 None
                             };
+
+                            full_disk_check_counter += 1;
 
                             match run_inner(paths_to_scan).await {
                                 Ok(_) => {
@@ -677,11 +691,76 @@ impl Filesystem {
             return (inner_path.to_path_buf(), archive_fs);
         }
 
+        let (mount_match, mount_infos) = {
+            let server_config = server.configuration.read().await;
+            let allowed_mounts = &server.app_state.config.allowed_mounts;
+
+            let mut match_result = None;
+            let mut infos = Vec::new();
+
+            for mount in &server_config.mounts {
+                let Some(relative_target) = mount.target.strip_prefix("/home/container/") else {
+                    continue;
+                };
+                if relative_target.is_empty()
+                    || allowed_mounts
+                        .iter()
+                        .all(|am| !mount.source.starts_with(&**am))
+                {
+                    continue;
+                }
+
+                infos.push(virtualfs::mount::MountInfo {
+                    relative_target: PathBuf::from(relative_target),
+                });
+
+                if match_result.is_none() {
+                    let relative_target_path = Path::new(relative_target);
+                    if path.starts_with(relative_target_path)
+                        && let Ok(inner_path) = path.strip_prefix(relative_target_path)
+                    {
+                        match_result = Some((
+                            inner_path.to_path_buf(),
+                            PathBuf::from(&*mount.source),
+                            mount.read_only,
+                        ));
+                    }
+                }
+            }
+
+            (match_result, infos)
+        };
+
+        if let Some((inner_path, source_path, read_only)) = mount_match {
+            match cap::CapFilesystem::new(source_path).await {
+                Ok(cap_fs) => {
+                    let mut fs = cap_fs.get_virtual(server.clone());
+                    fs.is_primary_server_fs = false;
+                    fs.is_writable = !read_only;
+
+                    return (inner_path, Arc::new(fs));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        server = %server.uuid,
+                        "failed to open mount source for browsing: {:?}",
+                        err
+                    );
+                }
+            }
+        }
+
         let mut fs = self.cap_filesystem.get_virtual(server.clone());
         fs.is_primary_server_fs = true;
         fs.is_writable = true;
 
-        (path, Arc::new(fs))
+        (
+            path,
+            Arc::new(virtualfs::mount::VirtualMountFilesystem {
+                inner: fs,
+                mounts: mount_infos,
+            }),
+        )
     }
 
     pub async fn resolve_writable_fs(
@@ -689,11 +768,75 @@ impl Filesystem {
         server: &crate::server::Server,
         path: impl AsRef<Path>,
     ) -> (PathBuf, Arc<dyn VirtualWritableFilesystem>) {
+        let path = self.relative_path(path.as_ref());
+
+        let mount_match = {
+            let server_config = server.configuration.read().await;
+            let allowed_mounts = &server.app_state.config.allowed_mounts;
+
+            let mut result: Option<(PathBuf, PathBuf, bool)> = None;
+            for mount in &server_config.mounts {
+                let Some(relative_target) = mount.target.strip_prefix("/home/container/") else {
+                    continue;
+                };
+                if relative_target.is_empty() {
+                    continue;
+                }
+                if allowed_mounts
+                    .iter()
+                    .all(|am| !mount.source.starts_with(&**am))
+                {
+                    continue;
+                }
+
+                let relative_target_path = Path::new(relative_target);
+                if !path.starts_with(relative_target_path) {
+                    continue;
+                }
+
+                if let Ok(inner_path) = path.strip_prefix(relative_target_path) {
+                    result = Some((
+                        inner_path.to_path_buf(),
+                        PathBuf::from(&*mount.source),
+                        mount.read_only,
+                    ));
+                    break;
+                }
+            }
+            result
+        };
+
+        if let Some((inner_path, source_path, read_only)) = mount_match {
+            match cap::CapFilesystem::new(source_path).await {
+                Ok(cap_fs) => {
+                    let mut fs = cap_fs.get_virtual(server.clone());
+                    fs.is_primary_server_fs = false;
+                    fs.is_writable = !read_only;
+
+                    return (inner_path, Arc::new(fs));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        server = %server.uuid,
+                        "failed to open mount source for writable fs: {:?}",
+                        err
+                    );
+                    if read_only {
+                        let mut fs = self.cap_filesystem.get_virtual(server.clone());
+                        fs.is_primary_server_fs = true;
+                        fs.is_writable = false;
+
+                        return (inner_path, Arc::new(fs));
+                    }
+                }
+            }
+        }
+
         let mut fs = self.cap_filesystem.get_virtual(server.clone());
         fs.is_primary_server_fs = true;
         fs.is_writable = true;
 
-        (self.relative_path(path.as_ref()), Arc::new(fs))
+        (path, Arc::new(fs))
     }
 
     pub async fn truncate_path(&self, path: impl AsRef<Path>) -> Result<(), anyhow::Error> {
@@ -812,6 +955,12 @@ impl Filesystem {
                     file_read.reader,
                     Arc::clone(&progress),
                 );
+
+                if let Some(parent) = destination_path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    destination_filesystem.async_create_dir_all(&parent).await?;
+                }
 
                 let mut writer = destination_filesystem
                     .async_create_file(&destination_path)
@@ -1096,6 +1245,8 @@ impl Filesystem {
 
         #[cfg(unix)]
         {
+            use std::os::fd::AsFd;
+
             let metadata = self.async_metadata(path.as_ref()).await?;
 
             let owner_uid = rustix::fs::Uid::from_raw_unchecked(self.config.system.user.uid);
@@ -1337,8 +1488,11 @@ impl Filesystem {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into(),
-            mode: encode_mode(metadata.permissions().mode()),
-            mode_bits: compact_str::format_compact!("{:o}", metadata.permissions().mode() & 0o777),
+            mode: encode_mode(PortablePermissions::from(metadata.permissions()).mode),
+            mode_bits: compact_str::format_compact!(
+                "{:o}",
+                PortablePermissions::from(metadata.permissions()).mode & 0o777
+            ),
             size,
             size_physical,
             editable: real_metadata.is_file() && detected_mime.valid_utf8,
@@ -1414,8 +1568,11 @@ impl Filesystem {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into(),
-            mode: encode_mode(metadata.permissions().mode()),
-            mode_bits: compact_str::format_compact!("{:o}", metadata.permissions().mode() & 0o777),
+            mode: encode_mode(PortablePermissions::from(metadata.permissions()).mode),
+            mode_bits: compact_str::format_compact!(
+                "{:o}",
+                PortablePermissions::from(metadata.permissions()).mode & 0o777
+            ),
             size,
             size_physical,
             editable: real_metadata.is_file() && detected_mime.valid_utf8,
@@ -1479,7 +1636,7 @@ impl Filesystem {
                 None
             };
 
-        let mime_key = (&metadata).into();
+        let mime_key = crate::routes::MimeCacheKey::from(&metadata);
         let detected_mime =
             if let Some(detected_mime) = self.app_state.mime_cache.get(&mime_key).await {
                 detected_mime
@@ -1491,7 +1648,7 @@ impl Filesystem {
                             .as_ref()
                             .is_some_and(|m| m.is_file()))
                 {
-                    match self
+                    match filesystem
                         .async_open(symlink_destination.as_ref().unwrap_or(&path))
                         .await
                     {

@@ -1,4 +1,4 @@
-use cap_std::fs::Permissions;
+use crate::utils::PortablePermissions;
 use cap_std::time::SystemTime;
 use std::future::Future;
 use std::path::Path;
@@ -26,7 +26,7 @@ impl FileSystemWriter {
     pub fn new(
         server: crate::server::Server,
         destination: &Path,
-        permissions: Option<Permissions>,
+        permissions: Option<PortablePermissions>,
         modified: Option<SystemTime>,
     ) -> Result<Self, anyhow::Error> {
         let parent_path = destination.parent().ok_or_else(|| {
@@ -164,7 +164,7 @@ impl AsyncFileSystemWriter {
     pub async fn new(
         server: crate::server::Server,
         destination: &Path,
-        permissions: Option<Permissions>,
+        permissions: Option<PortablePermissions>,
         modified: Option<SystemTime>,
     ) -> Result<Self, anyhow::Error> {
         let parent_path = destination.parent().ok_or_else(|| {

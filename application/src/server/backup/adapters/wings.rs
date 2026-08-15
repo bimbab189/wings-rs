@@ -19,10 +19,9 @@ use crate::{
             },
         },
     },
-    utils::PortableModeExt,
+    utils::PortablePermissions,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use cap_std::fs::Permissions;
 use sha1::Digest;
 use std::{
     io::Write,
@@ -87,18 +86,15 @@ impl WingsBackup {
 
 #[async_trait::async_trait]
 impl BackupFindExt for WingsBackup {
-    async fn exists(
-        config: &Arc<crate::config::Config>,
-        uuid: uuid::Uuid,
-    ) -> Result<bool, anyhow::Error> {
-        Ok(Self::get_first_file_name(config, uuid).await.is_ok())
+    async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
+        Ok(Self::get_first_file_name(&state.config, uuid).await.is_ok())
     }
 
     async fn find(
-        config: &Arc<crate::config::Config>,
+        state: &crate::routes::State,
         uuid: uuid::Uuid,
     ) -> Result<Option<Backup>, anyhow::Error> {
-        if let Ok((format, path)) = Self::get_first_file_name(config, uuid).await {
+        if let Ok((format, path)) = Self::get_first_file_name(&state.config, uuid).await {
             Ok(Some(Backup::Wings(Self { uuid, format, path })))
         } else {
             Ok(None)
@@ -249,7 +245,7 @@ impl BackupCreateExt for WingsBackup {
         loop {
             match file.read(&mut buffer).await? {
                 0 => break,
-                bytes_read => checksum_writer.write_all(&buffer[..bytes_read])?,
+                bytes_read => checksum_writer.update(&buffer[..bytes_read]),
             }
         }
 
@@ -262,7 +258,7 @@ impl BackupCreateExt for WingsBackup {
         }
 
         Ok(RawServerBackup {
-            checksum: format!("{:x}", checksum_writer.finalize()),
+            checksum: hex::encode(checksum_writer.finalize()),
             checksum_type: "sha1".into(),
             size,
             files: total_files,
@@ -286,7 +282,7 @@ impl BackupExt for WingsBackup {
 
     async fn download(
         &self,
-        _config: &Arc<crate::config::Config>,
+        _state: &crate::routes::State,
         _archive_format: StreamableArchiveFormat,
         range: Option<ByteRange>,
     ) -> Result<ApiResponse, anyhow::Error> {
@@ -380,7 +376,7 @@ impl BackupExt for WingsBackup {
                             tar::EntryType::Directory => {
                                 server.filesystem.create_dir_all(destination_path)?;
                                 if let Ok(permissions) =
-                                    header.mode().map(Permissions::from_portable_mode)
+                                    header.mode().map(PortablePermissions::from_mode)
                                 {
                                     server
                                         .filesystem
@@ -406,7 +402,7 @@ impl BackupExt for WingsBackup {
                                     crate::server::filesystem::writer::FileSystemWriter::new(
                                         server.clone(),
                                         destination_path,
-                                        header.mode().map(Permissions::from_portable_mode).ok(),
+                                        header.mode().map(PortablePermissions::from_mode).ok(),
                                         header
                                             .mtime()
                                             .map(|t| {
@@ -525,7 +521,7 @@ impl BackupExt for WingsBackup {
                                         server.filesystem.create_dir_all(&path)?;
                                         server.filesystem.set_permissions(
                                             &path,
-                                            Permissions::from_portable_mode(
+                                            PortablePermissions::from_mode(
                                                 entry.unix_mode().unwrap_or(0o755),
                                             ),
                                         )?;
@@ -539,7 +535,7 @@ impl BackupExt for WingsBackup {
                                         let mut writer = crate::server::filesystem::writer::FileSystemWriter::new(
                                             server.clone(),
                                             &path,
-                                            entry.unix_mode().map(Permissions::from_portable_mode),
+                                            entry.unix_mode().map(PortablePermissions::from_mode),
                                             crate::server::filesystem::archive::zip_entry_get_modified_time(&entry),
                                         )?;
                                         let mut reader = CountingReader::new_with_bytes_read(
@@ -772,8 +768,13 @@ impl BackupExt for WingsBackup {
         Ok(())
     }
 
-    async fn delete(&self, _config: &Arc<crate::config::Config>) -> Result<(), anyhow::Error> {
+    async fn delete(&self, state: &crate::routes::State) -> Result<(), anyhow::Error> {
         tokio::fs::remove_file(&self.path).await?;
+
+        state
+            .backup_manager
+            .invalidate_cached_browse(self.uuid)
+            .await;
 
         Ok(())
     }

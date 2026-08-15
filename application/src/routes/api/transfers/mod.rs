@@ -50,13 +50,12 @@ pub(crate) mod post {
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
         server::transfer::TransferArchiveFormat,
-        utils::PortableModeExt,
+        utils::PortablePermissions,
     };
     use axum::{
         extract::Multipart,
         http::{HeaderMap, StatusCode},
     };
-    use cap_std::fs::Permissions;
     use futures::TryStreamExt;
     use serde::Serialize;
     use sha1::Digest;
@@ -222,7 +221,7 @@ pub(crate) mod post {
                                 let mut directory_entries = chunked_vec::ChunkedVec::new();
                                 let mut entries = archive.entries()?;
 
-                                let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+                                let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
                                 while let Some(Ok(mut entry)) = entries.next() {
                                     let path = entry.path()?;
 
@@ -237,7 +236,7 @@ pub(crate) mod post {
                                         tar::EntryType::Directory => {
                                             server.filesystem.create_dir_all(destination_path)?;
                                             if let Ok(permissions) =
-                                                header.mode().map(Permissions::from_portable_mode)
+                                                header.mode().map(PortablePermissions::from_mode)
                                             {
                                                 server.filesystem.set_permissions(
                                                     destination_path,
@@ -261,7 +260,7 @@ pub(crate) mod post {
                                                 crate::server::filesystem::writer::FileSystemWriter::new(
                                                     server.clone(),
                                                     destination_path,
-                                                    header.mode().map(Permissions::from_portable_mode).ok(),
+                                                    header.mode().map(PortablePermissions::from_mode).ok(),
                                                     header
                                                         .mtime()
                                                         .map(|t| {
@@ -328,7 +327,7 @@ pub(crate) mod post {
                                 archive_checksum = Some(inner.finish());
                             } else if field.name() == Some("checksum") {
                                 let archive_checksum = match archive_checksum.take() {
-                                    Some(checksum) => format!("{:x}", checksum),
+                                    Some(checksum) => hex::encode(checksum),
                                     None => {
                                         return Err(anyhow::anyhow!(
                                             "archive checksum does not match multipart checksum, None to be found"
@@ -386,7 +385,7 @@ pub(crate) mod post {
                                     None => {
                                         if field.name().is_some_and(|n| n.contains("checksum")) {
                                             let backup_checksum = match backup_checksum.take() {
-                                                Some(checksum) => format!("{:x}", checksum),
+                                                Some(checksum) => hex::encode(checksum),
                                                 None => {
                                                     return Err(anyhow::anyhow!(
                                                         "backup checksum does not match multipart checksum, None to be found"

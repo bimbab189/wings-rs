@@ -9,7 +9,7 @@ use bollard::container::{
     RemoveContainerOptions,
 };
 use bollard::models::{HostConfig, Mount, MountTypeEnum};
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},

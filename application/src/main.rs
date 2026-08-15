@@ -7,7 +7,7 @@ use axum::{
     response::IntoResponse,
 };
 use colored::Colorize;
-use russh::{keys::ssh_key::rand_core::OsRng, server::Server};
+use russh::server::Server;
 use std::{net::SocketAddr, path::Path, sync::Arc, time::Instant};
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa_axum::router::OpenApiRouter;
@@ -101,8 +101,8 @@ async fn handle_cors(
 #[tokio::main]
 async fn main() {
     let cli = wings_rs::commands::CliCommandGroupBuilder::new(
-        "panel-rs",
-        "The panel server allowing control of game servers.",
+        "wings-rs",
+        "The wings server implementing server management for the panel.",
     );
 
     let mut cli = wings_rs::commands::commands(cli);
@@ -241,7 +241,7 @@ async fn main() {
                     bollard::API_DEFAULT_VERSION,
                 )
             } else {
-                bollard::Docker::connect_with_unix(
+                bollard::Docker::connect_with_local(
                     &config.docker.socket,
                     120,
                     bollard::API_DEFAULT_VERSION,
@@ -287,9 +287,7 @@ async fn main() {
         docker: Arc::clone(&docker),
         stats_manager: Arc::new(wings_rs::stats::StatsManager::default()),
         server_manager: Arc::new(wings_rs::server::manager::ServerManager::new(&servers)),
-        backup_manager: Arc::new(wings_rs::server::backup::manager::BackupManager::new(
-            Arc::clone(&config),
-        )),
+        backup_manager: Arc::new(wings_rs::server::backup::manager::BackupManager::default()),
         inotify_manager: Arc::new(
             wings_rs::server::filesystem::inotify::InotifyManager::new()
                 .context("failed to initialize inotify manager")
@@ -330,7 +328,7 @@ async fn main() {
         .with_state(state.clone());
 
     let (mut router, mut openapi) = app.split_for_parts();
-    openapi.info.version = state.version.clone();
+    openapi.info.version = "1.0.0".into();
     openapi.info.description = None;
     openapi.info.title = format!("{} Wings API", config.app_name);
     openapi.info.contact = None;
@@ -406,7 +404,7 @@ async fn main() {
                         );
 
                         let key = russh::keys::PrivateKey::random(
-                            &mut OsRng,
+                            &mut rand::rngs::ThreadRng::default(),
                             state
                                 .config
                                 .system
@@ -444,9 +442,7 @@ async fn main() {
                 };
 
                 let config = russh::server::Config {
-                    server_id: russh::SshId::Standard(
-                        format!("SSH-2.0-Calagopus-Wings-{}", wings_rs::VERSION).into(),
-                    ),
+                    server_id: russh::SshId::Standard("SSH-2.0-Calagopus-Wings".into()),
                     auth_rejection_time: std::time::Duration::from_secs(0),
                     auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
                     maximum_packet_size: 32 * 1024,
@@ -486,6 +482,7 @@ async fn main() {
         });
     }
 
+    #[cfg(unix)]
     tokio::spawn(async move {
         let mut signal =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).unwrap();

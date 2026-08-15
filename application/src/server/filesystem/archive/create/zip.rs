@@ -5,8 +5,8 @@ use crate::{
         counting_reader::CountingReader,
     },
     server::filesystem::virtualfs::IsIgnoredFn,
+    utils::PortablePermissions,
 };
-use cap_std::fs::PermissionsExt;
 use chrono::{Datelike, Timelike};
 use std::{
     io::{Read, Seek, Write},
@@ -54,7 +54,7 @@ pub async fn create_zip<W: Write + Seek + Send + 'static>(
             let mut zip_options: zip::write::FileOptions<'_, ()> =
                 zip::write::FileOptions::default()
                     .compression_level(Some(options.compression_level.to_deflate_level() as i64))
-                    .unix_permissions(source_metadata.permissions().mode())
+                    .unix_permissions(PortablePermissions::from(source_metadata.permissions()).mode)
                     .large_file(true);
 
             if let Ok(mtime) = source_metadata.modified() {
@@ -97,7 +97,9 @@ pub async fn create_zip<W: Write + Seek + Send + 'static>(
                             .compression_level(Some(
                                 options.compression_level.to_deflate_level() as i64
                             ))
-                            .unix_permissions(metadata.permissions().mode())
+                            .unix_permissions(
+                                PortablePermissions::from(metadata.permissions()).mode,
+                            )
                             .large_file(true);
 
                     if let Ok(mtime) = metadata.modified() {
@@ -209,7 +211,7 @@ pub async fn create_zip_streaming<W: Write + Send + 'static>(
             let mut zip_options: zip::write::FileOptions<'_, ()> =
                 zip::write::FileOptions::default()
                     .compression_level(Some(options.compression_level.to_deflate_level() as i64))
-                    .unix_permissions(source_metadata.permissions().mode())
+                    .unix_permissions(PortablePermissions::from(source_metadata.permissions()).mode)
                     .large_file(true);
 
             if let Ok(mtime) = source_metadata.modified() {
@@ -252,7 +254,9 @@ pub async fn create_zip_streaming<W: Write + Send + 'static>(
                             .compression_level(Some(
                                 options.compression_level.to_deflate_level() as i64
                             ))
-                            .unix_permissions(metadata.permissions().mode())
+                            .unix_permissions(
+                                PortablePermissions::from(metadata.permissions()).mode,
+                            )
                             .large_file(true);
 
                     if let Ok(mtime) = metadata.modified() {

@@ -6,8 +6,8 @@ use crate::{
         fixed_reader::FixedReader,
     },
     server::filesystem::virtualfs::IsIgnoredFn,
+    utils::PortablePermissions,
 };
-use cap_std::fs::PermissionsExt;
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -60,7 +60,7 @@ pub async fn create_tar<W: Write + Send + 'static>(
 
             let mut header = tar::Header::new_gnu();
             header.set_size(0);
-            header.set_mode(source_metadata.permissions().mode());
+            header.set_mode(PortablePermissions::from(source_metadata.permissions()).mode);
             header.set_mtime(
                 source_metadata
                     .modified()
@@ -97,7 +97,7 @@ pub async fn create_tar<W: Write + Send + 'static>(
 
                     let mut header = tar::Header::new_gnu();
                     header.set_size(0);
-                    header.set_mode(metadata.permissions().mode());
+                    header.set_mode(PortablePermissions::from(metadata.permissions()).mode);
                     header.set_mtime(
                         metadata
                             .modified()
@@ -155,6 +155,7 @@ pub async fn create_tar<W: Write + Send + 'static>(
                 };
                 let reader =
                     FixedReader::new_with_fixed_bytes(reader, source_metadata.len() as usize);
+                let reader = std::io::BufReader::with_capacity(crate::BUFFER_SIZE, reader);
 
                 header.set_size(source_metadata.len());
                 header.set_entry_type(tar::EntryType::Regular);
@@ -213,7 +214,7 @@ pub async fn create_tar_distributed<W: Write + Send + 'static>(
 
             let mut header = tar::Header::new_gnu();
             header.set_size(0);
-            header.set_mode(source_metadata.permissions().mode());
+            header.set_mode(PortablePermissions::from(source_metadata.permissions()).mode);
             header.set_mtime(
                 source_metadata
                     .modified()
@@ -244,6 +245,7 @@ pub async fn create_tar_distributed<W: Write + Send + 'static>(
                 };
                 let reader =
                     FixedReader::new_with_fixed_bytes(reader, source_metadata.len() as usize);
+                let reader = std::io::BufReader::with_capacity(crate::TRANSFER_BUFFER_SIZE, reader);
 
                 header.set_size(source_metadata.len());
                 header.set_entry_type(tar::EntryType::Regular);

@@ -13,9 +13,8 @@ use crate::{
             virtualfs::{ByteRange, VirtualReadableFilesystem},
         },
     },
-    utils::PortableModeExt,
+    utils::PortablePermissions,
 };
-use cap_std::fs::Permissions;
 use futures::TryStreamExt;
 use sha1::Digest;
 use std::{
@@ -137,16 +136,13 @@ impl S3Backup {
 
 #[async_trait::async_trait]
 impl BackupFindExt for S3Backup {
-    async fn exists(
-        config: &Arc<crate::config::Config>,
-        uuid: uuid::Uuid,
-    ) -> Result<bool, anyhow::Error> {
-        let path = Self::get_file_name(config, uuid);
+    async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
+        let path = Self::get_file_name(&state.config, uuid);
         Ok(tokio::fs::metadata(&path).await.is_ok())
     }
 
     async fn find(
-        _config: &Arc<crate::config::Config>,
+        _state: &crate::routes::State,
         uuid: uuid::Uuid,
     ) -> Result<Option<Backup>, anyhow::Error> {
         Ok(Some(Backup::S3(S3Backup { uuid })))
@@ -189,7 +185,7 @@ impl BackupCreateExt for S3Backup {
                 total.fetch_add(bytes_read as u64, Ordering::Relaxed);
             }
 
-            Ok::<_, anyhow::Error>(format!("{:x}", sha1.finalize()))
+            Ok::<_, anyhow::Error>(hex::encode(sha1.finalize()))
         };
 
         let total_task = {
@@ -389,7 +385,7 @@ impl BackupExt for S3Backup {
 
     async fn download(
         &self,
-        _config: &Arc<crate::config::Config>,
+        _state: &crate::routes::State,
         _archive_format: StreamableArchiveFormat,
         _range: Option<ByteRange>,
     ) -> Result<crate::response::ApiResponse, anyhow::Error> {
@@ -440,12 +436,13 @@ impl BackupExt for S3Backup {
                 reader,
                 CompressionType::Gz,
             )?;
+            let reader = std::io::BufReader::with_capacity(crate::TRANSFER_BUFFER_SIZE, reader);
 
             let mut archive = tar::Archive::new(reader);
             let mut directory_entries = Vec::new();
             let entries = archive.entries()?;
 
-            let mut read_buffer = vec![0; crate::BUFFER_SIZE];
+            let mut read_buffer = vec![0; crate::TRANSFER_BUFFER_SIZE];
             for entry in entries {
                 let mut entry = entry?;
                 let path = entry.path()?;
@@ -462,7 +459,7 @@ impl BackupExt for S3Backup {
                             .filesystem
                             .set_permissions(
                                 path.as_ref(),
-                                Permissions::from_portable_mode(header.mode().unwrap_or(0o755)),
+                                PortablePermissions::from_mode(header.mode().unwrap_or(0o755)),
                             )?;
 
                         if let Ok(modified_time) = header.mtime() {
@@ -479,7 +476,7 @@ impl BackupExt for S3Backup {
                         let mut writer = crate::server::filesystem::writer::FileSystemWriter::new(
                             server.clone(),
                             &path,
-                            Some(Permissions::from_portable_mode(header.mode().unwrap_or(0o644))),
+                            Some(PortablePermissions::from_mode(header.mode().unwrap_or(0o644))),
                             header
                                 .mtime()
                                 .map(|t| {
@@ -528,11 +525,16 @@ impl BackupExt for S3Backup {
         Ok(())
     }
 
-    async fn delete(&self, config: &Arc<crate::config::Config>) -> Result<(), anyhow::Error> {
-        let file_name = Self::get_file_name(config, self.uuid);
+    async fn delete(&self, state: &crate::routes::State) -> Result<(), anyhow::Error> {
+        let file_name = Self::get_file_name(&state.config, self.uuid);
         if tokio::fs::metadata(&file_name).await.is_ok() {
             tokio::fs::remove_file(&file_name).await?;
         }
+
+        state
+            .backup_manager
+            .invalidate_cached_browse(self.uuid)
+            .await;
 
         Ok(())
     }

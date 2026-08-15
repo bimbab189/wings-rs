@@ -15,8 +15,8 @@ use crate::{
             },
         },
     },
+    utils::PortablePermissions,
 };
-use cap_std::fs::Permissions;
 use chrono::{Datelike, Timelike};
 use ddup_bak::archive::entries::Entry;
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
@@ -196,21 +196,18 @@ impl DdupBakBackup {
 
 #[async_trait::async_trait]
 impl BackupFindExt for DdupBakBackup {
-    async fn exists(
-        config: &Arc<crate::config::Config>,
-        uuid: uuid::Uuid,
-    ) -> Result<bool, anyhow::Error> {
-        let repository = get_repository(config).await?;
+    async fn exists(state: &crate::routes::State, uuid: uuid::Uuid) -> Result<bool, anyhow::Error> {
+        let repository = get_repository(&state.config).await?;
         let path = repository.archive_path(&uuid.to_string());
 
         Ok(tokio::fs::metadata(&path).await.is_ok())
     }
 
     async fn find(
-        config: &Arc<crate::config::Config>,
+        state: &crate::routes::State,
         uuid: uuid::Uuid,
     ) -> Result<Option<Backup>, anyhow::Error> {
-        let repository = get_repository(config).await?;
+        let repository = get_repository(&state.config).await?;
 
         if let Ok(archive) =
             tokio::task::spawn_blocking(move || repository.get_archive(&uuid.to_string())).await?
@@ -376,7 +373,11 @@ impl BackupCreateExt for DdupBakBackup {
         }
 
         Ok(RawServerBackup {
-            checksum: format!("{}-{:x}", file.metadata().await?.len(), sha1.finalize()),
+            checksum: format!(
+                "{}-{}",
+                file.metadata().await?.len(),
+                hex::encode(sha1.finalize())
+            ),
             checksum_type: "ddup-sha1".into(),
             size: total_size,
             files: total_files,
@@ -397,14 +398,14 @@ impl BackupExt for DdupBakBackup {
 
     async fn download(
         &self,
-        config: &Arc<crate::config::Config>,
+        state: &crate::routes::State,
         archive_format: StreamableArchiveFormat,
         _range: Option<ByteRange>,
     ) -> Result<ApiResponse, anyhow::Error> {
-        let repository = get_repository(config).await?;
+        let repository = get_repository(&state.config).await?;
 
         let archive = self.archive.clone();
-        let compression_level = config.system.backups.compression_level;
+        let compression_level = state.config.system.backups.compression_level;
         let (reader, writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
         match archive_format {
@@ -435,7 +436,7 @@ impl BackupExt for DdupBakBackup {
                     tokio_util::io::SyncIoBridge::new(writer),
                     archive_format.compression_format(),
                     compression_level,
-                    config.api.file_compression_threads,
+                    state.config.api.file_compression_threads,
                 )?;
 
                 crate::spawn_blocking_handled(move || -> Result<(), anyhow::Error> {
@@ -528,7 +529,7 @@ impl BackupExt for DdupBakBackup {
                         let mut writer = crate::server::filesystem::writer::FileSystemWriter::new(
                             server.clone(),
                             &path,
-                            Some(Permissions::from_std(file.mode.into())),
+                            Some(PortablePermissions::from_mode(file.mode.bits())),
                             Some(cap_std::time::SystemTime::from_std(file.mtime)),
                         )?;
                         let reader = repository.entry_reader(Entry::File(file.clone()))?;
@@ -542,7 +543,7 @@ impl BackupExt for DdupBakBackup {
                         server.filesystem.create_dir_all(&path)?;
                         server.filesystem.set_permissions(
                             &path,
-                            cap_std::fs::Permissions::from_std(directory.mode.into()),
+                            PortablePermissions::from_mode(directory.mode.bits()),
                         )?;
 
                         for entry in &directory.entries {
@@ -580,8 +581,8 @@ impl BackupExt for DdupBakBackup {
         Ok(())
     }
 
-    async fn delete(&self, config: &Arc<crate::config::Config>) -> Result<(), anyhow::Error> {
-        let repository = get_repository(config).await?;
+    async fn delete(&self, state: &crate::routes::State) -> Result<(), anyhow::Error> {
+        let repository = get_repository(&state.config).await?;
 
         let uuid = self.uuid;
         tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
@@ -591,6 +592,11 @@ impl BackupExt for DdupBakBackup {
             Ok(())
         })
         .await??;
+
+        state
+            .backup_manager
+            .invalidate_cached_browse(self.uuid)
+            .await;
 
         Ok(())
     }

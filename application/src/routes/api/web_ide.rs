@@ -11,7 +11,7 @@ use axum::{
 };
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{

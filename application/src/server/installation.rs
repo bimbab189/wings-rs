@@ -5,7 +5,6 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs::Permissions,
     path::Path,
     sync::{Arc, atomic::Ordering},
 };
@@ -163,8 +162,10 @@ impl ServerInstaller {
     }
 
     pub async fn start(self: &mut Arc<Self>, force: bool) -> Result<(), anyhow::Error> {
-        if self.server.is_locked_state() {
-            return Err(anyhow::anyhow!("server is in a locked state"));
+        if let Some(state) = self.server.locked_state() {
+            return Err(anyhow::anyhow!(
+                "server is in a locked state ({state}), cannot start installation process"
+            ));
         }
 
         self.server.stop_web_ide_sessions("server_installing").await;
@@ -915,7 +916,7 @@ impl ServerInstaller {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&tmp_dir, Permissions::from_mode(0o755)).await?;
+            tokio::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755)).await?;
         }
 
         Ok(bollard::container::Config {

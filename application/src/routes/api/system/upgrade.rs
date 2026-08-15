@@ -95,14 +95,11 @@ pub(crate) mod post {
             .headers(headers)
             .send()
             .await?;
-        let mut file = tokio::fs::File::options()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .read(true)
-            .mode(0o766)
-            .open(&tmp_file)
-            .await?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true).read(true);
+        #[cfg(unix)]
+        options.mode(0o766);
+        let mut file = options.open(&tmp_file).await?;
 
         while let Some(chunk) = response.chunk().await? {
             file.write_all(&chunk).await?;
@@ -125,7 +122,7 @@ pub(crate) mod post {
 
         drop(file);
 
-        if format!("{:x}", hasher.finalize()) != data.sha256 {
+        if hex::encode(hasher.finalize()) != data.sha256 {
             tokio::fs::remove_file(tmp_file).await.ok();
 
             return ApiResponse::error("downloaded file does not match provided sha256")
