@@ -787,7 +787,11 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
 
                     let file_type = VirtualSevenZipArchive::seven_zip_entry_to_file_type(entry);
 
-                    if let Some(name) = (self.is_ignored)(file_type, name.to_path_buf()) {
+                    if let Some(name) = self
+                        .is_ignored
+                        .call_async(file_type, name.to_path_buf())
+                        .await
+                    {
                         return Some(Ok((file_type, name)));
                     }
                 }
@@ -1333,14 +1337,12 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                         if relative.components().count() == 0 {
                             continue;
                         }
-                        if (is_ignored)(
+                        let Some(relative) = (is_ignored)(
                             VirtualSevenZipArchive::seven_zip_entry_to_file_type(entry),
-                            relative.clone(),
-                        )
-                        .is_none()
-                        {
+                            relative,
+                        ) else {
                             continue;
-                        }
+                        };
                         entries.push((relative, i));
                     }
                     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -1359,11 +1361,6 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
                             continue;
                         };
 
-                        // 7z names come from the source archive rather than from
-                        // readdir, so they can hold bytes itaf rejects (NUL is
-                        // representable in 7z's UTF-16 names). Validate the whole
-                        // chain before touching dir_stack so a skip cannot leave
-                        // the encoder's directory nesting unbalanced.
                         if let Some(invalid) = components
                             .iter()
                             .find(|c| itaf::spec::validate_name(c).is_err())
@@ -1447,9 +1444,6 @@ impl VirtualReadableFilesystem for VirtualSevenZipArchive {
 
                                     Ok(false)
                                 })
-                                // Not unwrap_or_default: a failure here can land
-                                // mid-entry, and swallowing it would let finish()
-                                // hand back a well-formed but silently wrong archive.
                                 .map_err(|err| {
                                     anyhow::anyhow!("failed to write 7z entry to itaf: {err}")
                                 })?;

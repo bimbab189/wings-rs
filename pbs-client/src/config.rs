@@ -49,6 +49,12 @@ impl PbsConfig {
 
         if let Some(fingerprint) = &self.fingerprint {
             super::tls::normalize_fingerprint(fingerprint).map_err(PbsError::Config)?;
+
+            if self.url.starts_with("http://") {
+                return Err(PbsError::Config(
+                    "fingerprint pinning requires an https:// url".into(),
+                ));
+            }
         }
 
         Ok(())

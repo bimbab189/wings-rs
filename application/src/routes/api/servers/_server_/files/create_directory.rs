@@ -5,6 +5,7 @@ pub(crate) mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
+        server::filesystem::cap::FileType,
     };
     use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
@@ -47,7 +48,12 @@ pub(crate) mod post {
                 .ok();
         }
 
-        if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(&root, true) {
+        if filesystem.is_primary_server_fs()
+            && server
+                .filesystem
+                .async_is_ignored(&root, FileType::Dir)
+                .await
+        {
             return ApiResponse::error("path not found")
                 .with_status(StatusCode::NOT_FOUND)
                 .ok();
@@ -55,7 +61,12 @@ pub(crate) mod post {
 
         let destination = root.join(&data.name);
 
-        if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(&destination, true) {
+        if filesystem.is_primary_server_fs()
+            && server
+                .filesystem
+                .async_is_ignored(&destination, FileType::Dir)
+                .await
+        {
             return ApiResponse::error("destination not found")
                 .with_status(StatusCode::EXPECTATION_FAILED)
                 .ok();

@@ -39,6 +39,13 @@ impl VirtualCapFilesystem {
         self
     }
 
+    fn denied() -> anyhow::Error {
+        anyhow::anyhow!(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "File not found"
+        ))
+    }
+
     pub fn check_ignored(
         &self,
         file_type: FileType,
@@ -49,13 +56,34 @@ impl VirtualCapFilesystem {
             return Ok(path);
         };
         let Some(path) = (is_ignored)(file_type, path) else {
-            return Err(anyhow::anyhow!(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "File not found"
-            )));
+            return Err(Self::denied());
         };
 
         Ok(path)
+    }
+
+    pub async fn async_check_ignored(
+        &self,
+        file_type: FileType,
+        path: impl Into<PathBuf>,
+    ) -> Result<PathBuf, anyhow::Error> {
+        let path = path.into();
+        let Some(is_ignored) = &self.is_ignored else {
+            return Ok(path);
+        };
+        let Some(path) = is_ignored.call_async(file_type, path).await else {
+            return Err(Self::denied());
+        };
+
+        Ok(path)
+    }
+
+    pub fn is_denied(&self, file_type: FileType, path: &Path) -> bool {
+        self.check_ignored(file_type, path).is_err()
+    }
+
+    pub async fn async_is_denied(&self, file_type: FileType, path: &Path) -> bool {
+        self.async_check_ignored(file_type, path).await.is_err()
     }
 
     #[inline]
@@ -72,7 +100,9 @@ impl VirtualCapFilesystem {
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<crate::server::filesystem::PreparedDirectoryEntry, anyhow::Error> {
         let metadata = self.inner.async_symlink_metadata(path).await?;
-        let path = self.check_ignored(metadata.file_type().into(), path.as_ref())?;
+        let path = self
+            .async_check_ignored(metadata.file_type().into(), path.as_ref())
+            .await?;
 
         Ok(self
             .server
@@ -116,7 +146,8 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         let metadata = self.inner.async_metadata(path).await?;
         let metadata: FileMetadata = metadata.into();
 
-        self.check_ignored(metadata.file_type, path.as_ref())?;
+        self.async_check_ignored(metadata.file_type, path.as_ref())
+            .await?;
 
         Ok(metadata)
     }
@@ -139,7 +170,8 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         let metadata = self.inner.async_symlink_metadata(path).await?;
         let metadata: FileMetadata = metadata.into();
 
-        self.check_ignored(metadata.file_type, path.as_ref())?;
+        self.async_check_ignored(metadata.file_type, path.as_ref())
+            .await?;
 
         Ok(metadata)
     }
@@ -150,7 +182,9 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
     ) -> Result<DirectoryEntry, anyhow::Error> {
         let metadata = self.inner.async_symlink_metadata(path).await?;
 
-        let path = self.check_ignored(metadata.file_type().into(), path.as_ref())?;
+        let path = self
+            .async_check_ignored(metadata.file_type().into(), path.as_ref())
+            .await?;
 
         Ok(self
             .server
@@ -171,7 +205,9 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
     ) -> Result<DirectoryEntry, anyhow::Error> {
         let metadata = self.inner.async_symlink_metadata(path).await?;
 
-        let path = self.check_ignored(metadata.file_type().into(), path.as_ref())?;
+        let path = self
+            .async_check_ignored(metadata.file_type().into(), path.as_ref())
+            .await?;
 
         Ok(self
             .server
@@ -466,7 +502,9 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         path: &(dyn AsRef<Path> + Send + Sync),
         range: Option<ByteRange>,
     ) -> Result<AsyncFileRead, anyhow::Error> {
-        let path = self.check_ignored(FileType::File, path.as_ref())?;
+        let path = self
+            .async_check_ignored(FileType::File, path.as_ref())
+            .await?;
         let file = self.inner.async_open(path).await?;
 
         Ok(AsyncFileRead::from_file(file, range).await?)
@@ -485,7 +523,9 @@ impl super::VirtualReadableFilesystem for VirtualCapFilesystem {
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<PathBuf, anyhow::Error> {
-        let path = self.check_ignored(FileType::Symlink, path.as_ref())?;
+        let path = self
+            .async_check_ignored(FileType::Symlink, path.as_ref())
+            .await?;
         let link_path = self.inner.async_read_link(&path).await?;
 
         Ok(link_path)
@@ -651,7 +691,9 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error> {
         self.check_writable()?;
-        let path = self.check_ignored(FileType::Dir, path.as_ref())?;
+        let path = self
+            .async_check_ignored(FileType::Dir, path.as_ref())
+            .await?;
 
         if self.is_primary_server_fs {
             self.server
@@ -678,7 +720,9 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error> {
         self.check_writable()?;
-        let path = self.check_ignored(FileType::Dir, path.as_ref())?;
+        let path = self
+            .async_check_ignored(FileType::Dir, path.as_ref())
+            .await?;
 
         self.inner.async_remove_dir_all(path).await?;
 
@@ -698,7 +742,9 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error> {
         self.check_writable()?;
-        let path = self.check_ignored(FileType::File, path.as_ref())?;
+        let path = self
+            .async_check_ignored(FileType::File, path.as_ref())
+            .await?;
 
         self.inner.async_remove_file(path).await?;
 
@@ -727,8 +773,12 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         link: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<(), anyhow::Error> {
         self.check_writable()?;
-        let original = self.check_ignored(FileType::File, original.as_ref())?;
-        let link = self.check_ignored(FileType::Symlink, link.as_ref())?;
+        let original = self
+            .async_check_ignored(FileType::File, original.as_ref())
+            .await?;
+        let link = self
+            .async_check_ignored(FileType::Symlink, link.as_ref())
+            .await?;
 
         self.inner.async_symlink(original, &link).await?;
         if self.is_primary_server_fs {
@@ -765,7 +815,9 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         path: &(dyn AsRef<Path> + Send + Sync),
     ) -> Result<AsyncWritableSeekableFileStream, anyhow::Error> {
         self.check_writable()?;
-        let path = self.check_ignored(FileType::File, path.as_ref())?;
+        let path = self
+            .async_check_ignored(FileType::File, path.as_ref())
+            .await?;
 
         if self.is_primary_server_fs {
             let file = crate::server::filesystem::file::AsyncServerFile::new(
@@ -812,7 +864,9 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         options: cap_std::fs::OpenOptions,
     ) -> Result<AsyncReadableWritableSeekableFileStream, anyhow::Error> {
         self.check_writable()?;
-        let path = self.check_ignored(FileType::File, path.as_ref())?;
+        let path = self
+            .async_check_ignored(FileType::File, path.as_ref())
+            .await?;
 
         let file = self.inner.async_open_with(&path, options).await?;
 
@@ -833,10 +887,11 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
     fn set_permissions(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
+        file_type: FileType,
         permissions: PortablePermissions,
     ) -> Result<(), anyhow::Error> {
         self.check_writable()?;
-        let path = self.check_ignored(FileType::File, path.as_ref())?;
+        let path = self.check_ignored(file_type, path.as_ref())?;
 
         self.inner.set_permissions(path, permissions)?;
 
@@ -845,10 +900,11 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
     async fn async_set_permissions(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
+        file_type: FileType,
         permissions: PortablePermissions,
     ) -> Result<(), anyhow::Error> {
         self.check_writable()?;
-        let path = self.check_ignored(FileType::File, path.as_ref())?;
+        let path = self.async_check_ignored(file_type, path.as_ref()).await?;
 
         self.inner.async_set_permissions(path, permissions).await?;
 
@@ -858,11 +914,12 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
     fn set_times(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
+        file_type: FileType,
         modification_time: std::time::SystemTime,
         access_time: Option<std::time::SystemTime>,
     ) -> Result<(), anyhow::Error> {
         self.check_writable()?;
-        let path = self.check_ignored(FileType::File, path.as_ref())?;
+        let path = self.check_ignored(file_type, path.as_ref())?;
 
         self.inner.set_times(path, modification_time, access_time)?;
 
@@ -871,11 +928,12 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
     async fn async_set_times(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
+        file_type: FileType,
         modification_time: std::time::SystemTime,
         access_time: Option<std::time::SystemTime>,
     ) -> Result<(), anyhow::Error> {
         self.check_writable()?;
-        let path = self.check_ignored(FileType::File, path.as_ref())?;
+        let path = self.async_check_ignored(file_type, path.as_ref()).await?;
 
         self.inner
             .async_set_times(path, modification_time, access_time)
@@ -888,10 +946,11 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         &self,
         from: &(dyn AsRef<Path> + Send + Sync),
         to: &(dyn AsRef<Path> + Send + Sync),
+        file_type: FileType,
     ) -> Result<(), anyhow::Error> {
         self.check_writable()?;
-        let from = self.check_ignored(FileType::File, from.as_ref())?;
-        let to = self.check_ignored(FileType::File, to.as_ref())?;
+        let from = self.check_ignored(file_type, from.as_ref())?;
+        let to = self.check_ignored(file_type, to.as_ref())?;
 
         self.inner.rename(from, &self.inner, to)?;
 
@@ -901,10 +960,11 @@ impl super::VirtualWritableFilesystem for VirtualCapFilesystem {
         &self,
         from: &(dyn AsRef<Path> + Send + Sync),
         to: &(dyn AsRef<Path> + Send + Sync),
+        file_type: FileType,
     ) -> Result<(), anyhow::Error> {
         self.check_writable()?;
-        let from = self.check_ignored(FileType::File, from.as_ref())?;
-        let to = self.check_ignored(FileType::File, to.as_ref())?;
+        let from = self.async_check_ignored(file_type, from.as_ref()).await?;
+        let to = self.async_check_ignored(file_type, to.as_ref()).await?;
 
         self.inner.async_rename(from, &self.inner, to).await?;
 

@@ -40,7 +40,19 @@ impl ServerFile {
         let parent = server
             .filesystem
             .path_to_components(&server.filesystem.relative_path(parent_path));
-        let file = server.filesystem.create(destination)?;
+
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+
+        let file = server.filesystem.open_with(destination, options)?;
+        let previous_size = file
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map_or(0, |metadata| metadata.len());
+        if previous_size > 0 {
+            file.set_len(0)?;
+        }
 
         if let Some(permissions) = permissions {
             server
@@ -55,13 +67,20 @@ impl ServerFile {
             parent,
             file: Some(file),
             ignorant: false,
-            accumulated_bytes: 0,
+            accumulated_bytes: -(previous_size as i64),
             modified,
             current_position: 0,
             highest_position: 0,
         })
     }
 
+    /// Wraps an already opened file, accounting only for what is written past
+    /// `initial_size`.
+    ///
+    /// Positions are counted from this handle, not from the file, so `initial_size`
+    /// must be `0` for an `O_APPEND` handle: writes there land at the end of the file
+    /// while the handle's own position starts at zero, and any other value would leave
+    /// that many appended bytes uncharged.
     pub fn new_file(
         server: crate::server::Server,
         destination: &Path,
@@ -108,7 +127,7 @@ impl ServerFile {
     }
 
     fn allocate_accumulated(&mut self) -> std::io::Result<()> {
-        if self.accumulated_bytes > 0 {
+        if self.accumulated_bytes != 0 {
             if !self.server.filesystem.allocate_in_path_iterator(
                 &self.parent,
                 self.accumulated_bytes,
@@ -233,7 +252,7 @@ impl WriteAt for ServerFile {
 
 impl Drop for ServerFile {
     fn drop(&mut self) {
-        if self.accumulated_bytes > 0 {
+        if self.accumulated_bytes != 0 {
             let server = self.server.clone();
             let parent = self.parent.clone();
             let bytes = self.accumulated_bytes;
@@ -292,7 +311,23 @@ impl AsyncServerFile {
         let parent = server
             .filesystem
             .path_to_components(&server.filesystem.relative_path(parent_path));
-        let file = server.filesystem.async_create(destination).await?;
+
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+
+        let file = server
+            .filesystem
+            .async_open_with(destination, options)
+            .await?;
+        let previous_size = file
+            .metadata()
+            .await
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map_or(0, |metadata| metadata.len());
+        if previous_size > 0 {
+            file.set_len(0).await?;
+        }
 
         if let Some(permissions) = permissions {
             server
@@ -308,7 +343,7 @@ impl AsyncServerFile {
             parent,
             file: Some(file),
             ignorant: false,
-            accumulated_bytes: 0,
+            accumulated_bytes: -(previous_size as i64),
             allocating_bytes: 0,
             modified,
             allocation_in_progress: None,
@@ -317,6 +352,8 @@ impl AsyncServerFile {
         })
     }
 
+    /// Async counterpart of [`ServerFile::new_file`], with the same `initial_size`
+    /// requirement for `O_APPEND` handles.
     pub fn new_file(
         server: crate::server::Server,
         destination: &Path,
@@ -356,7 +393,7 @@ impl AsyncServerFile {
     }
 
     fn start_allocation(&mut self) {
-        if crate::likely(self.accumulated_bytes > 0 && self.allocation_in_progress.is_none()) {
+        if crate::likely(self.accumulated_bytes != 0 && self.allocation_in_progress.is_none()) {
             let server = self.server.clone();
             let parent = self.parent.clone();
             let bytes = self.accumulated_bytes;
@@ -442,7 +479,7 @@ impl AsyncWrite for AsyncServerFile {
             Poll::Pending => return Poll::Pending,
         }
 
-        if crate::likely(self.accumulated_bytes > 0) {
+        if crate::likely(self.accumulated_bytes != 0) {
             self.start_allocation();
 
             match self.poll_allocation(cx) {
@@ -466,7 +503,7 @@ impl AsyncWrite for AsyncServerFile {
             Poll::Pending => return Poll::Pending,
         }
 
-        if crate::likely(self.accumulated_bytes > 0) {
+        if crate::likely(self.accumulated_bytes != 0) {
             self.start_allocation();
 
             match self.poll_allocation(cx) {
@@ -486,7 +523,7 @@ impl AsyncWrite for AsyncServerFile {
 
 impl AsyncSeek for AsyncServerFile {
     fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
-        if crate::unlikely(self.accumulated_bytes > 0) {
+        if crate::unlikely(self.accumulated_bytes != 0) {
             self.start_allocation();
         }
 
@@ -535,7 +572,7 @@ impl AsyncRead for AsyncServerFile {
 impl Drop for AsyncServerFile {
     fn drop(&mut self) {
         let leftover = self.accumulated_bytes + self.allocating_bytes;
-        if leftover > 0 {
+        if leftover != 0 {
             let server = self.server.clone();
             let parent = self.parent.clone();
             let ignorant = self.ignorant;

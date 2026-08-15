@@ -15,7 +15,7 @@ pub(crate) mod post {
         },
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
-        server::transfer::TransferArchiveFormat,
+        server::{filesystem::cap::FileType, transfer::TransferArchiveFormat},
         utils::PortablePermissions,
     };
     use axum::{
@@ -153,6 +153,17 @@ pub(crate) mod post {
             .resolve_writable_fs(&server, &payload.destination_path)
             .await;
 
+        if filesystem.is_primary_server_fs()
+            && server
+                .filesystem
+                .async_is_ignored(&root, FileType::Dir)
+                .await
+        {
+            return ApiResponse::error("destination not found")
+                .with_status(StatusCode::NOT_FOUND)
+                .ok();
+        }
+
         filesystem.async_create_dir_all(&root).await?;
 
         let (_, task) = server
@@ -231,7 +242,7 @@ pub(crate) mod post {
                                                 if filesystem.is_primary_server_fs()
                                                     && server
                                                         .filesystem
-                                                        .is_ignored(&destination_path, is_dir)
+                                                        .is_ignored(&destination_path, FileType::from_is_dir(is_dir))
                                                 {
                                                     continue;
                                                 }
@@ -242,6 +253,7 @@ pub(crate) mod post {
                                                             .create_dir_all(&destination_path)?;
                                                         filesystem.set_permissions(
                                                             &destination_path,
+                                                            FileType::Dir,
                                                             PortablePermissions::from_mode_dir(
                                                                 dir.metadata().mode,
                                                             ),
@@ -324,7 +336,7 @@ pub(crate) mod post {
                                                 if filesystem.is_primary_server_fs()
                                                     && server
                                                         .filesystem
-                                                        .is_ignored(&destination_path, is_dir)
+                                                        .is_ignored(&destination_path, FileType::from_is_dir(is_dir))
                                                 {
                                                     continue;
                                                 }
@@ -337,6 +349,7 @@ pub(crate) mod post {
                                                         {
                                                             filesystem.set_permissions(
                                                                 &destination_path,
+                                                                FileType::Dir,
                                                                 permissions,
                                                             )?;
                                                         }

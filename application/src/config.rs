@@ -48,6 +48,34 @@ fn api_remote_download_blocked_cidrs() -> Vec<cidr::IpCidr> {
         ])
     }
 }
+fn api_schedule_steps_http_request_enabled() -> bool {
+    true
+}
+fn api_schedule_steps_http_request_blocked_cidrs() -> Vec<cidr::IpCidr> {
+    unsafe {
+        Vec::from([
+            cidr::IpCidr::from_str("0.0.0.0/8").unwrap_unchecked(),
+            cidr::IpCidr::from_str("127.0.0.0/8").unwrap_unchecked(),
+            cidr::IpCidr::from_str("10.0.0.0/8").unwrap_unchecked(),
+            cidr::IpCidr::from_str("100.64.0.0/10").unwrap_unchecked(),
+            cidr::IpCidr::from_str("172.16.0.0/12").unwrap_unchecked(),
+            cidr::IpCidr::from_str("192.168.0.0/16").unwrap_unchecked(),
+            cidr::IpCidr::from_str("169.254.0.0/16").unwrap_unchecked(),
+            cidr::IpCidr::from_str("::1/128").unwrap_unchecked(),
+            cidr::IpCidr::from_str("fe80::/10").unwrap_unchecked(),
+            cidr::IpCidr::from_str("fc00::/7").unwrap_unchecked(),
+        ])
+    }
+}
+fn api_schedule_steps_http_request_requests() -> u32 {
+    5
+}
+fn api_schedule_steps_http_request_window_seconds() -> u64 {
+    60
+}
+fn api_schedule_steps_http_request_max_response_size() -> usize {
+    16 * 1024
+}
 fn api_directory_entry_limit() -> usize {
     10000
 }
@@ -533,14 +561,26 @@ fn docker_registry_image_fetch_cache_duration() -> u64 {
     5 * 60
 }
 
-fn docker_tmpfs_size() -> u64 {
-    100
+fn docker_tmpfs_size() -> MiB {
+    100u64.into()
 }
 fn docker_container_pid_limit() -> u64 {
     5120
 }
 fn docker_container_apply_seccomp() -> bool {
     true
+}
+fn docker_numa_memory_binding() -> bool {
+    true
+}
+fn docker_cpu_period() -> u64 {
+    100000
+}
+fn docker_cfs_burst_enabled() -> bool {
+    true
+}
+fn docker_cfs_burst_multiple() -> f64 {
+    1.0
 }
 
 fn docker_installer_limits_timeout() -> u64 {
@@ -725,6 +765,30 @@ nestify::nest! {
             #[serde(default)]
             #[schema(value_type = Vec<String>)]
             pub trusted_proxies: Vec<cidr::IpCidr>,
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub schedule: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct ApiSchedule {
+                #[serde(default)]
+                #[schema(inline)]
+                pub steps: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct ApiScheduleSteps {
+                    #[serde(default)]
+                    #[schema(inline)]
+                    pub http_request: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct ApiScheduleStepsHttpRequest {
+                        #[serde(default = "api_schedule_steps_http_request_enabled")]
+                        pub enabled: bool,
+                        #[serde(default = "api_schedule_steps_http_request_requests")]
+                        pub requests: u32,
+                        #[serde(default = "api_schedule_steps_http_request_window_seconds")]
+                        pub window_seconds: u64,
+                        #[serde(default = "api_schedule_steps_http_request_max_response_size")]
+                        pub max_response_size: usize,
+                        #[serde(default = "api_schedule_steps_http_request_blocked_cidrs")]
+                        #[schema(value_type = Vec<String>)]
+                        pub blocked_cidrs: Vec<cidr::IpCidr>,
+                    },
+                },
+            },
         },
         #[serde(default)]
         #[schema(inline)]
@@ -1162,7 +1226,7 @@ nestify::nest! {
                 pub ispn: bool,
                 #[serde(default = "docker_network_driver")]
                 pub driver: String,
-                #[serde(default = "docker_network_mode")]
+                #[serde(default = "docker_network_mode", alias = "network_mode")]
                 pub mode: String,
                 #[serde(default)]
                 pub is_internal: bool,
@@ -1215,11 +1279,27 @@ nestify::nest! {
             },
 
             #[serde(default = "docker_tmpfs_size")]
-            pub tmpfs_size: u64,
+            pub tmpfs_size: MiB,
+            #[serde(default)]
+            pub shm_size: MiB,
             #[serde(default = "docker_container_pid_limit")]
             pub container_pid_limit: u64,
             #[serde(default = "docker_container_apply_seccomp")]
             pub container_apply_seccomp: bool,
+            #[serde(default = "docker_numa_memory_binding")]
+            pub numa_memory_binding: bool,
+
+            #[serde(default = "docker_cpu_period")]
+            pub cpu_period: u64,
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub cfs_burst: #[derive(Clone, Copy, ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerCfsBurst {
+                #[serde(default = "docker_cfs_burst_enabled")]
+                pub enabled: bool,
+                #[serde(default = "docker_cfs_burst_multiple")]
+                pub multiple: f64,
+            },
 
             #[serde(default)]
             #[schema(inline)]
@@ -1302,6 +1382,13 @@ nestify::nest! {
     }
 }
 
+impl Docker {
+    /// The configured CFS period in microseconds, clamped to what the kernel accepts.
+    pub fn cpu_period_us(&self) -> i64 {
+        self.cpu_period.clamp(1000, 1000000) as i64
+    }
+}
+
 impl DockerOverhead {
     /// ```yaml
     /// multipliers:
@@ -1362,6 +1449,15 @@ pub const FORBIDDEN_PATHS: &[&str] = &[
     "system.passwd",
     "docker.socket",
     "allowed_mounts",
+    "ignore_panel_config_updates",
+    "ignore_panel_wings_upgrades",
+    "api.host",
+    "api.port",
+    "api.ssl",
+    "api.trusted_proxies",
+    "api.disable_remote_download",
+    "api.remote_download_blocked_cidrs",
+    "api.schedule.steps.http_request",
 ];
 
 #[allow(dead_code)]
@@ -1676,6 +1772,17 @@ impl Config {
                 std::thread::sleep(std::time::Duration::from_secs(10));
             }
             tracing::warn!("you are treading on thin ice. proceed at your own risk.");
+        }
+
+        if cfg.docker.network.mode == docker_network_mode()
+            && cfg.docker.network.name != docker_network_name()
+        {
+            tracing::warn!(
+                "docker.network.mode is set to the default \"{}\" while docker.network.name is \"{}\", containers will be attached to a network that does not exist. if this is not intentional, set docker.network.mode to \"{}\".",
+                cfg.docker.network.mode,
+                cfg.docker.network.name,
+                cfg.docker.network.name
+            );
         }
 
         #[cfg(unix)]

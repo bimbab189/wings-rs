@@ -419,6 +419,18 @@ impl CapFilesystem {
         Ok(canonicalized)
     }
 
+    pub fn canonicalize(&self, path: impl AsRef<Path>) -> Result<PathBuf, std::io::Error> {
+        let path = self.relative_path(path.as_ref());
+        if path.components().next().is_none() {
+            return Ok(path);
+        }
+
+        let inner = self.get_inner()?;
+        let canonicalized = inner.canonicalize(path)?;
+
+        Ok(canonicalized)
+    }
+
     pub async fn async_read_link(&self, path: impl AsRef<Path>) -> Result<PathBuf, std::io::Error> {
         let path = self.relative_path(path.as_ref());
 
@@ -1248,5 +1260,34 @@ mod tests {
 
         result.unwrap();
         assert!(!dir.path().join("tree").exists());
+    }
+
+    // canonicalize
+
+    #[test]
+    fn canonicalize_resolves_symlink_to_target() {
+        let (dir, filesystem) = temp_filesystem();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(dir.path().join("config/secret.yml"), b"x").unwrap();
+        filesystem.symlink("config/secret.yml", "link.yml").unwrap();
+
+        assert_eq!(
+            filesystem.canonicalize("link.yml").unwrap(),
+            PathBuf::from("config/secret.yml")
+        );
+    }
+
+    #[test]
+    fn canonicalize_errors_on_missing_path() {
+        let (_d, filesystem) = temp_filesystem();
+
+        assert!(filesystem.canonicalize("nope.txt").is_err());
+    }
+
+    #[test]
+    fn canonicalize_returns_empty_path_untouched() {
+        let (_d, filesystem) = temp_filesystem();
+
+        assert_eq!(filesystem.canonicalize("").unwrap(), PathBuf::from(""));
     }
 }

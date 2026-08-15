@@ -12,6 +12,7 @@ use crate::{
                 ArchiveFormat, StreamableArchiveFormat, multi_reader::MultiReader,
                 zip_entry_get_modified_time,
             },
+            cap::FileType,
             virtualfs::{
                 ByteRange, VirtualReadableFilesystem,
                 archive::{seven_zip::VirtualSevenZipArchive, zip::VirtualZipArchive},
@@ -662,7 +663,7 @@ impl BackupExt for WingsBackup {
 
                             if server
                                 .filesystem
-                                .is_ignored(&path, entry.is_dir())
+                                .is_ignored(&path, FileType::from_is_dir(entry.is_dir()))
                             {
                                 continue;
                             }
@@ -744,10 +745,10 @@ impl BackupExt for WingsBackup {
 
                                     let destination_path = Path::new(path);
 
-                                    if server
-                                        .filesystem
-                                        .is_ignored(destination_path, entry.is_directory())
-                                    {
+                                    if server.filesystem.is_ignored(
+                                        destination_path,
+                                        FileType::from_is_dir(entry.is_directory()),
+                                    ) {
                                         return Ok(true);
                                     }
 
@@ -818,10 +819,10 @@ impl BackupExt for WingsBackup {
 
                                 let destination_path = Path::new(path);
 
-                                if server
-                                    .filesystem
-                                    .is_ignored(destination_path, entry.is_directory())
-                                {
+                                if server.filesystem.is_ignored(
+                                    destination_path,
+                                    FileType::from_is_dir(entry.is_directory()),
+                                ) {
                                     continue;
                                 }
 

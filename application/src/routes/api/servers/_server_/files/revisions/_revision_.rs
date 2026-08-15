@@ -5,6 +5,7 @@ mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
+        server::filesystem::cap::FileType,
     };
     use axum::{
         extract::{Path, Query},
@@ -50,7 +51,11 @@ mod get {
         };
         let revision_path = std::path::Path::new(&revision_path);
 
-        if server.filesystem.is_ignored(revision_path, false) {
+        if server
+            .filesystem
+            .async_is_ignored(revision_path, FileType::File)
+            .await
+        {
             return ApiResponse::error("revision not found")
                 .with_status(StatusCode::NOT_FOUND)
                 .ok();

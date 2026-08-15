@@ -27,12 +27,7 @@ impl FileJwtPayload {
             return None;
         }
 
-        let mut ignore_builder = ignore::gitignore::GitignoreBuilder::new("/");
-        for file in &self.ignored_files {
-            ignore_builder.add_line(None, file).ok();
-        }
-
-        ignore_builder.build().ok()
+        crate::server::filesystem::build_gitignore_matcher(self.ignored_files.iter()).ok()
     }
 }
 
@@ -51,7 +46,10 @@ pub(crate) mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
-        server::activity::{Activity, ActivityEvent},
+        server::{
+            activity::{Activity, ActivityEvent},
+            filesystem::cap::FileType,
+        },
     };
     use axum::{
         extract::{ConnectInfo, Multipart, Query},
@@ -196,8 +194,11 @@ pub(crate) mod post {
 
             if ignored
                 .as_ref()
-                .is_some_and(|o| o.matched(parent, false).is_ignore())
-                || server.filesystem.is_ignored(parent, false)
+                .is_some_and(|o| o.matched(parent, true).is_ignore())
+                || server
+                    .filesystem
+                    .async_is_ignored(parent, FileType::Dir)
+                    .await
             {
                 return ApiResponse::error("file not found")
                     .with_status(StatusCode::NOT_FOUND)
@@ -223,7 +224,10 @@ pub(crate) mod post {
                 && (ignored
                     .as_ref()
                     .is_some_and(|o| o.matched(&path, false).is_ignore())
-                    || server.filesystem.is_ignored(&path, false))
+                    || server
+                        .filesystem
+                        .async_is_ignored(&path, FileType::File)
+                        .await)
             {
                 return ApiResponse::error("file not found")
                     .with_status(StatusCode::NOT_FOUND)
@@ -277,6 +281,7 @@ mod head {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
+        server::filesystem::cap::FileType,
     };
     use axum::{body::Body, extract::Query, http::StatusCode};
     use serde::Deserialize;
@@ -351,8 +356,11 @@ mod head {
 
         if ignored
             .as_ref()
-            .is_some_and(|o| o.matched(parent, false).is_ignore())
-            || server.filesystem.is_ignored(parent, false)
+            .is_some_and(|o| o.matched(parent, true).is_ignore())
+            || server
+                .filesystem
+                .async_is_ignored(parent, FileType::Dir)
+                .await
         {
             return ApiResponse::error("file not found")
                 .with_status(StatusCode::NOT_FOUND)
@@ -369,7 +377,10 @@ mod head {
             && (ignored
                 .as_ref()
                 .is_some_and(|o| o.matched(&path, false).is_ignore())
-                || server.filesystem.is_ignored(&path, false))
+                || server
+                    .filesystem
+                    .async_is_ignored(&path, FileType::File)
+                    .await)
         {
             return ApiResponse::error("file not found")
                 .with_status(StatusCode::NOT_FOUND)
@@ -399,7 +410,10 @@ mod patch {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
-        server::activity::{Activity, ActivityEvent},
+        server::{
+            activity::{Activity, ActivityEvent},
+            filesystem::cap::FileType,
+        },
     };
     use axum::{
         body::Body,
@@ -538,8 +552,11 @@ mod patch {
 
         if ignored
             .as_ref()
-            .is_some_and(|o| o.matched(&parent, false).is_ignore())
-            || server.filesystem.is_ignored(&parent, false)
+            .is_some_and(|o| o.matched(&parent, true).is_ignore())
+            || server
+                .filesystem
+                .async_is_ignored(&parent, FileType::Dir)
+                .await
         {
             return ApiResponse::error("file not found")
                 .with_status(StatusCode::NOT_FOUND)
@@ -556,7 +573,10 @@ mod patch {
             && (ignored
                 .as_ref()
                 .is_some_and(|o| o.matched(&path, false).is_ignore())
-                || server.filesystem.is_ignored(&path, false))
+                || server
+                    .filesystem
+                    .async_is_ignored(&path, FileType::File)
+                    .await)
         {
             return ApiResponse::error("file not found")
                 .with_status(StatusCode::NOT_FOUND)

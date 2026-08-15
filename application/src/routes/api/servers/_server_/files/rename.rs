@@ -65,12 +65,10 @@ pub(crate) mod put {
 
             if filesystem.async_metadata(&to).await.is_ok()
                 || (filesystem.is_primary_server_fs()
-                    && (server
+                    && server
                         .filesystem
-                        .is_ignored(&from, from_metadata.file_type.is_dir())
-                        || server
-                            .filesystem
-                            .is_ignored(&to, from_metadata.file_type.is_dir())))
+                        .async_is_ignored(&to, from_metadata.file_type)
+                        .await)
             {
                 continue;
             }
@@ -100,7 +98,11 @@ pub(crate) mod put {
                 {
                     tracing::error!("failed to rename file in diff storage: {:?}", err);
                 }
-            } else if filesystem.async_rename(&from, &to).await.is_ok() {
+            } else if filesystem
+                .async_rename(&from, &to, from_metadata.file_type)
+                .await
+                .is_ok()
+            {
                 renamed_count += 1;
             }
         }

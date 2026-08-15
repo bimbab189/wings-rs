@@ -28,6 +28,7 @@ mod config;
 mod deserialize;
 mod io;
 mod models;
+mod net;
 mod payload;
 mod remote;
 mod response;

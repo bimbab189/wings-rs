@@ -19,6 +19,7 @@ pub(crate) mod pull;
 pub(crate) mod rename;
 pub(crate) mod revisions;
 pub(crate) mod search;
+mod sqlite_query;
 pub(crate) mod write;
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
@@ -36,6 +37,7 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/delete", delete::router(state))
         .nest("/chmod", chmod::router(state))
         .nest("/search", search::router(state))
+        .nest("/sqlite-query", sqlite_query::router(state))
         .nest("/fingerprints", fingerprints::router(state))
         .nest("/pull", pull::router(state))
         .nest("/compress", compress::router(state))

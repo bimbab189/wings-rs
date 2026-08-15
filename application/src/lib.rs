@@ -8,6 +8,7 @@ pub mod config;
 pub mod deserialize;
 pub mod io;
 pub mod models;
+pub mod net;
 pub mod payload;
 pub mod remote;
 pub mod response;

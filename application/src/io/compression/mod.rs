@@ -30,6 +30,24 @@ impl CompressionType {
             _ => CompressionType::None,
         }
     }
+
+    pub fn from_file_name(file_name: &str) -> Self {
+        if file_name.ends_with(".gz") {
+            CompressionType::Gz
+        } else if file_name.ends_with(".xz") {
+            CompressionType::Xz
+        } else if file_name.ends_with(".lz") {
+            CompressionType::Lzip
+        } else if file_name.ends_with(".bz2") {
+            CompressionType::Bz2
+        } else if file_name.ends_with(".lz4") {
+            CompressionType::Lz4
+        } else if file_name.ends_with(".zst") {
+            CompressionType::Zstd
+        } else {
+            CompressionType::None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ToSchema, Deserialize, Serialize, Default)]

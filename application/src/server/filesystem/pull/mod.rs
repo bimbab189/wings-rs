@@ -1,4 +1,4 @@
-use crate::server::filesystem::virtualfs::VirtualWritableFilesystem;
+use crate::server::filesystem::{cap::FileType, virtualfs::VirtualWritableFilesystem};
 use anyhow::Context;
 use compact_str::ToCompactString;
 use rand::RngExt;
@@ -6,72 +6,62 @@ use serde::Serialize;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::{io::AsyncWriteExt, sync::RwLock};
+use tokio::io::AsyncWriteExt;
 use utoipa::ToSchema;
 
-mod resolver;
+use crate::net::{host_to_ip, is_blocked_ip};
 
-static DOWNLOAD_CLIENT: RwLock<Option<Arc<reqwest::Client>>> = RwLock::const_new(None);
+const MAX_REDIRECTS: usize = 10;
 
-fn host_to_ip(host: &str) -> Option<std::net::IpAddr> {
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
+static DOWNLOAD_CLIENT: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
 
-    std::net::IpAddr::from_str(host).ok()
+fn blocked_cidrs(config: &crate::config::InnerConfig) -> &Vec<cidr::IpCidr> {
+    &config.api.remote_download_blocked_cidrs
 }
 
-fn is_blocked_ip(config: &crate::config::InnerConfig, ip: &std::net::IpAddr) -> bool {
-    let ip = ip.to_canonical();
-
-    config
-        .api
-        .remote_download_blocked_cidrs
-        .iter()
-        .any(|cidr| cidr.contains(&ip))
-}
-
-async fn get_download_client(
+fn get_download_client(
     config: &Arc<crate::config::Config>,
 ) -> Result<Arc<reqwest::Client>, anyhow::Error> {
-    let client = DOWNLOAD_CLIENT.read().await;
-    if let Some(client) = client.as_ref() {
+    if let Some(client) = DOWNLOAD_CLIENT.get() {
         return Ok(Arc::clone(client));
     }
 
-    drop(client);
-    let mut write_lock = DOWNLOAD_CLIENT.write().await;
-
     let redirect_config = Arc::clone(config);
-    let new_client = reqwest::Client::builder()
-        .user_agent("Calagopus Wings (https://github.com/calagopus/wings)")
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .dns_resolver(Arc::new(resolver::DnsResolver::new(config)))
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if let Some(host) = attempt.url().host_str()
-                && let Some(ip) = host_to_ip(host)
-                && is_blocked_ip(&redirect_config.load(), &ip)
-            {
-                tracing::warn!("blocking redirect to internal IP address in pull: {}", ip);
-                return attempt.error(anyhow::anyhow!("IP address {} is blocked", ip));
-            }
+    let client = Arc::new(
+        reqwest::Client::builder()
+            .user_agent("Calagopus Wings (https://github.com/calagopus/wings)")
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .no_proxy()
+            .dns_resolver(Arc::new(crate::net::BlockedIpResolver::new(
+                config,
+                blocked_cidrs,
+                "pull",
+            )))
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() >= MAX_REDIRECTS {
+                    return attempt.error(anyhow::anyhow!("too many redirects"));
+                }
 
-            attempt.follow()
-        }))
-        .build()
-        .context("failed to build download client")?;
+                if let Some(host) = attempt.url().host_str()
+                    && let Some(ip) = host_to_ip(host)
+                    && is_blocked_ip(blocked_cidrs(&redirect_config.load()), &ip)
+                {
+                    tracing::warn!("blocking redirect to internal IP address in pull: {}", ip);
+                    return attempt.error(anyhow::anyhow!("IP address {} is blocked", ip));
+                }
 
-    let new_client = Arc::new(new_client);
-    *write_lock = Some(Arc::clone(&new_client));
+                attempt.follow()
+            }))
+            .build()
+            .context("failed to build download client")?,
+    );
 
-    Ok(new_client)
+    Ok(Arc::clone(DOWNLOAD_CLIENT.get_or_init(|| client)))
 }
 
 #[derive(ToSchema, Serialize)]
@@ -92,14 +82,13 @@ impl PullQueryResponse {
 
         if let Some(host) = url.host_str()
             && let Some(ip) = host_to_ip(host)
-            && is_blocked_ip(&config.load(), &ip)
+            && is_blocked_ip(blocked_cidrs(&config.load()), &ip)
         {
             tracing::warn!("blocking internal IP address in pull: {}", ip);
             return Err(anyhow::anyhow!("IP address {} is blocked", ip));
         }
 
-        let response = get_download_client(config)
-            .await?
+        let response = get_download_client(config)?
             .get(url)
             .send()
             .await
@@ -166,14 +155,13 @@ impl Download {
 
         if let Some(host) = url.host_str()
             && let Some(ip) = host_to_ip(host)
-            && is_blocked_ip(&server.app_state.config.load(), &ip)
+            && is_blocked_ip(blocked_cidrs(&server.app_state.config.load()), &ip)
         {
             tracing::warn!("blocking internal IP address in pull: {}", ip);
             return Err(anyhow::anyhow!("IP address {} is blocked", ip));
         }
 
-        let response = get_download_client(&server.app_state.config)
-            .await?
+        let response = get_download_client(&server.app_state.config)?
             .get(url)
             .send()
             .await
@@ -230,7 +218,10 @@ impl Download {
         real_destination.push(file_name);
 
         if filesystem.is_primary_server_fs()
-            && server.filesystem.is_ignored(&real_destination, false)
+            && server
+                .filesystem
+                .async_is_ignored(&real_destination, FileType::File)
+                .await
         {
             return Err(anyhow::anyhow!("file not found"));
         }

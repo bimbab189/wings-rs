@@ -5,7 +5,7 @@ pub(crate) mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
-        server::filesystem::virtualfs::VirtualReadableFilesystem,
+        server::filesystem::{cap::FileType, virtualfs::VirtualReadableFilesystem},
     };
     use axum::http::StatusCode;
     use compact_str::ToCompactString;
@@ -77,12 +77,7 @@ pub(crate) mod post {
 
         let metadata = match filesystem.async_metadata(&path).await {
             Ok(metadata) => {
-                if (!metadata.file_type.is_file() && !metadata.file_type.is_dir())
-                    || (filesystem.is_primary_server_fs()
-                        && server
-                            .filesystem
-                            .is_ignored(&path, metadata.file_type.is_dir()))
-                {
+                if !metadata.file_type.is_file() && !metadata.file_type.is_dir() {
                     return ApiResponse::error("file not found")
                         .with_status(StatusCode::NOT_FOUND)
                         .ok();
@@ -145,7 +140,12 @@ pub(crate) mod post {
             compact_str::format_compact!("{base_name}{suffix}{extension}")
         }
 
-        if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true) {
+        if filesystem.is_primary_server_fs()
+            && server
+                .filesystem
+                .async_is_ignored(parent, FileType::Dir)
+                .await
+        {
             return ApiResponse::error("parent directory not found")
                 .with_status(StatusCode::EXPECTATION_FAILED)
                 .ok();
@@ -187,7 +187,8 @@ pub(crate) mod post {
         if destination_filesystem.is_primary_server_fs()
             && server
                 .filesystem
-                .is_ignored(&destination_path, metadata.file_type.is_dir())
+                .async_is_ignored(&destination_path, metadata.file_type)
+                .await
         {
             return ApiResponse::error("destination file not found")
                 .with_status(StatusCode::EXPECTATION_FAILED)

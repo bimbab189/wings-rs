@@ -711,13 +711,18 @@ pub async fn install_host_artifact(
                 &destination,
                 existing_metadata
                     .as_ref()
-                    .is_ok_and(|m| m.file_type.is_dir()),
+                    .map(|m| m.file_type)
+                    .unwrap_or(crate::server::filesystem::cap::FileType::File),
             )
     {
         return Err(anyhow::anyhow!("target path is ignored"));
     }
 
-    if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true) {
+    if filesystem.is_primary_server_fs()
+        && server
+            .filesystem
+            .is_ignored(parent, crate::server::filesystem::cap::FileType::Dir)
+    {
         return Err(anyhow::anyhow!("target parent directory is ignored"));
     }
 

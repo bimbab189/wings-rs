@@ -1,7 +1,7 @@
 use super::{CollabConflict, CollabError, CollabParticipant, CollabSaved, CollabSyncMeta};
 use crate::server::{
     activity::{Activity, ActivityEvent},
-    filesystem::virtualfs::VirtualWritableFilesystem,
+    filesystem::{cap::FileType, virtualfs::VirtualWritableFilesystem},
     permissions::{Permission, Permissions},
     websocket::{
         ServerWebsocketHandler, TargetedWebsocketMessage, WebsocketEvent, WebsocketMessage,
@@ -407,8 +407,14 @@ impl CollabManager {
         }
 
         let path = root.join(file_name);
-        if server.filesystem.is_ignored(&path, false)
-            || server.user_permissions.is_ignored(user_uuid, &path, false)
+        if server
+            .filesystem
+            .async_is_ignored(&path, FileType::File)
+            .await
+            || server
+                .user_permissions
+                .async_is_ignored(server, user_uuid, &path, FileType::File)
+                .await
         {
             return Err(CollabError::User("file not found"));
         }
@@ -930,9 +936,9 @@ impl CollabManager {
             .subscribed_session(server, connection_id, user_uuid, raw_path)
             .await?;
         let (path, _, filesystem) = self.resolve(server, user_uuid, raw_path).await?;
-        let parent = Path::new(raw_path)
-            .parent()
-            .ok_or(CollabError::User("file has no parent"))?;
+        if Path::new(raw_path).parent().is_none() {
+            return Err(CollabError::User("file has no parent"));
+        }
 
         let _save_guard = session.save_lock.lock().await;
 
@@ -1003,8 +1009,7 @@ impl CollabManager {
 
         if !server
             .filesystem
-            .async_allocate_in_path(parent, content.len() as i64 - old_content_size, false)
-            .await
+            .has_headroom(content.len() as i64 - old_content_size)
         {
             return Err(CollabError::User("failed to allocate space"));
         }

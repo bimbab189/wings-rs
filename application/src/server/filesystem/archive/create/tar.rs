@@ -139,7 +139,7 @@ pub async fn create_tar<W: Write + Send + 'static>(
 
                         if header.set_link_name(link_target).is_ok() {
                             archive.append_data(&mut header, relative, std::io::empty())?;
-                            progress.increment_bytes(source_metadata.len());
+                            progress.increment_bytes(metadata.len());
                             progress.increment_files();
                         }
                     }

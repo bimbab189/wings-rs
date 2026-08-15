@@ -652,22 +652,26 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
     fn set_permissions(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
+        file_type: FileType,
         permissions: PortablePermissions,
     ) -> Result<(), anyhow::Error>;
     async fn async_set_permissions(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
+        file_type: FileType,
         permissions: PortablePermissions,
     ) -> Result<(), anyhow::Error>;
     fn set_times(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
+        file_type: FileType,
         modification_time: std::time::SystemTime,
         access_time: Option<std::time::SystemTime>,
     ) -> Result<(), anyhow::Error>;
     async fn async_set_times(
         &self,
         path: &(dyn AsRef<Path> + Send + Sync),
+        file_type: FileType,
         modification_time: std::time::SystemTime,
         access_time: Option<std::time::SystemTime>,
     ) -> Result<(), anyhow::Error>;
@@ -675,10 +679,12 @@ pub trait VirtualWritableFilesystem: VirtualReadableFilesystem {
         &self,
         from: &(dyn AsRef<Path> + Send + Sync),
         to: &(dyn AsRef<Path> + Send + Sync),
+        file_type: FileType,
     ) -> Result<(), anyhow::Error>;
     async fn async_rename(
         &self,
         from: &(dyn AsRef<Path> + Send + Sync),
         to: &(dyn AsRef<Path> + Send + Sync),
+        file_type: FileType,
     ) -> Result<(), anyhow::Error>;
 }

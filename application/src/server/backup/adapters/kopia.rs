@@ -1251,7 +1251,10 @@ impl VirtualReadableFilesystem for VirtualKopiaBackup {
         let mut file_children: Vec<(PathBuf, &KopiaEntry)> = Vec::new();
 
         for (name, entry) in dir.entries.iter() {
-            let child_path = match (is_ignored)(entry.file_type, path.join(name.as_str())) {
+            let child_path = match is_ignored
+                .call_async(entry.file_type, path.join(name.as_str()))
+                .await
+            {
                 Some(kept) => kept,
                 None => continue,
             };

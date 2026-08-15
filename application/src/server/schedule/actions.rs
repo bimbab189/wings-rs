@@ -2,7 +2,7 @@ use crate::{
     routes::State,
     server::{
         activity::{Activity, ActivityEvent},
-        filesystem::archive::ArchiveFormat,
+        filesystem::{archive::ArchiveFormat, cap::FileType, virtualfs::IsIgnoredFn},
     },
 };
 use cap_std::fs::OpenOptions;
@@ -20,11 +20,47 @@ pub struct ScheduleVariable {
     pub variable: compact_str::CompactString,
 }
 
+impl<'a> From<&'a ScheduleVariable> for Cow<'a, ScheduleVariable> {
+    fn from(value: &'a ScheduleVariable) -> Self {
+        Cow::Borrowed(value)
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ScheduleDynamicParameter {
     Raw(compact_str::CompactString),
     Variable(ScheduleVariable),
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleHttpMethod {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+    Head,
+}
+
+impl From<ScheduleHttpMethod> for reqwest::Method {
+    fn from(value: ScheduleHttpMethod) -> Self {
+        match value {
+            ScheduleHttpMethod::Get => reqwest::Method::GET,
+            ScheduleHttpMethod::Post => reqwest::Method::POST,
+            ScheduleHttpMethod::Put => reqwest::Method::PUT,
+            ScheduleHttpMethod::Patch => reqwest::Method::PATCH,
+            ScheduleHttpMethod::Delete => reqwest::Method::DELETE,
+            ScheduleHttpMethod::Head => reqwest::Method::HEAD,
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct ScheduleHttpHeader {
+    pub name: compact_str::CompactString,
+    pub value: ScheduleDynamicParameter,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -172,6 +208,9 @@ pub enum ScheduleAction {
         #[serde(default)]
         backup_group_uuid: Option<uuid::Uuid>,
         ignored_files: Vec<compact_str::CompactString>,
+
+        #[serde(default)]
+        output_into: Option<ScheduleVariable>,
     },
     RestoreBackup {
         ignore_failure: bool,
@@ -261,6 +300,24 @@ pub enum ScheduleAction {
 
         image: ScheduleDynamicParameter,
     },
+    HttpRequest {
+        ignore_failure: bool,
+
+        method: ScheduleHttpMethod,
+        url: reqwest::Url,
+        #[serde(default)]
+        headers: Vec<ScheduleHttpHeader>,
+        #[serde(default)]
+        body: Option<ScheduleDynamicParameter>,
+        timeout: u64,
+        #[serde(default)]
+        ignore_error_status: bool,
+
+        #[serde(default)]
+        output_status_into: Option<ScheduleVariable>,
+        #[serde(default)]
+        output_body_into: Option<ScheduleVariable>,
+    },
 }
 
 impl ScheduleAction {
@@ -294,6 +351,7 @@ impl ScheduleAction {
             ScheduleAction::UpdateStartupVariable { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::UpdateStartupCommand { ignore_failure, .. } => *ignore_failure,
             ScheduleAction::UpdateStartupDockerImage { ignore_failure, .. } => *ignore_failure,
+            ScheduleAction::HttpRequest { ignore_failure, .. } => *ignore_failure,
         }
     }
 
@@ -329,54 +387,82 @@ impl ScheduleAction {
                 format,
                 output_into,
             } => {
-                let mut result = compact_str::CompactString::default();
-                let mut chars = format.chars().peekable();
+                fn format_value(
+                    format: &str,
+                    execution_context: &super::ScheduleExecutionContext,
+                ) -> Result<compact_str::CompactString, Cow<'static, str>> {
+                    let mut result = compact_str::CompactString::default();
+                    let mut chars = format.chars().peekable();
 
-                while let Some(ch) = chars.next() {
-                    if ch == '{' {
-                        if chars.peek() == Some(&'{') {
-                            chars.next();
-                            result.push('{');
-                        } else {
-                            let mut var_name = String::new();
-                            let mut found_closing = false;
-
-                            for inner_ch in chars.by_ref() {
-                                if inner_ch == '}' {
-                                    found_closing = true;
-                                    break;
-                                }
-                                var_name.push(inner_ch);
-                            }
-
-                            if found_closing {
-                                if let Some(value) =
-                                    execution_context.get_variable_by_str(&var_name)
-                                {
-                                    result.push_str(value.as_str());
-                                } else {
-                                    result.push('{');
-                                    result.push_str(&var_name);
-                                    result.push('}');
-                                }
-                            } else {
-                                result.push('{');
-                                result.push_str(&var_name);
-                            }
+                    fn push_str_within_limit(
+                        result: &mut compact_str::CompactString,
+                        value: &str,
+                    ) -> Result<(), Cow<'static, str>> {
+                        if result.len() + value.len() > super::MAX_VARIABLE_SIZE {
+                            return Err(format!(
+                                "formatted value exceeds the maximum size of {} bytes.",
+                                super::MAX_VARIABLE_SIZE
+                            )
+                            .into());
                         }
-                    } else if ch == '}' {
-                        if chars.peek() == Some(&'}') {
-                            chars.next();
-                            result.push('}');
-                        } else {
-                            result.push(ch);
-                        }
-                    } else {
-                        result.push(ch);
+
+                        result.push_str(value);
+
+                        Ok(())
                     }
+
+                    fn push_within_limit(
+                        result: &mut compact_str::CompactString,
+                        value: char,
+                    ) -> Result<(), Cow<'static, str>> {
+                        let mut buffer = [0u8; 4];
+
+                        push_str_within_limit(result, value.encode_utf8(&mut buffer))
+                    }
+
+                    while let Some(ch) = chars.next() {
+                        if ch != '{' || chars.peek() != Some(&'{') {
+                            push_within_limit(&mut result, ch)?;
+                            continue;
+                        }
+
+                        chars.next();
+
+                        let mut var_name = String::new();
+                        let mut found_closing = false;
+
+                        while let Some(inner_ch) = chars.next() {
+                            if inner_ch == '}' && chars.peek() == Some(&'}') {
+                                chars.next();
+                                found_closing = true;
+                                break;
+                            }
+
+                            var_name.push(inner_ch);
+                        }
+
+                        match execution_context
+                            .get_variable_by_str(var_name.trim())
+                            .filter(|_| found_closing)
+                        {
+                            Some(value) => push_str_within_limit(&mut result, value.as_str())?,
+                            None => {
+                                push_str_within_limit(&mut result, "{{")?;
+                                push_str_within_limit(&mut result, &var_name)?;
+
+                                if found_closing {
+                                    push_str_within_limit(&mut result, "}}")?;
+                                }
+                            }
+                        }
+                    }
+
+                    Ok(result)
                 }
 
-                execution_context.store_variable(output_into.clone(), result);
+                let result = format_value(format, execution_context)?;
+
+                execution_context.store_variable(output_into, result)?;
             }
             ScheduleAction::MatchRegex {
                 input,
@@ -399,10 +485,8 @@ impl ScheduleAction {
                         continue;
                     };
 
-                    execution_context.store_variable(
-                        output_into.clone(),
-                        group_match.as_str().to_compact_string(),
-                    );
+                    execution_context
+                        .store_variable(output_into, group_match.as_str().to_compact_string())?;
                 }
             }
             ScheduleAction::WaitForConsoleLine {
@@ -453,7 +537,7 @@ impl ScheduleAction {
                     if let Some(output_into) = output_into
                         && let Some(line) = line
                     {
-                        execution_context.store_variable(output_into.clone(), line);
+                        execution_context.store_variable(output_into, line)?;
                     }
 
                     return Ok(());
@@ -664,6 +748,7 @@ impl ScheduleAction {
                 name,
                 backup_group_uuid,
                 ignored_files,
+                output_into,
                 ..
             } => {
                 let name = match name {
@@ -705,6 +790,10 @@ impl ScheduleAction {
 
                 if state.backup_manager.fast_contains(server, uuid).await {
                     return Err("backup already exists".into());
+                }
+
+                if let Some(output_into) = output_into {
+                    execution_context.store_variable(output_into, uuid.to_compact_string())?;
                 }
 
                 let thread = tokio::spawn({
@@ -940,14 +1029,22 @@ impl ScheduleAction {
                     return Err("path is not a directory".into());
                 }
 
-                if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(&root, true) {
+                if filesystem.is_primary_server_fs()
+                    && server
+                        .filesystem
+                        .async_is_ignored(&root, FileType::Dir)
+                        .await
+                {
                     return Err("path not found".into());
                 }
 
                 let destination = root.join(name);
 
                 if filesystem.is_primary_server_fs()
-                    && server.filesystem.is_ignored(&destination, true)
+                    && server
+                        .filesystem
+                        .async_is_ignored(&destination, FileType::Dir)
+                        .await
                 {
                     return Err("destination not found".into());
                 }
@@ -1009,7 +1106,12 @@ impl ScheduleAction {
 
                 let metadata = filesystem.async_metadata(&path).await;
 
-                if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true) {
+                if filesystem.is_primary_server_fs()
+                    && server
+                        .filesystem
+                        .async_is_ignored(parent, FileType::Dir)
+                        .await
+                {
                     return Err("file not found".into());
                 }
 
@@ -1023,7 +1125,12 @@ impl ScheduleAction {
                     0
                 };
 
-                if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true) {
+                if filesystem.is_primary_server_fs()
+                    && server
+                        .filesystem
+                        .async_is_ignored(parent, FileType::Dir)
+                        .await
+                {
                     return Err("parent directory not found".into());
                 }
 
@@ -1127,12 +1234,7 @@ impl ScheduleAction {
 
                 let metadata = match filesystem.async_metadata(&path).await {
                     Ok(metadata) => {
-                        if !metadata.file_type.is_file()
-                            || (filesystem.is_primary_server_fs()
-                                && server
-                                    .filesystem
-                                    .is_ignored(&path, metadata.file_type.is_dir()))
-                        {
+                        if !metadata.file_type.is_file() {
                             return Err("file not found".into());
                         } else {
                             metadata
@@ -1143,7 +1245,12 @@ impl ScheduleAction {
                     }
                 };
 
-                if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true) {
+                if filesystem.is_primary_server_fs()
+                    && server
+                        .filesystem
+                        .async_is_ignored(parent, FileType::Dir)
+                        .await
+                {
                     return Err("parent directory not found".into());
                 }
 
@@ -1168,6 +1275,15 @@ impl ScheduleAction {
                 let destination_path = server
                     .filesystem
                     .relative_path(&destination_path.join(destination_file_name));
+
+                if destination_filesystem.is_primary_server_fs()
+                    && server
+                        .filesystem
+                        .async_is_ignored(&destination_path, metadata.file_type)
+                        .await
+                {
+                    return Err("destination file not found".into());
+                }
 
                 let bytes_processed = Arc::new(AtomicU64::new(0));
                 let bytes_total = Arc::new(AtomicU64::new(metadata.size));
@@ -1276,14 +1392,6 @@ impl ScheduleAction {
                         Err(_) => continue,
                     };
 
-                    if filesystem.is_primary_server_fs()
-                        && server
-                            .filesystem
-                            .is_ignored(&source, metadata.file_type.is_dir())
-                    {
-                        continue;
-                    }
-
                     let result = if filesystem.is_primary_server_fs() {
                         server.filesystem.truncate_path(&source).await
                     } else if metadata.file_type.is_dir() {
@@ -1353,10 +1461,12 @@ impl ScheduleAction {
                         || (filesystem.is_primary_server_fs()
                             && (server
                                 .filesystem
-                                .is_ignored(&from, from_metadata.file_type.is_dir())
+                                .async_is_ignored(&from, from_metadata.file_type)
+                                .await
                                 || server
                                     .filesystem
-                                    .is_ignored(&to, from_metadata.file_type.is_dir())))
+                                    .async_is_ignored(&to, from_metadata.file_type)
+                                    .await))
                     {
                         continue;
                     }
@@ -1364,7 +1474,9 @@ impl ScheduleAction {
                     let result = if filesystem.is_primary_server_fs() {
                         server.filesystem.rename_path(from, to).await
                     } else {
-                        filesystem.async_rename(&from, &to).await
+                        filesystem
+                            .async_rename(&from, &to, from_metadata.file_type)
+                            .await
                     };
 
                     if let Err(err) = result {
@@ -1444,10 +1556,17 @@ impl ScheduleAction {
                 let destination_path = destination_root.join(file_name);
 
                 if destination_filesystem.is_primary_server_fs()
-                    && server.filesystem.is_ignored(&destination_path, false)
+                    && server
+                        .filesystem
+                        .async_is_ignored(&destination_path, FileType::File)
+                        .await
                 {
                     return Err("file not found".into());
                 }
+
+                let excluded_destination = destination_filesystem
+                    .is_primary_server_fs()
+                    .then(|| destination_path.clone());
 
                 let bytes_processed = Arc::new(AtomicU64::new(0));
                 let bytes_total = Arc::new(AtomicU64::new(0));
@@ -1477,7 +1596,12 @@ impl ScheduleAction {
                             let destination_filesystem = destination_filesystem.clone();
 
                             async move {
-                                let ignored = server.filesystem.get_ignored();
+                                let mut ignored: IsIgnoredFn =
+                                    server.filesystem.get_ignored().into();
+                                if let Some(excluded_destination) = excluded_destination {
+                                    ignored = ignored.excluding(excluded_destination);
+                                }
+
                                 let writer = tokio::task::spawn_blocking(move || {
                                     destination_filesystem.create_seekable_file(&destination_path)
                                 })
@@ -1512,7 +1636,7 @@ impl ScheduleAction {
                                             &root,
                                             files,
                                             crate::server::filesystem::archive::create::ArchiveProgress::new(bytes_processed.clone(), files_processed.clone()),
-                                            ignored.into(),
+                                            ignored,
                                             crate::server::filesystem::archive::create::CreateTarOptions {
                                                 compression_type: format.compression_format(),
                                                 compression_level: state
@@ -1532,7 +1656,7 @@ impl ScheduleAction {
                                             &root,
                                             files,
                                             crate::server::filesystem::archive::create::ArchiveProgress::new(bytes_processed.clone(), files_processed.clone()),
-                                            ignored.into(),
+                                            ignored,
                                             crate::server::filesystem::archive::create::CreateZipOptions {
                                                 compression_level: state
                                                     .config.load()
@@ -1550,7 +1674,7 @@ impl ScheduleAction {
                                             &root,
                                             files,
                                             crate::server::filesystem::archive::create::ArchiveProgress::new(bytes_processed.clone(), files_processed.clone()),
-                                            ignored.into(),
+                                            ignored,
                                             crate::server::filesystem::archive::create::Create7zOptions {
                                                 compression_level: state
                                                     .config.load()
@@ -1645,14 +1769,11 @@ impl ScheduleAction {
 
                 let source = root.join(file);
 
-                if server.filesystem.is_ignored(
-                    &source,
-                    server
-                        .filesystem
-                        .async_metadata(&source)
-                        .await
-                        .is_ok_and(|m| m.is_dir()),
-                ) {
+                if server
+                    .filesystem
+                    .async_is_ignored(&source, server.filesystem.probe_file_type(&source).await)
+                    .await
+                {
                     return Err("file not found".into());
                 }
 
@@ -1855,6 +1976,90 @@ impl ScheduleAction {
                         ));
                     }
                 };
+            }
+            ScheduleAction::HttpRequest {
+                method,
+                url,
+                headers,
+                body,
+                timeout,
+                ignore_error_status,
+                output_status_into,
+                output_body_into,
+                ..
+            } => {
+                let mut resolved_headers = Vec::with_capacity(headers.len());
+                for header in headers {
+                    match execution_context.resolve_parameter(&header.value) {
+                        Some(value) => {
+                            resolved_headers.push((header.name.clone(), value.clone()));
+                        }
+                        None => {
+                            return Err(format!(
+                                "unable to resolve parameter `{}` into a string.",
+                                header.name
+                            )
+                            .into());
+                        }
+                    }
+                }
+
+                let resolved_body = match body {
+                    Some(body) => match execution_context.resolve_parameter(body) {
+                        Some(body) => Some(body.as_str()),
+                        None => {
+                            return Err("unable to resolve parameter `body` into a string.".into());
+                        }
+                    },
+                    None => None,
+                };
+
+                let outcome = super::http::execute(
+                    &state.config,
+                    server.uuid,
+                    super::http::HttpRequestOptions {
+                        method: (*method).into(),
+                        url,
+                        headers: resolved_headers
+                            .iter()
+                            .map(|(name, value)| (name.as_str(), value.as_str()))
+                            .collect(),
+                        body: resolved_body,
+                        timeout: std::time::Duration::from_millis(*timeout),
+                        capture_body: output_body_into.is_some(),
+                    },
+                )
+                .await?;
+
+                server.activity.log_activity(Activity {
+                    event: ActivityEvent::ScheduleHttpRequest,
+                    user: None,
+                    ip: None,
+                    metadata: Some(serde_json::json!({
+                        "method": method,
+                        "host": outcome.host,
+                        "status": outcome.status,
+                    })),
+                    schedule: Some(execution_context.schedule_uuid),
+                    timestamp: chrono::Utc::now(),
+                });
+
+                if let Some(output_into) = output_status_into {
+                    execution_context
+                        .store_variable(output_into, outcome.status.to_compact_string())?;
+                }
+
+                if let Some(output_into) = output_body_into
+                    && let Some(body) = outcome.body
+                {
+                    execution_context.store_variable(output_into, body)?;
+                }
+
+                if !ignore_error_status && !(200..400).contains(&outcome.status) {
+                    return Err(
+                        format!("the http request returned status {}.", outcome.status).into(),
+                    );
+                }
             }
         }
 

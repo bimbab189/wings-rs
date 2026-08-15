@@ -3,6 +3,7 @@ use crate::{
     io::{
         abort::{AbortGuard, AbortWriter},
         compression::CompressionLevel,
+        fixed_reader::FixedReader,
     },
     server::filesystem::virtualfs::IsIgnoredFn,
     utils::PortablePermissions,
@@ -129,7 +130,9 @@ pub async fn create_zip<W: Write + Seek + Send + 'static>(
                         progress.increment_bytes(metadata.len());
                     } else if metadata.is_file() {
                         let file = filesystem.open(&path)?;
-                        let mut reader = progress.counting_reader(file);
+                        let reader = progress.counting_reader(file);
+                        let mut reader =
+                            FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
 
                         archive.start_file(relative.to_string_lossy(), zip_options)?;
                         crate::io::copy_shared(&mut read_buffer, &mut reader, &mut archive)?;
@@ -140,13 +143,17 @@ pub async fn create_zip<W: Write + Seek + Send + 'static>(
                             link_target.to_string_lossy(),
                             zip_options,
                         )?;
-                        progress.increment_bytes(source_metadata.len());
+                        progress.increment_bytes(metadata.len());
                         progress.increment_files();
                     }
                 }
             } else if source_metadata.is_file() {
                 let file = filesystem.open(&source)?;
-                let mut reader = progress.counting_reader(file);
+                let reader = progress.counting_reader(file);
+                let mut reader = FixedReader::new_with_fixed_bytes(
+                    reader,
+                    source_metadata.len() as usize,
+                );
 
                 archive.start_file(relative.to_string_lossy(), zip_options)?;
                 crate::io::copy_shared(&mut read_buffer, &mut reader, &mut archive)?;
@@ -282,7 +289,9 @@ pub async fn create_zip_streaming<W: Write + Send + 'static>(
                         progress.increment_bytes(metadata.len());
                     } else if metadata.is_file() {
                         let file = filesystem.open(&path)?;
-                        let mut reader = progress.counting_reader(file);
+                        let reader = progress.counting_reader(file);
+                        let mut reader =
+                            FixedReader::new_with_fixed_bytes(reader, metadata.len() as usize);
 
                         archive.start_file(relative.to_string_lossy(), zip_options)?;
                         crate::io::copy_shared(&mut read_buffer, &mut reader, &mut archive)?;
@@ -293,13 +302,17 @@ pub async fn create_zip_streaming<W: Write + Send + 'static>(
                             link_target.to_string_lossy(),
                             zip_options,
                         )?;
-                        progress.increment_bytes(source_metadata.len());
+                        progress.increment_bytes(metadata.len());
                         progress.increment_files();
                     }
                 }
             } else if source_metadata.is_file() {
                 let file = filesystem.open(&source)?;
-                let mut reader = progress.counting_reader(file);
+                let reader = progress.counting_reader(file);
+                let mut reader = FixedReader::new_with_fixed_bytes(
+                    reader,
+                    source_metadata.len() as usize,
+                );
 
                 archive.start_file(relative.to_string_lossy(), zip_options)?;
                 crate::io::copy_shared(&mut read_buffer, &mut reader, &mut archive)?;

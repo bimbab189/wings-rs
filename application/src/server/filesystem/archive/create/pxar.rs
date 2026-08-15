@@ -223,7 +223,7 @@ pub async fn create_pxar<W: Write + Send + 'static>(
                     Some(n) => n.clone(),
                     None => continue,
                 };
-                let enclosing = components.get_slice(..components.len() - 1)?;
+                let enclosing = components.get_slice(..components.len().saturating_sub(1))?;
 
                 enter_path_components(&mut archive, enclosing, &meta)?;
 
@@ -242,7 +242,7 @@ pub async fn create_pxar<W: Write + Send + 'static>(
                     Some(n) => n.clone(),
                     None => continue,
                 };
-                let enclosing = components.get_slice(..components.len() - 1)?;
+                let enclosing = components.get_slice(..components.len().saturating_sub(1))?;
 
                 enter_path_components(&mut archive, enclosing, &meta)?;
                 archive.add_symlink(&name, &target, &meta)?;

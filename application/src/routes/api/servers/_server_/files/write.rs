@@ -5,6 +5,7 @@ pub(crate) mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
+        server::filesystem::cap::FileType,
     };
     use axum::{
         body::Body,
@@ -89,7 +90,14 @@ pub(crate) mod post {
         if filesystem.is_primary_server_fs()
             && server
                 .filesystem
-                .is_ignored(&path, metadata.as_ref().is_ok_and(|m| m.file_type.is_dir()))
+                .async_is_ignored(
+                    &path,
+                    metadata
+                        .as_ref()
+                        .map(|m| m.file_type)
+                        .unwrap_or(FileType::File),
+                )
+                .await
         {
             return ApiResponse::error("file not found")
                 .with_status(StatusCode::NOT_FOUND)
@@ -108,7 +116,12 @@ pub(crate) mod post {
             0
         };
 
-        if filesystem.is_primary_server_fs() && server.filesystem.is_ignored(parent, true) {
+        if filesystem.is_primary_server_fs()
+            && server
+                .filesystem
+                .async_is_ignored(parent, FileType::Dir)
+                .await
+        {
             return ApiResponse::error("parent directory not found")
                 .with_status(StatusCode::EXPECTATION_FAILED)
                 .ok();
@@ -119,8 +132,7 @@ pub(crate) mod post {
         if filesystem.is_primary_server_fs()
             && !server
                 .filesystem
-                .async_allocate_in_path(parent, content_size - old_content_size, false)
-                .await
+                .has_headroom(content_size - old_content_size)
         {
             return ApiResponse::error("failed to allocate space")
                 .with_status(StatusCode::EXPECTATION_FAILED)

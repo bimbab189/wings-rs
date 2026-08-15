@@ -3,8 +3,9 @@ use compact_str::ToCompactString;
 use serde::{Deserialize, Serialize};
 use serde_default::DefaultFromSerde;
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 use utoipa::ToSchema;
 
@@ -19,6 +20,87 @@ fn is_plain_absolute_path(path: &Path) -> bool {
                 std::path::Component::CurDir | std::path::Component::ParentDir
             )
         })
+}
+
+fn parse_cpu_list(list: &str) -> Option<Vec<u64>> {
+    let mut cpus = Vec::new();
+
+    for part in list.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        match part.split_once('-') {
+            Some((start, end)) => {
+                let start: u64 = start.trim().parse().ok()?;
+                let end: u64 = end.trim().parse().ok()?;
+                if start > end {
+                    return None;
+                }
+
+                cpus.extend(start..=end);
+            }
+            None => cpus.push(part.parse().ok()?),
+        }
+    }
+
+    Some(cpus)
+}
+
+fn numa_memory_nodes(threads: &str) -> Option<String> {
+    static NUMA_NODE_CPUS: OnceLock<Vec<(u64, Vec<u64>)>> = OnceLock::new();
+
+    let nodes = NUMA_NODE_CPUS.get_or_init(|| {
+        let mut nodes = Vec::new();
+
+        let Ok(entries) = std::fs::read_dir("/sys/devices/system/node") else {
+            return nodes;
+        };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(id) = name
+                .to_string_lossy()
+                .strip_prefix("node")
+                .and_then(|id| id.parse().ok())
+            else {
+                continue;
+            };
+
+            let Ok(cpulist) = std::fs::read_to_string(entry.path().join("cpulist")) else {
+                continue;
+            };
+
+            if let Some(cpus) = parse_cpu_list(&cpulist) {
+                nodes.push((id, cpus));
+            }
+        }
+
+        nodes
+    });
+
+    if nodes.len() < 2 {
+        return None;
+    }
+
+    let cpus = parse_cpu_list(threads)?;
+    let mut node_ids = BTreeSet::new();
+    for cpu in cpus {
+        node_ids.insert(nodes.iter().find(|(_, cpus)| cpus.contains(&cpu))?.0);
+    }
+
+    if node_ids.is_empty() {
+        return None;
+    }
+
+    Some(
+        node_ids
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 #[derive(ToSchema, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -172,6 +254,8 @@ nestify::nest! {
             #[serde(default, deserialize_with = "crate::deserialize::deserialize_defaultable")]
             pub overhead_memory: i64,
             pub swap: i64,
+            /// Only has an effect with a scheduler that implements weights, CFQ on
+            /// cgroup v1 and BFQ or iocost on v2. It is silently ignored otherwise.
             pub io_weight: Option<u16>,
             pub cpu_limit: i64,
             pub disk_space: u64,
@@ -456,36 +540,47 @@ impl ServerConfiguration {
             0
         };
 
+        let memory = match real_memory {
+            0 => None,
+            limit => Some(
+                config
+                    .load()
+                    .docker
+                    .overhead
+                    .get_memory(limit.into())
+                    .as_bytes() as i64,
+            ),
+        };
+
+        if self.build.oom_disabled && crate::server::executor::docker::cgroup::is_unified() {
+            tracing::warn!(
+                server = %self.uuid,
+                "oom_disabled is set, but the container engine discards it on cgroup v2 hosts"
+            );
+        }
+
         let mut resources = bollard::models::Resources {
-            memory: match real_memory {
-                0 => None,
-                limit => Some(
-                    config
-                        .load()
-                        .docker
-                        .overhead
-                        .get_memory(limit.into())
-                        .as_bytes() as i64,
-                ),
-            },
+            memory,
             memory_reservation: match real_memory {
                 0 => None,
                 limit => Some(limit * 1024 * 1024),
             },
-            memory_swap: match self.build.swap {
-                0 => None,
-                -1 => Some(-1),
-                limit => match real_memory {
-                    0 => Some(limit * 1024 * 1024),
-                    memory_limit => Some(
-                        config
-                            .load()
-                            .docker
-                            .overhead
-                            .get_memory(memory_limit.into())
-                            .as_bytes() as i64
-                            + limit * 1024 * 1024,
-                    ),
+            memory_swap: match memory {
+                None => {
+                    if self.build.swap != 0 {
+                        tracing::warn!(
+                            server = %self.uuid,
+                            swap = self.build.swap,
+                            "ignoring the swap limit, it cannot be set without a memory limit"
+                        );
+                    }
+
+                    None
+                }
+                Some(memory) => match self.build.swap {
+                    0 => Some(memory),
+                    -1 => Some(-1),
+                    limit => Some(memory + limit * 1024 * 1024),
                 },
             },
             blkio_weight: self.build.io_weight,
@@ -495,13 +590,19 @@ impl ServerConfiguration {
                 limit => Some(limit as i64),
             },
             cpuset_cpus: self.build.threads.clone().map(|t| t.into()),
+            cpuset_mems: if config.load().docker.numa_memory_binding {
+                self.build.threads.as_deref().and_then(numa_memory_nodes)
+            } else {
+                None
+            },
             ..Default::default()
         };
 
         if self.build.cpu_limit > 0 {
-            resources.cpu_quota = Some(self.build.cpu_limit * 1000);
-            resources.cpu_period = Some(100000);
-            resources.cpu_shares = Some(1024);
+            let period = config.load().docker.cpu_period_us();
+
+            resources.cpu_quota = Some(self.build.cpu_limit * period / 100);
+            resources.cpu_period = Some(period);
         } else {
             resources.cpu_quota = Some(-1);
         }
@@ -562,6 +663,57 @@ mod tests {
             source: source.as_ref().to_string_lossy().to_compact_string(),
             read_only: false,
         }
+    }
+
+    fn resources(memory_limit: i64, swap: i64) -> bollard::models::Resources {
+        let config = tokio_test::block_on(async { crate::config::Config::mock() });
+
+        let mut configuration = ServerConfiguration::mock(uuid::Uuid::new_v4());
+        configuration.build.memory_limit = memory_limit;
+        configuration.build.overhead_memory = 0;
+        configuration.build.swap = swap;
+
+        configuration.convert_container_resources(&config)
+    }
+
+    // ServerConfiguration::convert_container_resources
+
+    #[test]
+    fn convert_container_resources_disables_swap_by_matching_the_memory_limit() {
+        let resources = resources(2048, 0);
+
+        assert!(resources.memory.is_some());
+        assert_eq!(resources.memory_swap, resources.memory);
+    }
+
+    #[test]
+    fn convert_container_resources_passes_unlimited_swap_through() {
+        assert_eq!(resources(2048, -1).memory_swap, Some(-1));
+    }
+
+    #[test]
+    fn convert_container_resources_adds_a_positive_swap_limit_to_the_memory_limit() {
+        let resources = resources(2048, 512);
+
+        assert_eq!(
+            resources.memory_swap,
+            Some(resources.memory.unwrap() + 512 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn convert_container_resources_never_sets_swap_without_a_memory_limit() {
+        for swap in [0, -1, 512] {
+            let resources = resources(0, swap);
+
+            assert_eq!(resources.memory, None);
+            assert_eq!(resources.memory_swap, None);
+        }
+    }
+
+    #[test]
+    fn convert_container_resources_leaves_cpu_shares_at_the_host_default() {
+        assert_eq!(resources(2048, 0).cpu_shares, None);
     }
 
     // Mount::resolve_allowed_source

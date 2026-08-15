@@ -214,6 +214,8 @@ pub async fn handle_ws(
                                                     }
                                                 websocket::WebsocketEvent::ServerOperationProgress
                                                 | websocket::WebsocketEvent::ServerOperationCompleted
+                                                | websocket::WebsocketEvent::ServerOperationAborted
+                                                | websocket::WebsocketEvent::ServerOperationError
                                                     if !websocket_handler
                                                         .has_permission(Permission::FileRead).await?
                                                     => {

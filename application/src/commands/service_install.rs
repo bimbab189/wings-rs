@@ -40,7 +40,6 @@ PartOf=docker.service
 [Service]
 User=root
 KillMode=process
-WorkingDirectory=/etc/pterodactyl
 LimitNOFILE=4096
 PIDFile=/run/calagopus-wings/daemon.pid
 ExecStart={}
@@ -65,7 +64,6 @@ description="Calagopus Wings Daemon"
 command="{}"
 supervisor="supervise-daemon"
 pidfile="/run/calagopus-wings.pid"
-directory="/etc/pterodactyl"
 rc_ulimit="-n 4096"
 
 respawn_delay=5

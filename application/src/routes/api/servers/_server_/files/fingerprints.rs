@@ -84,9 +84,7 @@ pub(crate) mod get {
                 Err(_) => continue,
             };
 
-            if !metadata.file_type.is_file()
-                || (filesystem.is_primary_server_fs() && server.filesystem.is_ignored(&path, false))
-            {
+            if !metadata.file_type.is_file() {
                 continue;
             }
 

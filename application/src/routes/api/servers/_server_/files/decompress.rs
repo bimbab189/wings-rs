@@ -5,6 +5,7 @@ pub(crate) mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},
+        server::filesystem::cap::FileType,
     };
     use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
@@ -69,7 +70,10 @@ pub(crate) mod post {
             server.filesystem.resolve_writable_fs(&server, &root).await;
 
         if destination_filesystem.is_primary_server_fs()
-            && server.filesystem.is_ignored(&root, true)
+            && server
+                .filesystem
+                .async_is_ignored(&root, FileType::Dir)
+                .await
         {
             return ApiResponse::error("root not found")
                 .with_status(StatusCode::NOT_FOUND)
@@ -78,14 +82,11 @@ pub(crate) mod post {
 
         let source = root.join(data.file);
 
-        if server.filesystem.is_ignored(
-            &source,
-            server
-                .filesystem
-                .async_metadata(&source)
-                .await
-                .is_ok_and(|m| m.is_dir()),
-        ) {
+        if server
+            .filesystem
+            .async_is_ignored(&source, server.filesystem.probe_file_type(&source).await)
+            .await
+        {
             return ApiResponse::error("file not found")
                 .with_status(StatusCode::NOT_FOUND)
                 .ok();

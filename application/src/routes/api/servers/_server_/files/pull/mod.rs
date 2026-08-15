@@ -46,6 +46,7 @@ pub(crate) mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},
+        server::filesystem::cap::FileType,
     };
     use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
@@ -100,6 +101,17 @@ pub(crate) mod post {
         if !metadata.map_or(true, |m| m.file_type.is_dir()) {
             return ApiResponse::error("root is not a directory")
                 .with_status(StatusCode::EXPECTATION_FAILED)
+                .ok();
+        }
+
+        if filesystem.is_primary_server_fs()
+            && server
+                .filesystem
+                .async_is_ignored(&root, FileType::Dir)
+                .await
+        {
+            return ApiResponse::error("path not found")
+                .with_status(StatusCode::NOT_FOUND)
                 .ok();
         }
 

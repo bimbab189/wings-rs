@@ -695,7 +695,11 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
 
                     let file_type = VirtualZipArchive::zip_entry_to_file_type(&entry);
 
-                    if let Some(name) = (self.is_ignored)(file_type, name.to_path_buf()) {
+                    if let Some(name) = self
+                        .is_ignored
+                        .call_async(file_type, name.to_path_buf())
+                        .await
+                    {
                         return Some(Ok((file_type, name)));
                     }
                 }
@@ -745,7 +749,7 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
 
                     let file_type = VirtualZipArchive::zip_entry_to_file_type(&entry);
 
-                    if let Some(name) = (self.is_ignored)(file_type, name) {
+                    if let Some(name) = self.is_ignored.call_async(file_type, name).await {
                         if entry.is_file() {
                             let (reader, mut writer) = tokio::io::simplex(crate::BUFFER_SIZE);
 
@@ -1126,9 +1130,9 @@ impl VirtualReadableFilesystem for VirtualZipArchive {
                             continue;
                         }
                         let file_type = VirtualZipArchive::zip_entry_to_file_type(&entry);
-                        if (is_ignored)(file_type, relative.clone()).is_none() {
+                        let Some(relative) = (is_ignored)(file_type, relative) else {
                             continue;
-                        }
+                        };
                         entries.push((relative, i));
                     }
                     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));

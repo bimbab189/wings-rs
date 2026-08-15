@@ -14,6 +14,7 @@ use std::{
 };
 use tokio::io::{AsyncWriteExt, ReadBuf};
 
+pub mod cgroup;
 pub mod host_mounts;
 
 #[inline]
@@ -270,6 +271,10 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
                                 "com.docker.network.host_ipv4".to_string(),
                                 default.ip.to_string(),
                             ),
+                            (
+                                "com.docker.network.driver.mtu".to_string(),
+                                config.load().docker.network.network_mtu.to_string(),
+                            ),
                         ])),
                         ..Default::default()
                     })
@@ -310,11 +315,15 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
                 memory_swap: resources.memory_swap,
                 cpu_quota: resources.cpu_quota,
                 cpu_period: resources.cpu_period,
-                cpu_shares: resources.cpu_shares,
                 cpuset_cpus: resources.cpuset_cpus,
+                cpuset_mems: resources.cpuset_mems,
                 pids_limit: resources.pids_limit,
                 blkio_weight: resources.blkio_weight,
                 oom_kill_disable: resources.oom_kill_disable,
+                shm_size: match config.load().docker.shm_size.as_bytes() {
+                    0 => None,
+                    size => Some(size as i64),
+                },
 
                 port_bindings: Some(self.convert_allocations_docker_bindings(config)),
                 mounts: Some(self.convert_mounts(config, filesystem, host_mounts).await),
@@ -325,7 +334,10 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
                 dns_options: Some(config.load().docker.network.dns_options.clone()),
                 tmpfs: Some(HashMap::from([(
                     "/tmp".to_string(),
-                    format!("rw,exec,nosuid,size={}M", config.load().docker.tmpfs_size),
+                    format!(
+                        "rw,exec,nosuid,size={}M",
+                        config.load().docker.tmpfs_size.as_mib()
+                    ),
                 )])),
                 log_config: Some(bollard::plugin::HostConfigLogConfig {
                     typ: Some(config.load().docker.log_config.r#type.clone()),
@@ -398,8 +410,8 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
             memory_swap: resources.memory_swap,
             cpu_quota: resources.cpu_quota,
             cpu_period: resources.cpu_period,
-            cpu_shares: resources.cpu_shares,
             cpuset_cpus: resources.cpuset_cpus,
+            cpuset_mems: resources.cpuset_mems,
             pids_limit: resources.pids_limit,
             blkio_weight: resources.blkio_weight,
             oom_kill_disable: resources.oom_kill_disable,
@@ -422,14 +434,74 @@ impl DockerServerConfigurationExt for crate::server::configuration::ServerConfig
             resources.memory_swap = None;
         }
 
-        if resources
-            .cpu_quota
-            .is_some_and(|c| c > 0 && c < installer_limits.cpu as i64 * 1000)
-        {
-            resources.cpu_quota = Some(installer_limits.cpu as i64 * 1000);
+        let floor = installer_limits.cpu as i64 * config.docker.cpu_period_us() / 100;
+        if resources.cpu_quota.is_some_and(|c| c > 0 && c < floor) {
+            resources.cpu_quota = Some(floor);
         }
 
         resources
+    }
+}
+
+#[async_trait::async_trait]
+trait DockerCfsBurstExt {
+    async fn write_cfs_burst(&self, container_id: &str, quota_us: Option<i64>, multiple: f64);
+    async fn apply_cfs_burst(
+        &self,
+        container_id: &str,
+        quota_us: Option<i64>,
+        config: &crate::config::Config,
+    );
+    async fn clear_cfs_burst(&self, container_id: &str);
+}
+
+#[async_trait::async_trait]
+impl DockerCfsBurstExt for bollard::Docker {
+    async fn write_cfs_burst(&self, container_id: &str, quota_us: Option<i64>, multiple: f64) {
+        let inspect = match self.inspect_container(container_id, None).await {
+            Ok(inspect) => inspect,
+            Err(err) => {
+                tracing::debug!(
+                    container = %container_id,
+                    "failed to inspect container for cfs burst: {}",
+                    err
+                );
+
+                return;
+            }
+        };
+
+        let Some(pid) = inspect
+            .state
+            .and_then(|state| state.pid)
+            .filter(|pid| *pid > 0)
+        else {
+            return;
+        };
+
+        let quota_us = quota_us
+            .or_else(|| inspect.host_config.and_then(|config| config.cpu_quota))
+            .unwrap_or(0);
+
+        cgroup::write_burst(pid, cgroup::burst_us(quota_us, multiple)).await;
+    }
+
+    async fn apply_cfs_burst(
+        &self,
+        container_id: &str,
+        quota_us: Option<i64>,
+        config: &crate::config::Config,
+    ) {
+        let burst = config.load().docker.cfs_burst;
+
+        if burst.enabled {
+            self.write_cfs_burst(container_id, quota_us, burst.multiple)
+                .await;
+        }
+    }
+
+    async fn clear_cfs_burst(&self, container_id: &str) {
+        self.write_cfs_burst(container_id, Some(0), 0.0).await;
     }
 }
 
@@ -554,18 +626,17 @@ impl DockerExecutor {
                             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 
                             let mut cache = cache.lock();
-                            let now = std::time::Instant::now();
                             let duration = config.load().docker.registry_image_fetch_cache.duration;
                             cache.retain(
                                 |_,
                                  timestamp: &mut Arc<
                                     tokio::sync::Mutex<Option<std::time::Instant>>,
                                 >| {
-                                    timestamp.try_lock().is_ok_and(|t| {
-                                        now.duration_since(t.unwrap_or(std::time::Instant::now()))
-                                            .as_secs()
-                                            < duration
-                                    })
+                                    match timestamp.try_lock() {
+                                        Ok(timestamp) => timestamp
+                                            .is_some_and(|t| t.elapsed().as_secs() < duration),
+                                        Err(_) => true,
+                                    }
                                 },
                             );
                         }
@@ -812,6 +883,7 @@ impl DockerProcessHandle {
         app_config: Arc<crate::config::Config>,
         status_tx: tokio::sync::mpsc::Sender<super::ProcessStatus>,
         publish_resource_usage: bool,
+        attach_stdin: bool,
     ) -> Result<Self, anyhow::Error> {
         let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(150);
         let (stdout_ratelimited_tx, stdout_ratelimited_rx) =
@@ -835,7 +907,7 @@ impl DockerProcessHandle {
             .attach_container(
                 &container_id,
                 Some(bollard::query_parameters::AttachContainerOptions {
-                    stdin: true,
+                    stdin: attach_stdin,
                     stdout: true,
                     stderr: true,
                     stream: true,
@@ -845,6 +917,10 @@ impl DockerProcessHandle {
             .await?;
 
         let stdin_task = tokio::spawn(async move {
+            if !attach_stdin {
+                return;
+            }
+
             while let Some(data) = stdin_rx.recv().await {
                 if let Err(err) = attach.input.write_all(&data).await {
                     tracing::error!(error = %err, "failed to write to container stdin");
@@ -947,13 +1023,12 @@ impl DockerProcessHandle {
                     }),
                 );
 
-                let (r1, r2, _) = tokio::join!(
+                let (r1, _) = tokio::join!(
                     stream.next(),
-                    stats_server.filesystem.limiter_usage(),
                     tokio::time::sleep(std::time::Duration::from_secs(1))
                 );
 
-                (r1, r2)
+                (r1, stats_server.filesystem.limiter_usage().await)
             };
 
             while let (Some(stats), disk_bytes) = get_stats().await {
@@ -1063,15 +1138,20 @@ impl DockerProcessHandle {
                             if publish_resource_usage {
                                 state_usage.send_modify(|usage| {
                                     usage.uptime = uptime;
-                                    if let Some(host_config) = inspect.host_config
-                                        && let Some(cpu_quota) = host_config.cpu_quota
-                                        && cpu_quota > 0
-                                    {
-                                        usage.cpu_limit_absolute = (cpu_quota / 1000) as u32;
+                                    let host_config = inspect.host_config.unwrap_or_default();
+                                    let limit = cgroup::limit_percent(
+                                        host_config.cpu_quota.unwrap_or(0),
+                                        host_config.cpu_period.unwrap_or(100000),
+                                    );
+
+                                    usage.cpu_limit_absolute = if limit > 0 {
+                                        limit
                                     } else {
-                                        usage.cpu_limit_absolute =
-                                            rayon::current_num_threads() as u32 * 100;
-                                    }
+                                        std::thread::available_parallelism()
+                                            .map_or(1, |threads| threads.get())
+                                            as u32
+                                            * 100
+                                    };
                                 });
                             }
                         }
@@ -1198,18 +1278,28 @@ impl super::ProcessHandle for DockerProcessHandle {
             .read()
             .await
             .container_update_config(&self.app_config);
+        let cpu_quota = update_config.cpu_quota;
 
+        self.docker.clear_cfs_burst(&self.container_id).await;
         self.docker
             .update_container(&self.container_id, update_config)
-            .await
-            .map_err(Into::into)
+            .await?;
+        self.docker
+            .apply_cfs_burst(&self.container_id, cpu_quota, &self.app_config)
+            .await;
+
+        Ok(())
     }
 
     async fn start(&self) -> Result<(), anyhow::Error> {
         self.docker
             .start_container(&self.container_id, None)
-            .await
-            .map_err(Into::into)
+            .await?;
+        self.docker
+            .apply_cfs_burst(&self.container_id, None, &self.app_config)
+            .await;
+
+        Ok(())
     }
 
     async fn stop(&self) -> Result<(), anyhow::Error> {
@@ -1416,6 +1506,7 @@ impl super::ServerExecutor for DockerExecutor {
                 Arc::clone(&self.app_config),
                 status_tx,
                 true,
+                true,
             )
             .await?,
         );
@@ -1435,6 +1526,10 @@ impl super::ServerExecutor for DockerExecutor {
         .await
         .ok_or_else(|| anyhow::anyhow!("no running server container found"))?;
 
+        self.docker
+            .apply_cfs_burst(&container_id, None, &self.app_config)
+            .await;
+
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
         let handle = Arc::new(
             DockerProcessHandle::new(
@@ -1443,6 +1538,7 @@ impl super::ServerExecutor for DockerExecutor {
                 server,
                 Arc::clone(&self.app_config),
                 status_tx,
+                true,
                 true,
             )
             .await?,
@@ -1536,8 +1632,8 @@ impl super::ServerExecutor for DockerExecutor {
                 memory_swap: resources.memory_swap,
                 cpu_quota: resources.cpu_quota,
                 cpu_period: resources.cpu_period,
-                cpu_shares: resources.cpu_shares,
                 cpuset_cpus: resources.cpuset_cpus,
+                cpuset_mems: resources.cpuset_mems,
                 pids_limit: resources.pids_limit,
                 blkio_weight: resources.blkio_weight,
                 oom_kill_disable: resources.oom_kill_disable,
@@ -1568,7 +1664,7 @@ impl super::ServerExecutor for DockerExecutor {
                     "/tmp".to_string(),
                     format!(
                         "rw,exec,nosuid,size={}M",
-                        self.app_config.load().docker.tmpfs_size
+                        self.app_config.load().docker.tmpfs_size.as_mib()
                     ),
                 )])),
                 log_config: Some(bollard::plugin::HostConfigLogConfig {
@@ -1629,6 +1725,7 @@ impl super::ServerExecutor for DockerExecutor {
                 Arc::clone(&self.app_config),
                 status_tx,
                 true,
+                true,
             )
             .await?,
         );
@@ -1648,6 +1745,10 @@ impl super::ServerExecutor for DockerExecutor {
         .await
         .ok_or_else(|| anyhow::anyhow!("no running installer container found"))?;
 
+        self.docker
+            .apply_cfs_burst(&container_id, None, &self.app_config)
+            .await;
+
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
         let handle = Arc::new(
             DockerProcessHandle::new(
@@ -1656,6 +1757,7 @@ impl super::ServerExecutor for DockerExecutor {
                 server,
                 Arc::clone(&self.app_config),
                 status_tx,
+                true,
                 true,
             )
             .await?,
@@ -1749,8 +1851,8 @@ impl super::ServerExecutor for DockerExecutor {
                 memory_swap: resources.memory_swap,
                 cpu_quota: resources.cpu_quota,
                 cpu_period: resources.cpu_period,
-                cpu_shares: resources.cpu_shares,
                 cpuset_cpus: resources.cpuset_cpus,
+                cpuset_mems: resources.cpuset_mems,
                 pids_limit: resources.pids_limit,
                 blkio_weight: resources.blkio_weight,
                 oom_kill_disable: resources.oom_kill_disable,
@@ -1781,7 +1883,7 @@ impl super::ServerExecutor for DockerExecutor {
                     "/tmp".to_string(),
                     format!(
                         "rw,exec,nosuid,size={}M",
-                        self.app_config.load().docker.tmpfs_size
+                        self.app_config.load().docker.tmpfs_size.as_mib()
                     ),
                 )])),
                 log_config: Some(bollard::plugin::HostConfigLogConfig {
@@ -1798,7 +1900,6 @@ impl super::ServerExecutor for DockerExecutor {
                     ),
                 }),
                 userns_mode: string_to_option(&self.app_config.load().docker.userns_mode),
-                auto_remove: Some(true),
                 ..Default::default()
             }),
             cmd: Some(vec![
@@ -1841,15 +1942,59 @@ impl super::ServerExecutor for DockerExecutor {
         let (status_tx, status_rx) = tokio::sync::mpsc::channel(1);
         let handle = Arc::new(
             DockerProcessHandle::new(
-                container.id,
+                container.id.clone(),
                 Arc::clone(&self.docker),
                 server,
                 Arc::clone(&self.app_config),
                 status_tx,
                 false,
+                false,
             )
             .await?,
         );
+
+        tokio::spawn({
+            let docker = Arc::clone(&self.docker);
+            let server = server.uuid;
+
+            async move {
+                if let Some(Err(err)) = docker
+                    .wait_container(
+                        &container.id,
+                        Some(bollard::query_parameters::WaitContainerOptions {
+                            condition: "next-exit".to_string(),
+                        }),
+                    )
+                    .next()
+                    .await
+                {
+                    tracing::error!(
+                        server = %server,
+                        container = %container.id,
+                        "script failed: {}",
+                        err
+                    );
+                }
+
+                if let Err(err) = docker
+                    .remove_container(
+                        &container.id,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        server = %server,
+                        container = %container.id,
+                        "failed to remove script container: {}",
+                        err
+                    );
+                }
+            }
+        });
 
         Ok((handle, status_rx))
     }
@@ -1961,5 +2106,42 @@ impl super::ServerExecutor for DockerExecutor {
                 (ip, ports)
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::configuration::ServerConfiguration;
+
+    // cpu period scaling
+
+    #[test]
+    fn a_non_default_cpu_period_scales_every_quota_consistently() {
+        let config = tokio_test::block_on(async { crate::config::Config::mock() });
+        {
+            let inner = config.mutate_in_place_for_testing();
+            inner.docker.cpu_period = 20000;
+            inner.docker.installer_limits.cpu = 100;
+        }
+
+        let mut configuration = ServerConfiguration::mock(uuid::Uuid::new_v4());
+        configuration.build.cpu_limit = 250;
+
+        let resources = configuration.convert_container_resources(&config);
+        assert_eq!(resources.cpu_period, Some(20000));
+        assert_eq!(resources.cpu_quota, Some(50000));
+        assert_eq!(cgroup::limit_percent(50000, 20000), 250);
+
+        // below the installer floor, which is a percentage of the same period
+        configuration.build.cpu_limit = 50;
+        let installer = configuration.installer_resources(&config);
+        assert_eq!(installer.cpu_quota, Some(20000));
+        assert_eq!(cgroup::limit_percent(20000, 20000), 100);
+
+        // above the floor, the server limit is kept
+        configuration.build.cpu_limit = 400;
+        let installer = configuration.installer_resources(&config);
+        assert_eq!(installer.cpu_quota, Some(80000));
     }
 }

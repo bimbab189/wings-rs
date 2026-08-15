@@ -29,6 +29,7 @@ zstd = { version = "0.13.3", features = ["zstdmt"] }
 hex = "0.4.3"
 tar = "0.4.44"
 compact_str = { git = "https://github.com/ParkMyCar/compact_str.git", rev = "0969dcc71c2e06bb2200844d14c5ab7759211744", version = "0.9.0", features = ["serde"] }
+url = { version = "2.5.8", features = ["serde"] }
 positioned-io = "0.3.5"
 futures = "0.3.31"
 

@@ -142,6 +142,7 @@ where
 {
     fn from(err: T) -> Self {
         let err = err.into();
+
         tracing::error!("a request error occurred: {:?}", err);
 
         let message = if let Some(err) = err.downcast_ref::<&str>() {
