@@ -1,7 +1,7 @@
 use super::State;
 use utoipa_axum::router::OpenApiRouter;
 
-mod _operation_;
+pub(crate) mod _operation_;
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()

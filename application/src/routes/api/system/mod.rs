@@ -1,14 +1,15 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-mod config;
-mod logs;
-mod overview;
-mod ssh_sessions;
-mod stats;
-mod upgrade;
+pub(crate) mod config;
+pub(crate) mod logs;
+pub(crate) mod overview;
+pub(crate) mod ssh_sessions;
+pub(crate) mod stats;
+pub(crate) mod upgrade;
+pub(crate) mod web_hosting;
 
-mod get {
+pub(crate) mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::GetState,
@@ -49,5 +50,6 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/config", config::router(state))
         .nest("/stats", stats::router(state))
         .nest("/ssh-sessions", ssh_sessions::router(state))
+        .nest("/web-hosting", web_hosting::router(state))
         .with_state(state.clone())
 }

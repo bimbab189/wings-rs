@@ -92,6 +92,57 @@ pub async fn send_activity(
     Ok(())
 }
 
+pub async fn send_web_ide_session_event(
+    client: &Client,
+    server: uuid::Uuid,
+    session: uuid::Uuid,
+    event: &str,
+    reason: Option<&str>,
+) -> Result<(), anyhow::Error> {
+    client
+        .client
+        .post(format!(
+            "{}/servers/{server}/web-ide/sessions/{session}",
+            client.url
+        ))
+        .json(&json!({
+            "event": event,
+            "reason": reason,
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    Ok(())
+}
+
+pub async fn send_web_ide_addon_tool(
+    client: &Client,
+    server: uuid::Uuid,
+    session: uuid::Uuid,
+    operation: &str,
+    input: &serde_json::Value,
+) -> Result<(u16, String), anyhow::Error> {
+    let response = client
+        .client
+        .post(format!(
+            "{}/servers/{server}/web-ide/sessions/{session}/addon-tools",
+            client.url
+        ))
+        .json(&json!({
+            "operation": operation,
+            "input": input,
+        }))
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.bytes().await?;
+    if body.len() > 2 * 1024 * 1024 {
+        anyhow::bail!("panel addon tool response exceeded the size limit");
+    }
+    Ok((status, String::from_utf8_lossy(&body).into_owned()))
+}
+
 pub async fn send_schedule_status(
     client: &Client,
     schedules: Vec<ApiScheduleCompletionStatus>,

@@ -6,7 +6,7 @@ package.rust-version = "1.93.0"
 
 [workspace.dependencies]
 anyhow = "1.0.98"
-axum = { version = "0.8.1", features = ["http2", "ws", "multipart"] }
+axum = { version = "0.8.1", features = ["http2", "ws", "multipart", "macros"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 axum-extra = { version = "0.12.1", features = ["query"] }
 bollard = "0.18.1"

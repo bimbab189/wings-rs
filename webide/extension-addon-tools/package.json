@@ -1,0 +1,106 @@
+{
+  "name": "jexactyl-mod-manager-tools",
+  "displayName": "Jexactyl Mods & Plugins",
+  "description": "Permission-checked Copilot tools backed by the Jexactyl mods and plugins browser.",
+  "version": "1.0.5",
+  "publisher": "jexactyl",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.105.0"
+  },
+  "categories": ["Other"],
+  "extensionKind": ["workspace"],
+  "browser": "./dist/extension.js",
+  "main": "./dist/extension.js",
+  "activationEvents": ["*"],
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --format=cjs --platform=browser --external:vscode --outfile=dist/extension.js --minify --sourcemap",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/vscode": "1.105.0",
+    "esbuild": "0.28.1",
+    "typescript": "5.9.3"
+  },
+  "contributes": {
+    "chatInstructions": [
+      {
+        "path": "./prompts/jexactyl-addon-compatibility.instructions.md",
+        "when": "jexactyl.webIde.addonToolsEnabled"
+      }
+    ],
+    "configuration": {
+      "title": "Jexactyl Mods & Plugins",
+      "properties": {
+        "jexactyl.webIde.addonToolsEnabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Managed by Jexactyl. Enables the server-scoped Copilot mods/plugins tool pack."
+        },
+        "jexactyl.webIde.addonToolsSocket": {
+          "type": "string",
+          "default": "",
+          "scope": "window",
+          "description": "Managed by Jexactyl. Private session socket for the mods/plugins tool pack."
+        }
+      }
+    },
+    "languageModelTools": [
+      {
+        "name": "jexactyl_mod_manager_search",
+        "displayName": "Search Jexactyl mods and plugins",
+        "toolReferenceName": "jexactylModManagerSearch",
+        "icon": "$(search)",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Search the current server's Jexactyl mod/plugin catalog.",
+        "when": "jexactyl.webIde.addonToolsEnabled",
+        "modelDescription": "Search the Jexactyl server's existing mod/plugin catalogs. Returns at most 20 results containing only name, creator, short description, and an opaque ref. Use page for subsequent pages. The response includes server-owned compatibility metadata: require exact=true and verify the exact game_version whenever one is reported; for mods also verify the loader, and for plugins verify the platform. gameVersion is the browser's Minecraft version; modLoaderType uses the browser IDs (Forge 1, Cauldron 2, LiteLoader 3, Fabric 4, Quilt 5, NeoForge 6), or use loader by name. sortField/sortOrder and platform use the browser's provider-specific values. Never infer compatibility from a filename, choose the first provider version, override the server-owned filters, or access another server.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "resource": { "type": "string", "enum": ["mods", "plugins"], "description": "Catalog to search." },
+            "source": { "type": "string", "enum": ["modrinth", "curseforge", "spigot"], "description": "Provider used by the server's browser." },
+            "query": { "type": "string", "maxLength": 255 },
+            "page": { "type": "integer", "minimum": 1, "maximum": 500, "default": 1 },
+            "gameVersion": { "type": "string", "maxLength": 50 },
+            "modLoaderType": { "type": "integer", "minimum": 0, "maximum": 100000 },
+            "loader": { "type": "string", "maxLength": 50 },
+            "sortField": { "type": "string", "maxLength": 50 },
+            "sortOrder": { "type": "string", "enum": ["asc", "desc"] },
+            "categoryId": { "type": "integer", "minimum": 0, "maximum": 100000000 },
+            "minRating": { "type": "number", "minimum": 0, "maximum": 5 },
+            "platform": { "oneOf": [{ "type": "string", "maxLength": 50 }, { "type": "array", "maxItems": 8, "items": { "type": "string", "maxLength": 50 } }] }
+          },
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "jexactyl_mod_manager_install",
+        "displayName": "Install a Jexactyl mod or plugin",
+        "toolReferenceName": "jexactylModManagerInstall",
+        "icon": "$(cloud-download)",
+        "canBeReferencedInPrompt": true,
+        "userDescription": "Install a selected mod or plugin into the current server.",
+        "when": "jexactyl.webIde.addonToolsEnabled",
+        "modelDescription": "Install one mod/plugin into the current Jexactyl server through its existing authorized browser installer. Search first and use the returned opaque ref when possible; even a user-supplied project/file id is not proof of compatibility. Before calling, verify the search response's server-owned exact=true result and exact game_version whenever reported; for mods also verify loader, and for plugins verify platform. If any required check is missing or mismatched, do not install. Never choose a first/nearby provider version or override the server-owned filters. A user confirmation is required. Returns installed successfully or a stable error_code and message.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "resource": { "type": "string", "enum": ["mods", "plugins"] },
+            "source": { "type": "string", "enum": ["modrinth", "curseforge", "spigot"] },
+            "ref": { "type": "string", "maxLength": 512 },
+            "projectId": { "type": ["string", "integer"], "maxLength": 128 },
+            "fileId": { "type": ["string", "integer"], "maxLength": 128 },
+            "gameVersion": { "type": "string", "maxLength": 50 },
+            "modLoaderType": { "type": "integer", "minimum": 0, "maximum": 100000 },
+            "loader": { "type": "string", "maxLength": 50 },
+            "platform": { "oneOf": [{ "type": "string", "maxLength": 50 }, { "type": "array", "maxItems": 8, "items": { "type": "string", "maxLength": 50 } }] }
+          },
+          "additionalProperties": false,
+          "anyOf": [{ "required": ["ref"] }, { "required": ["projectId"] }]
+        }
+      }
+    ]
+  }
+}

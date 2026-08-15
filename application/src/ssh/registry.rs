@@ -1,10 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::{
-    collections::HashMap,
-    net::IpAddr,
-    sync::Arc,
-};
+use std::{collections::HashMap, net::IpAddr, sync::Arc};
 use tokio::sync::RwLock;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -125,7 +121,9 @@ mod tests {
         let user = Uuid::new_v4();
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
-        let id = registry.register(server, user, ip, SessionType::Shell).await;
+        let id = registry
+            .register(server, user, ip, SessionType::Shell)
+            .await;
         assert_eq!(registry.count().await, 1);
 
         let sessions = registry.for_server(server).await;
@@ -145,9 +143,15 @@ mod tests {
         let user = Uuid::new_v4();
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
-        let _id1 = registry.register(server1, user, ip, SessionType::Shell).await;
-        let _id2 = registry.register(server1, user, ip, SessionType::Sftp).await;
-        let _id3 = registry.register(server2, user, ip, SessionType::Exec).await;
+        let _id1 = registry
+            .register(server1, user, ip, SessionType::Shell)
+            .await;
+        let _id2 = registry
+            .register(server1, user, ip, SessionType::Sftp)
+            .await;
+        let _id3 = registry
+            .register(server2, user, ip, SessionType::Exec)
+            .await;
 
         assert_eq!(registry.count().await, 3);
         assert_eq!(registry.for_server(server1).await.len(), 2);

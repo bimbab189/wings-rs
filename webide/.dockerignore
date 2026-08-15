@@ -1,0 +1,5 @@
+extension/node_modules
+extension/dist
+extension/*.vsix
+extension-addon-tools/node_modules
+extension-addon-tools/dist

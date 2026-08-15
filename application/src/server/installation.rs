@@ -167,6 +167,7 @@ impl ServerInstaller {
             return Err(anyhow::anyhow!("server is in a locked state"));
         }
 
+        self.server.stop_web_ide_sessions("server_installing").await;
         self.server.installing.store(true, Ordering::SeqCst);
         self.server
             .websocket

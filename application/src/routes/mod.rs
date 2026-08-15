@@ -4,9 +4,9 @@ use std::{sync::Arc, time::Instant};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 
-pub mod api;
-mod download;
-mod upload;
+pub(crate) mod api;
+pub(crate) mod download;
+pub(crate) mod upload;
 
 #[derive(Debug, ToSchema, Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
@@ -86,6 +86,7 @@ pub struct AppState {
     pub backup_manager: Arc<crate::server::backup::manager::BackupManager>,
     pub mime_cache: moka::future::Cache<MimeCacheKey, &'static str>,
     pub ssh_sessions: crate::ssh::SshSessionRegistry,
+    pub web_ide: crate::server::web_ide::WebIdeManager,
 }
 
 #[derive(ToSchema, Serialize, Deserialize)]

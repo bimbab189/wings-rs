@@ -1,9 +1,9 @@
 use super::State;
 use utoipa_axum::router::OpenApiRouter;
 
-mod broadcast;
-mod deny;
-mod permissions;
+pub(crate) mod broadcast;
+pub(crate) mod deny;
+pub(crate) mod permissions;
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()

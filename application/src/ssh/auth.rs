@@ -345,6 +345,8 @@ impl russh::server::Handler for SshSession {
             user_ip: self.user_ip,
             user_uuid,
             mode: super::shell::ShellMode::Normal,
+            permission_override: None,
+            activity_source: "ssh",
         };
         ssh.run(channel);
 

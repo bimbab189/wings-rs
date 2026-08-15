@@ -1,7 +1,7 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-mod post {
+pub(crate) mod post {
     use crate::{
         remote::servers::RawServer,
         response::{ApiResponse, ApiResponseResult},

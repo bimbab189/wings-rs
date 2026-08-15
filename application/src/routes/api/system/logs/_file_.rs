@@ -1,7 +1,7 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-mod get {
+pub(crate) mod get {
     use crate::{
         io::compression::reader::AsyncCompressionReader,
         response::{ApiResponse, ApiResponseResult},

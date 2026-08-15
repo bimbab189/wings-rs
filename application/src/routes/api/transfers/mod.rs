@@ -5,10 +5,10 @@ use utoipa_axum::{
     routes,
 };
 
-mod _server_;
-mod files;
+pub(crate) mod _server_;
+pub(crate) mod files;
 
-mod post {
+pub(crate) mod post {
     use crate::{
         io::{
             abort::{AbortGuard, AbortReader},

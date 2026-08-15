@@ -1,7 +1,7 @@
 use super::State;
 use utoipa_axum::router::OpenApiRouter;
 
-mod _backup_;
+pub(crate) mod _backup_;
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()

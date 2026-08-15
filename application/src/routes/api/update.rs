@@ -1,7 +1,7 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-mod post {
+pub(crate) mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::GetState,
@@ -41,6 +41,26 @@ mod post {
             }>,
 
             allowed_origins: Option<Vec<String>>,
+
+            #[schema(inline)]
+            web_hosting: Option<#[derive(ToSchema, Deserialize)] pub struct WebHostingPayload {
+                enabled: Option<bool>,
+                vhost_dir: Option<String>,
+                vhost_path: Option<String>,
+                acme_root: Option<String>,
+                webroot_base: Option<String>,
+                state_dir: Option<String>,
+                backup_repository: Option<String>,
+                quarantine_path: Option<String>,
+                release_path: Option<String>,
+                reload_helper: Option<String>,
+                bind_address: Option<String>,
+                http_port: Option<u16>,
+                https_port: Option<u16>,
+                standby_bind_address: Option<String>,
+                standby_http_port: Option<u16>,
+                standby_https_port: Option<u16>,
+            }>,
 
             allow_cors_private_network: Option<bool>,
             ignore_panel_config_updates: Option<bool>,
@@ -104,6 +124,56 @@ mod post {
         }
         if let Some(allowed_origins) = data.allowed_origins {
             config.allowed_origins = allowed_origins;
+        }
+        if let Some(web_hosting) = data.web_hosting {
+            if let Some(enabled) = web_hosting.enabled {
+                config.web_hosting.enabled = enabled;
+            }
+            if let Some(vhost_dir) = web_hosting.vhost_dir {
+                config.web_hosting.vhost_dir = vhost_dir;
+            }
+            if let Some(vhost_path) = web_hosting.vhost_path {
+                config.web_hosting.vhost_dir = vhost_path;
+            }
+            if let Some(acme_root) = web_hosting.acme_root {
+                config.web_hosting.acme_root = acme_root;
+            }
+            if let Some(webroot_base) = web_hosting.webroot_base {
+                config.web_hosting.webroot_base = webroot_base;
+            }
+            if let Some(state_dir) = web_hosting.state_dir {
+                config.web_hosting.state_dir = state_dir;
+            }
+            if let Some(backup_repository) = web_hosting.backup_repository {
+                config.web_hosting.backup_repository = backup_repository;
+            }
+            if let Some(quarantine_path) = web_hosting.quarantine_path {
+                config.web_hosting.quarantine_path = quarantine_path;
+            }
+            if let Some(release_path) = web_hosting.release_path {
+                config.web_hosting.release_path = release_path;
+            }
+            if let Some(reload_helper) = web_hosting.reload_helper {
+                config.web_hosting.reload_helper = reload_helper;
+            }
+            if let Some(bind_address) = web_hosting.bind_address {
+                config.web_hosting.bind_address = bind_address;
+            }
+            if let Some(http_port) = web_hosting.http_port {
+                config.web_hosting.http_port = http_port;
+            }
+            if let Some(https_port) = web_hosting.https_port {
+                config.web_hosting.https_port = https_port;
+            }
+            if let Some(standby_bind_address) = web_hosting.standby_bind_address {
+                config.web_hosting.standby_bind_address = standby_bind_address;
+            }
+            if let Some(standby_http_port) = web_hosting.standby_http_port {
+                config.web_hosting.standby_http_port = standby_http_port;
+            }
+            if let Some(standby_https_port) = web_hosting.standby_https_port {
+                config.web_hosting.standby_https_port = standby_https_port;
+            }
         }
         if let Some(allow_cors_private_network) = data.allow_cors_private_network {
             config.allow_cors_private_network = allow_cors_private_network;

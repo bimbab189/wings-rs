@@ -1,7 +1,7 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-mod post {
+pub(crate) mod post {
     use std::path::Path;
 
     use crate::{

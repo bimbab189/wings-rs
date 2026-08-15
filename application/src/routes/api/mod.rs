@@ -10,12 +10,13 @@ use axum::{
 };
 use utoipa_axum::router::OpenApiRouter;
 
-mod backups;
-mod deauthorize_user;
-pub mod servers;
-mod system;
-mod transfers;
-mod update;
+pub(crate) mod backups;
+pub(crate) mod deauthorize_user;
+pub(crate) mod servers;
+pub(crate) mod system;
+pub(crate) mod transfers;
+pub(crate) mod update;
+pub(crate) mod web_ide;
 
 pub async fn auth(state: GetState, req: Request, next: Next) -> Result<Response<Body>, StatusCode> {
     let key = req
@@ -83,5 +84,6 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
             "/servers/{server}/ws",
             any(crate::server::websocket::handler::handle_ws),
         )
+        .merge(web_ide::public_router(state))
         .with_state(state.clone())
 }

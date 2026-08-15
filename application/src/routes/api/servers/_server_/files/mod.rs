@@ -1,23 +1,23 @@
 use super::State;
 use utoipa_axum::router::OpenApiRouter;
 
-mod chmod;
-mod compress;
-mod contents;
-mod copy;
-mod copy_many;
-mod copy_remote;
-mod create_directory;
-mod decompress;
-mod delete;
-mod fingerprints;
-mod list;
-mod list_directory;
-mod operations;
-mod pull;
-mod rename;
-mod search;
-mod write;
+pub(crate) mod chmod;
+pub(crate) mod compress;
+pub(crate) mod contents;
+pub(crate) mod copy;
+pub(crate) mod copy_many;
+pub(crate) mod copy_remote;
+pub(crate) mod create_directory;
+pub(crate) mod decompress;
+pub(crate) mod delete;
+pub(crate) mod fingerprints;
+pub(crate) mod list;
+pub(crate) mod list_directory;
+pub(crate) mod operations;
+pub(crate) mod pull;
+pub(crate) mod rename;
+pub(crate) mod search;
+pub(crate) mod write;
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()

@@ -18,6 +18,7 @@ pub mod backup;
 pub mod configuration;
 pub mod container;
 pub mod filesystem;
+pub mod helper;
 pub mod installation;
 pub mod manager;
 pub mod permissions;
@@ -26,6 +27,7 @@ pub mod schedule;
 pub mod script;
 pub mod state;
 pub mod transfer;
+pub mod web_ide;
 pub mod websocket;
 
 pub struct InnerServer {
@@ -466,6 +468,12 @@ impl Server {
         configuration: configuration::ServerConfiguration,
         process_configuration: configuration::process::ProcessConfiguration,
     ) {
+        if configuration.suspended {
+            self.app_state
+                .web_ide
+                .revoke_server(self.uuid, "server_suspended")
+                .await;
+        }
         self.filesystem
             .update_ignored(&configuration.egg.file_denylist)
             .await;
@@ -1344,11 +1352,17 @@ impl Server {
         let server = self.clone();
         tokio::spawn(async move {
             if server.state.get_state() != state::ServerState::Offline {
-                if server.state.get_state() != state::ServerState::Stopping {
-                    server.stop(aquire_timeout, true).await?;
-                }
-
+                // Mark the transition before asking Docker to stop. The
+                // container-state watcher can observe EXITED between the
+                // stop request and its return; setting this afterwards races
+                // the watcher and leaves a requested restart offline.
                 server.restarting.store(true, Ordering::SeqCst);
+                if server.state.get_state() != state::ServerState::Stopping {
+                    if let Err(error) = server.stop(aquire_timeout, true).await {
+                        server.restarting.store(false, Ordering::SeqCst);
+                        return Err(error);
+                    }
+                }
             } else {
                 server.start(aquire_timeout, true).await?;
             }
@@ -1381,11 +1395,16 @@ impl Server {
         let server = self.clone();
         tokio::spawn(async move {
             if server.state.get_state() != state::ServerState::Offline {
-                if server.state.get_state() != state::ServerState::Stopping {
-                    server.stop_with_kill_timeout(timeout, true).await?;
-                }
-
+                // See restart(): the watcher must see the restart intent
+                // before the stop/kill operation can make the container
+                // transition to EXITED.
                 server.restarting.store(true, Ordering::SeqCst);
+                if server.state.get_state() != state::ServerState::Stopping {
+                    if let Err(error) = server.stop_with_kill_timeout(timeout, true).await {
+                        server.restarting.store(false, Ordering::SeqCst);
+                        return Err(error);
+                    }
+                }
             } else {
                 server.start(aquire_timeout, true).await?;
             }
@@ -1501,6 +1520,13 @@ impl Server {
         }
     }
 
+    pub async fn stop_web_ide_sessions(&self, reason: &str) {
+        self.app_state
+            .web_ide
+            .revoke_server(self.uuid, reason)
+            .await;
+    }
+
     pub async fn destroy(&self) {
         tracing::info!(
             server = %self.uuid,
@@ -1508,6 +1534,11 @@ impl Server {
         );
 
         self.suspended.store(true, Ordering::SeqCst);
+        self.stop_web_ide_sessions("server_destroyed").await;
+        self.app_state
+            .web_ide
+            .remove_memory_for_server(self.uuid)
+            .await;
         self.kill(true).await.ok();
         self.destroy_container().await;
         self.configuration

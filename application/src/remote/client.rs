@@ -132,6 +132,29 @@ impl Client {
         super::send_activity(self, activity).await
     }
 
+    pub async fn send_web_ide_session_event(
+        &self,
+        server: uuid::Uuid,
+        session: uuid::Uuid,
+        event: &str,
+        reason: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        super::send_web_ide_session_event(self, server, session, event, reason).await
+    }
+
+    /// Forward a bounded Copilot addon-tool request to the panel. The browser
+    /// never receives this client or its node credential; Wings only exposes
+    /// this method after authenticating the exact Web IDE session.
+    pub async fn send_web_ide_addon_tool(
+        &self,
+        server: uuid::Uuid,
+        session: uuid::Uuid,
+        operation: &str,
+        input: &serde_json::Value,
+    ) -> Result<(u16, String), anyhow::Error> {
+        super::send_web_ide_addon_tool(self, server, session, operation, input).await
+    }
+
     #[tracing::instrument(skip(self))]
     pub async fn send_schedule_status(
         &self,

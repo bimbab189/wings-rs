@@ -348,11 +348,27 @@ pub async fn handle_message(
 
                 return Ok(());
             }
+            let user_uuid = socket_jwt.user_uuid;
             drop(socket_jwt);
 
             let Some(raw_command) = message.args.first() else {
                 return Ok(());
             };
+
+            let raw_command = raw_command.to_string();
+            if crate::server::helper::is_web_hosting_server(server).await {
+                handle_web_hosting_console_command(
+                    server,
+                    websocket_handler,
+                    &raw_command,
+                    user_uuid,
+                    user_ip,
+                )
+                .await?;
+
+                return Ok(());
+            }
+
             if let Some(stdin) = server.container_stdin().await {
                 let mut command = raw_command.to_compact_string();
                 command.push('\n');
@@ -368,10 +384,10 @@ pub async fn handle_message(
                         .activity
                         .log_activity(Activity {
                             event: ActivityEvent::ConsoleCommand,
-                            user: Some(websocket_handler.get_jwt().await?.user_uuid),
+                            user: Some(user_uuid),
                             ip: user_ip,
                             metadata: Some(json!({
-                                "command": raw_command,
+                                "command_length": raw_command.len(),
                             })),
                             schedule: None,
                             timestamp: chrono::Utc::now(),
@@ -394,4 +410,117 @@ pub async fn handle_message(
     }
 
     Ok(())
+}
+
+async fn handle_web_hosting_console_command(
+    server: &crate::server::Server,
+    websocket_handler: &super::ServerWebsocketHandler,
+    raw_command: &str,
+    user_uuid: uuid::Uuid,
+    user_ip: Option<IpAddr>,
+) -> Result<(), anyhow::Error> {
+    let command = raw_command.trim();
+    if command.is_empty() {
+        return Ok(());
+    }
+
+    send_console_output(websocket_handler, format!("\r\n$ {}\r\n", command)).await;
+
+    let mut metadata = json!({
+        "command_length": command.len(),
+        "mode": "web_hosting_exec",
+    });
+
+    match crate::server::helper::exec_web_hosting_user_command(server, command, None, None).await {
+        Ok(output) => {
+            if !output.stdout.is_empty() {
+                send_console_output(websocket_handler, with_crlf(&output.stdout)).await;
+            }
+
+            if !output.stderr.is_empty() {
+                send_console_output(
+                    websocket_handler,
+                    format!("\x1b[31m{}\x1b[0m", with_crlf(&output.stderr)),
+                )
+                .await;
+            }
+
+            if output.timed_out {
+                send_console_output(
+                    websocket_handler,
+                    "\x1b[33mCommand timed out and was stopped.\x1b[0m\r\n",
+                )
+                .await;
+            } else if output.exit_code != Some(0) {
+                send_console_output(
+                    websocket_handler,
+                    format!(
+                        "\x1b[31mCommand exited with status {}.\x1b[0m\r\n",
+                        output
+                            .exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    ),
+                )
+                .await;
+            }
+
+            if output.truncated {
+                send_console_output(
+                    websocket_handler,
+                    "\x1b[33mOutput was truncated.\x1b[0m\r\n",
+                )
+                .await;
+            }
+
+            metadata["exit_code"] = json!(output.exit_code);
+            metadata["timed_out"] = json!(output.timed_out);
+            metadata["truncated"] = json!(output.truncated);
+        }
+        Err(err) => {
+            send_console_output(websocket_handler, format!("\x1b[31m{}\x1b[0m\r\n", err)).await;
+
+            metadata["error"] = json!("execution_failed");
+        }
+    }
+
+    server
+        .activity
+        .log_activity(Activity {
+            event: ActivityEvent::ConsoleCommand,
+            user: Some(user_uuid),
+            ip: user_ip,
+            metadata: Some(metadata),
+            schedule: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .await;
+
+    Ok(())
+}
+
+async fn send_console_output(
+    websocket_handler: &super::ServerWebsocketHandler,
+    output: impl AsRef<str>,
+) {
+    let output = output.as_ref();
+    if output.is_empty() {
+        return;
+    }
+
+    websocket_handler
+        .send_message(WebsocketMessage::new(
+            WebsocketEvent::ServerConsoleOutput,
+            [output.to_compact_string()].into(),
+        ))
+        .await;
+}
+
+fn with_crlf(output: &str) -> String {
+    let mut output = output.replace('\n', "\r\n");
+    if !output.ends_with("\r\n") {
+        output.push_str("\r\n");
+    }
+
+    output
 }

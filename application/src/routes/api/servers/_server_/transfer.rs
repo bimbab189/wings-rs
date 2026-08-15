@@ -1,7 +1,7 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-mod post {
+pub(crate) mod post {
     use crate::{
         io::compression::CompressionLevel,
         response::{ApiResponse, ApiResponseResult},
@@ -56,6 +56,9 @@ mod post {
         }
 
         server
+            .stop_web_ide_sessions("server_transfer_started")
+            .await;
+        server
             .transferring
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let mut transfer = crate::server::transfer::OutgoingServerTransfer::new(
@@ -85,7 +88,7 @@ mod post {
     }
 }
 
-mod delete {
+pub(crate) mod delete {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},

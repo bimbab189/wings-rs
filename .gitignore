@@ -1,2 +1,13 @@
 target/
 config*.yml
+config*.yaml
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+webide/extension/node_modules/
+webide/extension/dist/
+webide/**/node_modules/
+webide/**/dist/

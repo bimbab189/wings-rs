@@ -1,7 +1,7 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-mod get {
+pub(crate) mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::GetState,
@@ -28,7 +28,7 @@ mod get {
     }
 }
 
-mod server_get {
+pub(crate) mod server_get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::GetState,

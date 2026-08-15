@@ -300,7 +300,14 @@ async fn main() {
         )),
         mime_cache: moka::future::Cache::new(20480),
         ssh_sessions: wings_rs::ssh::SshSessionRegistry::new(),
+        web_ide: wings_rs::server::web_ide::WebIdeManager::new(
+            Arc::clone(&config),
+            Arc::clone(&docker),
+        ),
     });
+
+    state.web_ide.reconcile_orphans().await;
+    state.web_ide.start_reaper();
 
     state.server_manager.boot(&state, servers).await;
 

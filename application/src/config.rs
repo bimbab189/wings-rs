@@ -62,6 +62,91 @@ fn api_max_jwt_uses() -> usize {
     5
 }
 
+fn web_hosting_vhost_dir() -> String {
+    "/etc/openresty/vhosts.d".to_string()
+}
+fn web_hosting_acme_root() -> String {
+    "/var/lib/jexactyl-webhosting/acme".to_string()
+}
+fn web_hosting_webroot_base() -> String {
+    "/var/www/jexactyl-webroots".to_string()
+}
+fn web_hosting_state_dir() -> String {
+    "/var/lib/jexactyl-webhosting".to_string()
+}
+fn web_hosting_backup_repository() -> String {
+    "/var/lib/jexactyl-webhosting/restic".to_string()
+}
+fn web_hosting_quarantine_path() -> String {
+    "/var/lib/jexactyl-webhosting/quarantine".to_string()
+}
+fn web_hosting_release_path() -> String {
+    "/var/lib/jexactyl-webhosting/releases".to_string()
+}
+fn web_hosting_reload_helper() -> String {
+    "/usr/local/sbin/jexactyl-openresty-reload".to_string()
+}
+fn web_hosting_bind_address() -> String {
+    "0.0.0.0".to_string()
+}
+fn web_hosting_http_port() -> u16 {
+    80
+}
+fn web_hosting_https_port() -> u16 {
+    443
+}
+fn web_hosting_standby_bind_address() -> String {
+    "127.0.0.1".to_string()
+}
+fn web_hosting_standby_http_port() -> u16 {
+    18080
+}
+fn web_hosting_standby_https_port() -> u16 {
+    18443
+}
+fn web_ide_runtime_directory() -> String {
+    "/var/lib/pterodactyl/webide".to_string()
+}
+fn web_ide_memory_directory() -> String {
+    "/var/lib/pterodactyl/webide-memory".to_string()
+}
+fn web_ide_persistent_data_directory() -> String {
+    "/var/lib/pterodactyl/webide-data".to_string()
+}
+fn web_ide_encryption_key_file() -> String {
+    "/etc/pterodactyl/webide.key".to_string()
+}
+fn web_ide_max_persistent_state_bytes() -> usize {
+    512 * 1024 * 1024
+}
+fn web_ide_memory_mib() -> u64 {
+    768
+}
+fn web_ide_cpu_percent() -> u64 {
+    100
+}
+fn web_ide_pid_limit() -> i64 {
+    256
+}
+fn web_ide_tmpfs_mib() -> u64 {
+    256
+}
+fn web_ide_max_request_bytes() -> usize {
+    16 * 1024 * 1024
+}
+fn web_ide_max_collaboration_document_bytes() -> usize {
+    2 * 1024 * 1024
+}
+fn web_ide_max_collaboration_rooms() -> usize {
+    256
+}
+fn web_ide_max_sessions() -> usize {
+    64
+}
+fn web_ide_max_sessions_per_server() -> usize {
+    8
+}
+
 fn system_root_directory() -> String {
     #[cfg(unix)]
     {
@@ -489,6 +574,101 @@ nestify::nest! {
             #[serde(default)]
             #[schema(value_type = Vec<String>)]
             pub trusted_proxies: Vec<cidr::IpCidr>,
+        },
+        #[serde(default)]
+        #[schema(inline)]
+        pub web_hosting: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct WebHosting {
+            #[serde(default)]
+            pub enabled: bool,
+            #[serde(default = "web_hosting_vhost_dir", alias = "vhost_path")]
+            pub vhost_dir: String,
+            #[serde(default = "web_hosting_acme_root")]
+            pub acme_root: String,
+            #[serde(default = "web_hosting_webroot_base")]
+            pub webroot_base: String,
+            #[serde(default = "web_hosting_state_dir")]
+            pub state_dir: String,
+            #[serde(default = "web_hosting_backup_repository")]
+            pub backup_repository: String,
+            #[serde(default = "web_hosting_quarantine_path")]
+            pub quarantine_path: String,
+            #[serde(default = "web_hosting_release_path")]
+            pub release_path: String,
+            #[serde(default = "web_hosting_reload_helper")]
+            pub reload_helper: String,
+            #[serde(default = "web_hosting_bind_address")]
+            pub bind_address: String,
+            #[serde(default = "web_hosting_http_port")]
+            pub http_port: u16,
+            #[serde(default = "web_hosting_https_port")]
+            pub https_port: u16,
+            #[serde(default = "web_hosting_standby_bind_address")]
+            pub standby_bind_address: String,
+            #[serde(default = "web_hosting_standby_http_port")]
+            pub standby_http_port: u16,
+            #[serde(default = "web_hosting_standby_https_port")]
+            pub standby_https_port: u16,
+        },
+        #[serde(default)]
+        #[schema(inline)]
+        pub web_ide: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct WebIde {
+            #[serde(default)]
+            pub enabled: bool,
+            #[serde(default)]
+            pub public_url: String,
+            #[serde(default)]
+            pub image: String,
+            #[serde(default = "web_ide_runtime_directory")]
+            pub runtime_directory: String,
+            /// Legacy location used only to migrate pre-encryption Copilot
+            /// memory into the encrypted state archive.
+            #[serde(default = "web_ide_memory_directory")]
+            pub memory_directory: String,
+            /// Root-owned encrypted VS Code state archives (GitHub
+            /// authentication, SecretStorage, chat sessions, extensions,
+            /// workspace settings and isolated HOME), scoped to one server
+            /// UUID and one panel user UUID.
+            #[serde(default = "web_ide_persistent_data_directory")]
+            pub persistent_data_directory: String,
+            /// Root-only 256-bit key used to encrypt the per-server/user
+            /// Web IDE state archive while no sidecar is running.
+            #[serde(default = "web_ide_encryption_key_file")]
+            pub encryption_key_file: String,
+            /// Maximum plaintext archive size accepted for settings,
+            /// SecretStorage, chat history, extensions, and HOME.
+            #[serde(default = "web_ide_max_persistent_state_bytes")]
+            pub max_persistent_state_bytes: usize,
+            #[serde(default = "web_ide_memory_mib")]
+            pub memory_mib: u64,
+            #[serde(default = "web_ide_cpu_percent")]
+            pub cpu_percent: u64,
+            #[serde(default = "web_ide_pid_limit")]
+            pub pid_limit: i64,
+            #[serde(default = "web_ide_tmpfs_mib")]
+            pub tmpfs_mib: u64,
+            #[serde(default = "web_ide_max_request_bytes")]
+            pub max_request_bytes: usize,
+            #[serde(default = "web_ide_max_collaboration_document_bytes")]
+            pub max_collaboration_document_bytes: usize,
+            #[serde(default = "web_ide_max_collaboration_rooms")]
+            pub max_collaboration_rooms: usize,
+            #[serde(default = "web_ide_max_sessions")]
+            pub max_sessions: usize,
+            #[serde(default = "web_ide_max_sessions_per_server")]
+            pub max_sessions_per_server: usize,
+            /// Allow temporary public Internet egress for IDE extensions and
+            /// GitHub authentication. The sidecar remains on Docker's
+            /// isolated default bridge; node/private destinations are still
+            /// denied by the node firewall profile.
+            #[serde(default)]
+            pub allow_public_network: bool,
+            /// Set only after the node firewall has been applied for both the
+            /// customer bridge and the IDE egress bridge (normally
+            /// `pterodactyl0,docker0`).
+            #[serde(default)]
+            pub public_network_isolation_verified: bool,
+            #[serde(default)]
+            pub terminal_network_isolation_verified: bool,
         },
         #[serde(default)]
         #[schema(inline)]
@@ -1023,6 +1203,8 @@ impl Config {
                 .context(format!("failed to create config directory {path}"))?;
         }
         let file = File::create(path).context(format!("failed to create config file {path}"))?;
+        #[cfg(unix)]
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         let writer = std::io::BufWriter::new(file);
         serde_norway::to_writer(writer, &config)
             .context(format!("failed to write config file {path}"))?;
@@ -1035,6 +1217,8 @@ impl Config {
 
         let file = File::create(&self.path)
             .context(format!("failed to create config file {}", self.path))?;
+        #[cfg(unix)]
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         let writer = std::io::BufWriter::new(file);
         serde_norway::to_writer(writer, unsafe { &*self.inner.get() })
             .context(format!("failed to write config file {}", self.path))?;
@@ -1113,6 +1297,132 @@ impl Config {
             ));
         }
 
+        if self.web_ide.enabled {
+            if !self.web_ide.public_url.starts_with("https://") {
+                return Err(anyhow::anyhow!(
+                    "web_ide.public_url must be an https:// origin"
+                ));
+            }
+            let immutable_image = self
+                .web_ide
+                .image
+                .strip_prefix("sha256:")
+                .or_else(|| {
+                    self.web_ide
+                        .image
+                        .split_once("@sha256:")
+                        .filter(|(name, _)| !name.is_empty())
+                        .map(|(_, digest)| digest)
+                })
+                .is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+            if !immutable_image {
+                return Err(anyhow::anyhow!(
+                    "web_ide.image must be pinned by immutable image ID or repository digest"
+                ));
+            }
+            if !self.web_ide.terminal_network_isolation_verified {
+                return Err(anyhow::anyhow!(
+                    "web_ide requires terminal_network_isolation_verified after applying the documented node firewall profile"
+                ));
+            }
+            if self.web_ide.allow_public_network && !self.web_ide.public_network_isolation_verified
+            {
+                return Err(anyhow::anyhow!(
+                    "web_ide public egress requires public_network_isolation_verified after applying the documented node firewall profile"
+                ));
+            }
+            if self.docker.network.driver != "bridge"
+                || self.docker.network.mode != self.docker.network.name
+            {
+                return Err(anyhow::anyhow!(
+                    "web_ide terminal isolation requires the managed Docker bridge network"
+                ));
+            }
+            if !(256..=8192).contains(&self.web_ide.memory_mib)
+                || !(1..=800).contains(&self.web_ide.cpu_percent)
+                || !(32..=4096).contains(&self.web_ide.pid_limit)
+                || !(32..=2048).contains(&self.web_ide.tmpfs_mib)
+                || self.web_ide.max_request_bytes == 0
+                || self.web_ide.max_request_bytes > 64 * 1024 * 1024
+                || self.web_ide.max_collaboration_document_bytes == 0
+                || self.web_ide.max_collaboration_document_bytes > 8 * 1024 * 1024
+                || self.web_ide.max_collaboration_rooms == 0
+                || self.web_ide.max_collaboration_rooms > 2048
+                || self.web_ide.max_sessions == 0
+                || self.web_ide.max_sessions > 1024
+                || self.web_ide.max_sessions_per_server == 0
+                || self.web_ide.max_sessions_per_server > self.web_ide.max_sessions
+                || self.web_ide.max_persistent_state_bytes < 16 * 1024 * 1024
+                || self.web_ide.max_persistent_state_bytes > 4 * 1024 * 1024 * 1024
+            {
+                return Err(anyhow::anyhow!(
+                    "invalid web_ide resource or request limits"
+                ));
+            }
+
+            let web_ide_directories = [
+                (
+                    std::path::Path::new(&self.web_ide.runtime_directory),
+                    "web_ide.runtime_directory",
+                ),
+                (
+                    std::path::Path::new(&self.web_ide.memory_directory),
+                    "web_ide.memory_directory",
+                ),
+                (
+                    std::path::Path::new(&self.web_ide.persistent_data_directory),
+                    "web_ide.persistent_data_directory",
+                ),
+            ];
+            for (path, name) in web_ide_directories {
+                if !path.is_absolute()
+                    || path.components().any(|component| {
+                        !matches!(
+                            component,
+                            std::path::Component::RootDir | std::path::Component::Normal(_)
+                        )
+                    })
+                {
+                    return Err(anyhow::anyhow!(
+                        "{} must be a dedicated absolute directory",
+                        name
+                    ));
+                }
+            }
+            for (left_index, (left, left_name)) in web_ide_directories.iter().enumerate() {
+                for (right, right_name) in web_ide_directories.iter().skip(left_index + 1) {
+                    if left == right || left.starts_with(right) || right.starts_with(left) {
+                        return Err(anyhow::anyhow!("{} overlaps {}", left_name, right_name));
+                    }
+                }
+            }
+
+            let key_file = std::path::Path::new(&self.web_ide.encryption_key_file);
+            if !key_file.is_absolute()
+                || key_file.components().any(|component| {
+                    !matches!(
+                        component,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    )
+                })
+                || key_file.file_name().is_none()
+            {
+                return Err(anyhow::anyhow!(
+                    "web_ide.encryption_key_file must be a dedicated absolute file"
+                ));
+            }
+            for (directory, name) in web_ide_directories {
+                if key_file.starts_with(directory) || directory.starts_with(key_file) {
+                    return Err(anyhow::anyhow!(
+                        "web_ide.encryption_key_file overlaps {}",
+                        name
+                    ));
+                }
+            }
+        }
+
         // Do not allow directory paths with less than 1 segment (e.g. "/")
         const MIN_DIRECTORY_SEGMENTS: usize = 1;
         let directories = vec![
@@ -1123,6 +1433,12 @@ impl Config {
             (&self.system.archive_directory, "archive_directory"),
             (&self.system.backup_directory, "backup_directory"),
             (&self.system.tmp_directory, "tmp_directory"),
+            (&self.web_ide.runtime_directory, "web_ide.runtime_directory"),
+            (&self.web_ide.memory_directory, "web_ide.memory_directory"),
+            (
+                &self.web_ide.persistent_data_directory,
+                "web_ide.persistent_data_directory",
+            ),
         ];
 
         for (dir, name) in directories {

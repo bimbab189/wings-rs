@@ -1,7 +1,7 @@
 use super::State;
 use utoipa_axum::router::OpenApiRouter;
 
-mod abort;
+pub(crate) mod abort;
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()

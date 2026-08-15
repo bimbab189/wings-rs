@@ -1,7 +1,7 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-mod post {
+pub(crate) mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},
@@ -34,6 +34,10 @@ mod post {
                     .user_permissions
                     .set_permissions(data.user, Permissions::default(), &[] as &[&str])
                     .await;
+                state
+                    .web_ide
+                    .revoke_user(server.uuid, data.user, "permissions_revoked")
+                    .await;
             }
         } else {
             for server in state.server_manager.get_servers().await.iter() {
@@ -41,6 +45,10 @@ mod post {
                     server
                         .user_permissions
                         .set_permissions(data.user, Permissions::default(), &[] as &[&str])
+                        .await;
+                    state
+                        .web_ide
+                        .revoke_user(server.uuid, data.user, "permissions_revoked")
                         .await;
                 }
             }

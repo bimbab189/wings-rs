@@ -7,10 +7,10 @@ use std::{
 
 mod auth;
 mod exec;
-pub mod registry;
 mod ratelimiter;
+pub mod registry;
 mod sftp;
-mod shell;
+pub(crate) mod shell;
 
 pub use registry::SshSessionRegistry;
 

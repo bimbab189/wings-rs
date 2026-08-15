@@ -9,8 +9,9 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Mutex;
+use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash, ToSchema)]
 pub enum Permission {
     #[serde(rename = "*")]
     All,
@@ -52,6 +53,9 @@ pub enum Permission {
     FileArchive,
     #[serde(rename = "file.sftp", alias = "files.sftp")]
     FileSftp,
+
+    #[serde(rename = "webide.access")]
+    WebIdeAccess,
 }
 
 impl Permission {
@@ -183,7 +187,7 @@ impl Drop for UserPermissionsMap {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Serialize, ToSchema)]
 #[repr(transparent)]
 pub struct Permissions(HashSet<Permission>);
 

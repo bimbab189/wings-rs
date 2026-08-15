@@ -5,7 +5,7 @@ use utoipa_axum::{
     routes,
 };
 
-mod post {
+pub(crate) mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState},

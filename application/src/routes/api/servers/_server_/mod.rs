@@ -9,19 +9,22 @@ use axum::{
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-mod backup;
-mod commands;
-mod files;
-mod install;
-mod logs;
-mod power;
-mod reinstall;
-mod schedules;
-mod script;
-mod sync;
-mod transfer;
-mod version;
-mod ws;
+pub(crate) mod backup;
+pub(crate) mod commands;
+pub(crate) mod files;
+pub(crate) mod helper;
+pub(crate) mod install;
+pub(crate) mod logs;
+pub(crate) mod power;
+pub(crate) mod reinstall;
+pub(crate) mod schedules;
+pub(crate) mod script;
+pub(crate) mod sync;
+pub(crate) mod transfer;
+pub(crate) mod version;
+pub(crate) mod web_hosting;
+pub(crate) mod web_ide;
+pub(crate) mod ws;
 
 pub type GetServer = axum::extract::Extension<crate::server::Server>;
 
@@ -61,7 +64,7 @@ pub async fn auth(
     Ok(next.run(req).await)
 }
 
-mod get {
+pub(crate) mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::api::servers::_server_::GetServer,
@@ -81,7 +84,7 @@ mod get {
     }
 }
 
-mod delete {
+pub(crate) mod delete {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{GetState, api::servers::_server_::GetServer},
@@ -117,12 +120,15 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/power", power::router(state))
         .nest("/version", version::router(state))
         .nest("/commands", commands::router(state))
+        .nest("/helper", helper::router(state))
         .nest("/sync", sync::router(state))
         .nest("/reinstall", reinstall::router(state))
         .nest("/ws", ws::router(state))
         .nest("/files", files::router(state))
         .nest("/backup", backup::router(state))
         .nest("/schedules", schedules::router(state))
+        .nest("/web-hosting", web_hosting::router(state))
+        .nest("/web-ide", web_ide::router(state))
         .routes(routes!(get::route))
         .routes(routes!(delete::route))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth))

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::fmt::Debug;
 
 pub mod bins;
@@ -18,9 +20,18 @@ pub mod utils;
 pub use payload::Payload;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const GIT_COMMIT: &str = env!("CARGO_GIT_COMMIT");
-pub const GIT_BRANCH: &str = env!("CARGO_GIT_BRANCH");
-pub const TARGET: &str = env!("CARGO_TARGET");
+pub const GIT_COMMIT: &str = match option_env!("CARGO_GIT_COMMIT") {
+    Some(value) => value,
+    None => "unknown",
+};
+pub const GIT_BRANCH: &str = match option_env!("CARGO_GIT_BRANCH") {
+    Some(value) => value,
+    None => "unknown",
+};
+pub const TARGET: &str = match option_env!("CARGO_TARGET") {
+    Some(value) => value,
+    None => "unknown-unknown",
+};
 
 pub const BUFFER_SIZE: usize = 32 * 1024;
 

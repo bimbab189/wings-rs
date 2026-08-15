@@ -1,10 +1,10 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-mod abort;
-mod trigger;
+pub(crate) mod abort;
+pub(crate) mod trigger;
 
-mod get {
+pub(crate) mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::servers::_server_::GetServer},

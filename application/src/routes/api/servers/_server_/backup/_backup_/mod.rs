@@ -1,9 +1,9 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-mod restore;
+pub(crate) mod restore;
 
-mod delete {
+pub(crate) mod delete {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, GetState, api::servers::_server_::GetServer},

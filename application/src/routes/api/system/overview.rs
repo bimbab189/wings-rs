@@ -1,7 +1,7 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-mod get {
+pub(crate) mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::GetState,
@@ -37,6 +37,9 @@ mod get {
     #[derive(ToSchema, Serialize)]
     struct Response<'a> {
         version: &'a str,
+        features: Vec<&'static str>,
+        web_ide_supported: bool,
+        web_ide_enabled: bool,
         local_time: chrono::DateTime<chrono::Local>,
         container_type: crate::routes::AppContainerType,
 
@@ -89,6 +92,9 @@ mod get {
 
         ApiResponse::new_serialized(Response {
             version: &state.version,
+            features: vec!["web_ide"],
+            web_ide_supported: true,
+            web_ide_enabled: state.web_ide.enabled(),
             local_time: chrono::Local::now(),
             container_type: state.container_type,
             cpu: ResponseCpu {

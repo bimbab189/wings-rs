@@ -2,7 +2,7 @@ use crate::{
     routes::State,
     server::{
         activity::{Activity, ActivityEvent},
-        permissions::Permission,
+        permissions::{Permission, Permissions},
         websocket::WebsocketEvent,
     },
 };
@@ -28,11 +28,18 @@ pub struct ShellSession {
     pub user_ip: std::net::IpAddr,
     pub user_uuid: uuid::Uuid,
     pub mode: ShellMode,
+    /// A signed, session-scoped permission snapshot is used by Web IDE
+    /// sessions. SSH sessions continue to use Wings' normal permission cache.
+    pub permission_override: Option<Permissions>,
+    pub activity_source: &'static str,
 }
 
 impl ShellSession {
     #[inline]
     async fn has_permission(&self, permission: Permission) -> bool {
+        if let Some(permissions) = &self.permission_override {
+            return permissions.has_permission(permission);
+        }
         self.server
             .user_permissions
             .has_permission(self.user_uuid, permission)
@@ -97,13 +104,14 @@ impl ShellSession {
                                 }
                             }
                         } else {
+                            writeln("Server start requested.").await;
                             self.server
                                 .activity
                                 .log_activity(Activity {
                                     event: ActivityEvent::PowerStart,
                                     user: Some(self.user_uuid),
                                     ip: Some(self.user_ip),
-                                    metadata: Some(json!({ "source": "ssh" })),
+                                    metadata: Some(json!({ "source": self.activity_source })),
                                     schedule: None,
                                     timestamp: chrono::Utc::now(),
                                 })
@@ -149,13 +157,14 @@ impl ShellSession {
                                 }
                             }
                         } else {
+                            writeln("Server restart requested.").await;
                             self.server
                                 .activity
                                 .log_activity(Activity {
                                     event: ActivityEvent::PowerRestart,
                                     user: Some(self.user_uuid),
                                     ip: Some(self.user_ip),
-                                    metadata: Some(json!({ "source": "ssh" })),
+                                    metadata: Some(json!({ "source": self.activity_source })),
                                     schedule: None,
                                     timestamp: chrono::Utc::now(),
                                 })
@@ -202,13 +211,14 @@ impl ShellSession {
                                 }
                             }
                         } else {
+                            writeln("Server stop requested.").await;
                             self.server
                                 .activity
                                 .log_activity(Activity {
                                     event: ActivityEvent::PowerStop,
                                     user: Some(self.user_uuid),
                                     ip: Some(self.user_ip),
-                                    metadata: Some(json!({ "source": "ssh" })),
+                                    metadata: Some(json!({ "source": self.activity_source })),
                                     schedule: None,
                                     timestamp: chrono::Utc::now(),
                                 })
@@ -237,13 +247,14 @@ impl ShellSession {
                             writeln("An unexpected error occurred while killing the server. Please contact an Administrator.")
                                         .await;
                         } else {
+                            writeln("Server kill requested.").await;
                             self.server
                                 .activity
                                 .log_activity(Activity {
                                     event: ActivityEvent::PowerKill,
                                     user: Some(self.user_uuid),
                                     ip: Some(self.user_ip),
-                                    metadata: Some(json!({ "source": "ssh" })),
+                                    metadata: Some(json!({ "source": self.activity_source })),
                                     schedule: None,
                                     timestamp: chrono::Utc::now(),
                                 })
@@ -320,6 +331,73 @@ impl ShellSession {
                 writeln("Unknown command. Type '.wings help' for a list of commands.").await;
             }
         }
+    }
+
+    /// Executes one line using the same command dispatcher and permission
+    /// checks as an interactive Wings SSH shell. This is deliberately not an
+    /// OS shell: ordinary lines go to the selected server console and the
+    /// configured `.wings` command controls daemon actions.
+    pub async fn execute_webide_line(&mut self, line: &str) -> Vec<u8> {
+        // Native Execute tools trim their input, but browser/extension clients
+        // can still send indentation or a trailing carriage return. Normalize
+        // that boundary so a valid `.wings power restart` cannot accidentally
+        // be forwarded to the application console as ordinary text.
+        let line = line.trim();
+        let mut output = Vec::new();
+        let mut writer = Box::pin(&mut output);
+
+        if line.split_whitespace().next()
+            == Some(self.state.config.system.sftp.shell.cli.name.as_str())
+        {
+            self.handle_cli_command(line, &mut writer).await;
+        } else if self.has_permission(Permission::ControlConsole).await {
+            if self.server.state.get_state() != crate::server::state::ServerState::Offline
+                && let Some(stdin) = self.server.container_stdin().await
+            {
+                if let Err(error) = stdin.send(format!("{line}\n").into()).await {
+                    writer.write_all(b"\r\n").await.unwrap_or_default();
+                    tracing::error!(server = %self.server.uuid, %error, "failed to send Web IDE shell command");
+                } else {
+                    writer.write_all(b"\r").await.unwrap_or_default();
+                    self.server
+                        .activity
+                        .log_activity(Activity {
+                            event: ActivityEvent::SshCommand,
+                            user: Some(self.user_uuid),
+                            ip: Some(self.user_ip),
+                            metadata: Some(json!({
+                                "command_length": line.len(),
+                                "source": self.activity_source,
+                            })),
+                            schedule: None,
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .await;
+                }
+            } else {
+                let prelude = ansi_term::Color::Yellow
+                    .bold()
+                    .paint(format!("[{} Daemon]:", self.state.config.app_name));
+                writer
+                    .write_all(
+                        format!("\r\n{prelude} The server is currently offline.\r\n\x1b[2K")
+                            .as_bytes(),
+                    )
+                    .await
+                    .unwrap_or_default();
+            }
+        } else {
+            let prelude = ansi_term::Color::Yellow
+                .bold()
+                .paint(format!("[{} Daemon]:", self.state.config.app_name));
+            writer
+                .write_all(format!("\r\n{prelude} You are missing the `control.console` permission to do this.\r\n\x1b[2K").as_bytes())
+                .await
+                .unwrap_or_default();
+        }
+
+        drop(writer);
+        output
     }
 
     async fn handle_special_keys(
@@ -496,8 +574,8 @@ impl ShellSession {
                                                 user: Some(self.user_uuid),
                                                 ip: Some(self.user_ip),
                                                 metadata: Some(json!({
-                                                    "command": line,
-                                                    "source": "ssh",
+                                                    "command_length": line.len(),
+                                                    "source": self.activity_source,
                                                 })),
                                                 schedule: None,
                                                 timestamp: chrono::Utc::now(),

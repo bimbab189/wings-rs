@@ -1,9 +1,9 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-mod _file_;
+pub(crate) mod _file_;
 
-mod get {
+pub(crate) mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
         routes::GetState,

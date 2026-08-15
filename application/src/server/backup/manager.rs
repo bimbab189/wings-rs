@@ -257,6 +257,7 @@ impl BackupManager {
             return Err(anyhow::anyhow!("Server is in a locked state"));
         }
 
+        server.stop_web_ide_sessions("backup_restore_started").await;
         server.restoring.store(true, Ordering::SeqCst);
         if let Err(err) = server
             .stop_with_kill_timeout(std::time::Duration::from_secs(30), false)

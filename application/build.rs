@@ -50,29 +50,35 @@ fn main() {
         !bin_path.exists() || (!release_env.is_empty() && release_env != existing_version)
     };
 
-    if should_check_github
-        && target_os == "linux"
-        && let Some((tag, url)) = fetch_release_metadata(&target_arch)
-        && (tag != existing_version || release_env.starts_with("latest"))
-        && let Ok(resp) = reqwest::blocking::get(url)
-        && resp.status().is_success()
-    {
-        let data = resp.bytes().expect("Failed to read response bytes");
+    if should_check_github && target_os == "linux" {
+        if let Some((tag, url)) = fetch_release_metadata(&target_arch) {
+            if tag != existing_version || release_env.starts_with("latest") {
+                if let Ok(resp) = reqwest::blocking::get(url) {
+                    if resp.status().is_success() {
+                        let data = resp.bytes().expect("Failed to read response bytes");
 
-        let compressed_data =
-            zstd::encode_all(&*data, 22).expect("Failed to compress binary with zstd");
+                        let compressed_data = zstd::encode_all(&*data, 22)
+                            .expect("Failed to compress binary with zstd");
 
-        let mut file = File::create(&bin_path).expect("Failed to create bin");
-        file.write_all(&compressed_data)
-            .expect("Failed to write compressed bin");
+                        let mut file = File::create(&bin_path).expect("Failed to create bin");
+                        file.write_all(&compressed_data)
+                            .expect("Failed to write compressed bin");
 
-        std::fs::write(&version_path, &tag).ok();
-        final_version = tag;
+                        std::fs::write(&version_path, &tag).ok();
+                        final_version = tag;
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).ok();
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            std::fs::set_permissions(
+                                &bin_path,
+                                std::fs::Permissions::from_mode(0o755),
+                            )
+                            .ok();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -116,15 +122,17 @@ fn handle_git_info() {
     if is_git_repo {
         println!("cargo:rerun-if-changed=../.git/HEAD");
 
-        if let Ok(head) = std::fs::read_to_string("../.git/HEAD")
-            && head.starts_with("ref: ")
-        {
-            let head_ref = head.trim_start_matches("ref: ").trim();
-            println!("cargo:rerun-if-changed=../.git/{head_ref}");
-            println!(
-                "cargo:rustc-env=CARGO_GIT_BRANCH={}",
-                head_ref.rsplit('/').next().unwrap_or("unknown")
-            );
+        if let Ok(head) = std::fs::read_to_string("../.git/HEAD") {
+            if head.starts_with("ref: ") {
+                let head_ref = head.trim_start_matches("ref: ").trim();
+                println!("cargo:rerun-if-changed=../.git/{head_ref}");
+                println!(
+                    "cargo:rustc-env=CARGO_GIT_BRANCH={}",
+                    head_ref.rsplit('/').next().unwrap_or("unknown")
+                );
+            } else {
+                println!("cargo:rustc-env=CARGO_GIT_BRANCH=unknown");
+            }
         } else {
             println!("cargo:rustc-env=CARGO_GIT_BRANCH=unknown");
         }
@@ -133,9 +141,10 @@ fn handle_git_info() {
         if let Ok(output) = Command::new("git")
             .args(["rev-parse", "--short", "HEAD"])
             .output()
-            && output.status.success()
         {
-            git_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if output.status.success() {
+                git_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            }
         }
     }
     println!("cargo:rustc-env=CARGO_GIT_COMMIT={git_hash}");
